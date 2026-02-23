@@ -423,7 +423,7 @@ class QuadSamplingBasedPlanner(ABC):
         R = self.num_randomizations
 
         H = self.plan_steps
-        B = R * N
+        B = int(R * N * self.top_fraction)
         T = H + 1
 
         def make_leaf(x):
