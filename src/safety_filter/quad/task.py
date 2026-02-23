@@ -12,6 +12,31 @@ from safety_filter.bases.task import Task, TaskParams
 from flax.struct import dataclass
 
 
+def get_torch_policy():
+    import torch
+    import torch.nn as nn
+
+    class ActorNetwork(nn.Module):
+        def __init__(self, obs_dim=82, action_dim=12):
+            super().__init__()
+            self.actor = nn.Sequential(
+                nn.Linear(obs_dim, 512),
+                nn.ReLU(),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, action_dim),
+            )
+        
+        def forward(self, x):
+            return self.actor(x)
+    
+    model = ActorNetwork()
+    return model
+
+
+@dataclass
 class QuadRLTaskParams(TaskParams):
     """Task parameters specific to the MPSQuadRL task."""
 
@@ -92,8 +117,8 @@ class QuadRLTask(Task):
     def __init__(
         self,
         mj_model: mujoco.MjModel,  # type: ignore
-        rl_policy: callable,  # type: ignore
-        rl_config: Dict[str, any],  # type: ignore
+        rl_policy: Callable,
+        rl_config: Dict[str, Any],
         trace_sites: Sequence[str] | None = None,
     ):
         # copy
@@ -144,38 +169,60 @@ class QuadRLTask(Task):
 
         self.decimation = rl_config["decimation"]
 
-        self.gait_patterns = {
-            0: jnp.array(
-                [[True, True, True, True], [True, True, True, True]]
-            ),  # stance
-            1: jnp.array(
-                [[True, True, True, True], [True, True, True, True]]
-            ),  # transition
-            2: jnp.array(
-                [[False, True, True, False], [True, False, False, True]]
-            ),  # trot
-            3: jnp.array(
-                [[True, False, True, False], [False, True, False, True]]
-            ),  # pace
-            4: jnp.array(
-                [[True, True, False, False], [False, False, True, True]]
-            ),  # bound
-            5: jnp.array(
-                [[False, False, False, False], [True, True, True, True]]
-            ),  # jump
-            # Add crawl/trot-fly patterns (4 phases) as needed
-        }
-
+        self.gait_patterns = jnp.array(
+            [
+                [[True, True, True, True], [True, True, True, True]],  # 0: stance
+                [[True, True, True, True], [True, True, True, True]],  # 1: transition
+                [[False, True, True, False], [True, False, False, True]],  # 2: trot
+                [[True, False, True, False], [False, True, False, True]],  # 3: pace
+                [[True, True, False, False], [False, False, True, True]],  # 4: bound
+                [[False, False, False, False], [True, True, True, True]],  # 5: jump
+            ]
+        )
         self.plan_dim = 4 * 3  # 4 legs, 3D position
         self.horizon_length = rl_config["horizon_length"]
+
+        # TODO: will be made more general
+        self.obstacles = jnp.array(rl_config.get("obstacles", []))  # Shape: (N, 4)
+        self.safety_margin = rl_config.get("safety_margin", 0.25)
+        self.robot_radius = rl_config.get("robot_radius", 0.15)
 
     def normalize(self, plan: jax.Array) -> jax.Array:
         """Normalize the plan to be within [-1, 1] based on plan_lim."""
         return jnp.clip(plan / self.plan_lim, -1.0, 1.0)
-    
+
     def denormalize(self, plan: jax.Array) -> jax.Array:
         """Denormalize the plan from [-1, 1] back to the original scale."""
         return jnp.clip(plan * self.plan_lim, -self.plan_lim, self.plan_lim)
+
+    @partial(jax.jit, static_argnames=["self"])
+    def get_reference(self, **kwargs):
+        """Get the reference trajectory for the MPS planner."""
+        ref = kwargs.get("ref", None)
+        if ref is not None:
+            # action_mps = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
+            # plan_dim = ([ref1, ref2], [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]) = 12
+            plan = jnp.transpose(ref, (1, 0, 2)).reshape(-1, self.plan_dim)  # Shape: (H, plan_dim)
+            return plan
+
+    @partial(jax.jit, static_argnames=["self"])
+    def update_params(self, task_params: QuadRLTaskParams, kwargs):
+        command_start_time = kwargs.get("command_start_time")
+        goal_idx = kwargs.get("goal_idx")
+        contact_plan = kwargs.get("contact_plan")
+        current_gait = kwargs.get("current_gait")
+        goal_completion_counter = kwargs.get("goal_completion_counter")
+        in_transition = kwargs.get("in_transition")
+
+        return update_params(
+            task_params,
+            command_start_time=jnp.asarray(command_start_time),
+            goal_idx=jnp.asarray(goal_idx),
+            contact_plan=jnp.asarray(contact_plan),
+            current_gait=jnp.asarray(current_gait),
+            goal_completion_counter=jnp.asarray(goal_completion_counter),
+            in_transition=jnp.asarray(in_transition),
+        )
 
     def update_goal(self, task_params: QuadRLTaskParams) -> QuadRLTaskParams:
         """Update goal_idx and contact_plan based on gait phase progression."""
@@ -183,44 +230,53 @@ class QuadRLTask(Task):
         counter = task_params.goal_completion_counter
         goal_idx = task_params.goal_idx
 
-        # Skip if stance or transition
-        if gait <= 1:
-            return task_params
+        def _update_goal(params):
+            new_counter = counter + 1
 
-        # Determine number of phases for current gait
-        num_phases = 2  # default for trot, pace, bound, jump
-        if gait >= 6:  # crawl patterns have 4 phases
-            num_phases = 4
+            # Determine number of phases for current gait
+            num_phases = jnp.where(gait >= 6, 4, 2)
 
-        new_counter = counter + 1
-
-        # Update goal_idx based on phase completion
-        if num_phases == 4:
-            new_goal_idx = goal_idx + (1 if new_counter % 4 == 0 else 0)
-        else:
-            new_goal_idx = goal_idx + (
-                1 if new_counter % 2 != 0 and new_counter > 0 else 0
+            # Update goal_idx based on phase completion
+            new_goal_idx = jnp.where(
+                num_phases == 4,
+                goal_idx + jnp.where(jnp.mod(new_counter, 4) == 0, 1, 0),
+                goal_idx + jnp.where((jnp.mod(new_counter, 2) != 0) & (new_counter > 0), 1, 0),
             )
 
-        # Safety reset if exceeds horizon
-        if new_goal_idx >= self.horizon_length:
-            new_goal_idx = 0
-            new_counter = 0
+            # Safety reset if exceeds horizon
+            new_goal_idx = jnp.where(
+                new_goal_idx >= self.horizon_length, 0, new_goal_idx
+            )
+            new_counter = jnp.where(new_goal_idx >= self.horizon_length, 0, new_counter)
 
-        # Update contact_plan
-        phase_idx = new_counter % num_phases
-        next_phase_idx = (new_counter + 1) % num_phases
+            # Update contact_plan
+            phase_idx = jnp.mod(new_counter, num_phases)
+            next_phase_idx = jnp.mod(new_counter + 1, num_phases)
 
-        current_phase = self.gait_patterns[gait][phase_idx]
-        next_phase = self.gait_patterns[gait][next_phase_idx]
+            current_phase = jnp.take(self.gait_patterns, gait, axis=0)[phase_idx]
+            next_phase = jnp.take(self.gait_patterns, gait, axis=0)[next_phase_idx]
 
-        new_contact_plan = jnp.concatenate([current_phase, next_phase]).flatten()
+            new_contact_plan = (
+                jnp.concatenate([current_phase, next_phase])
+                .astype(jnp.float32)
+                .reshape(4, 2)
+            )
 
-        return task_params.replace(  # type: ignore
-            goal_completion_counter=new_counter,
-            goal_idx=new_goal_idx,
-            contact_plan=new_contact_plan,
+            return params.replace(  # type: ignore
+                goal_completion_counter=new_counter,
+                goal_idx=new_goal_idx,
+                contact_plan=new_contact_plan,
+            )
+
+        # Skip if stance or transition
+        task_params = jax.lax.cond(
+            gait <= 1,
+            lambda _: task_params,
+            lambda _: _update_goal(task_params),
+            None
         )
+
+        return task_params
 
     def get_observation(
         self, task_params: QuadRLTaskParams, state: mjx.Data, action_mps: jax.Array
@@ -258,11 +314,12 @@ class QuadRLTask(Task):
         # 5. contact_time_left = 1
         elapsed = state.time - task_params.command_start_time
         time_left = jnp.maximum(0.0, self.command_duration - elapsed)
-
-        if elapsed > self.command_duration:
-            # If the command duration has elapsed, we can reset the command start time
-            # to the current time, so that the next command starts immediately.
-            task_params = task_params.replace(command_start_time=state.time)  # type: ignore
+        time_left = jnp.expand_dims(time_left, axis=-1) 
+        
+        new_start_time = jnp.where(
+            elapsed > self.command_duration, state.time, task_params.command_start_time
+        )
+        task_params = task_params.replace(command_start_time=new_start_time)  # type: ignore
 
         # 6. contact_plan = 8
         contact_plan = task_params.contact_plan.reshape(-1)  # (8,)
@@ -358,8 +415,8 @@ class QuadRLTask(Task):
         for _ in range(self.decimation):
             # Here we would apply the joint PD targets to the MuJoCo simulation and step forward
 
-            q = state.qpos
-            dq = state.qvel
+            q = state.qpos[7:self.num_joints + 7]  # Assuming first 7 are base pos and quat
+            dq = state.qvel[6:self.num_joints + 6]  # Assuming first 6 are base lin and ang vel
 
             q_des = u
             dq_des = jnp.zeros_like(dq)
@@ -374,3 +431,39 @@ class QuadRLTask(Task):
             state = mjx.step(model, state)
 
         return tp, state
+
+    @partial(jax.jit, static_argnames=["self"])
+    def constraint_check(self, state: mjx.Data) -> jax.Array:
+        """Check for constraint violations (collisions with obstacles)."""
+        if len(self.obstacles) == 0:
+            return jnp.array(0.0)
+
+        base_pos = state.qpos[:2]  # x, y position
+
+        # Extract obstacle xy positions and sizes
+        obs_xy = self.obstacles[:, :2]  # (N, 2)
+        obs_size = self.obstacles[:, 3:5]  # (N, 2) - half_size_x, half_size_y
+
+        # Distance to each obstacle center
+        diff = base_pos - obs_xy  # (N, 2)
+
+        # Box collision: check if robot is within obstacle bounds + safety margin
+        # robot_radius + safety_margin is the effective robot size
+        margin = self.robot_radius + self.safety_margin
+
+        # Check if robot center is inside expanded obstacle box
+        within_x = jnp.abs(diff[:, 0]) < (obs_size[:, 0] + margin)
+        within_y = jnp.abs(diff[:, 1]) < (obs_size[:, 1] + margin)
+        collision = within_x & within_y
+
+        # Return penalty (number of collisions)
+        return jnp.sum(collision)
+
+    def terminal_cost(self, task_params: TaskParams, state: mjx.Data) -> jax.Array:
+        constraint_penalty = self.constraint_check(state)
+        return constraint_penalty
+
+    def running_cost(self, task_params: TaskParams, state: mjx.Data, plan: jax.Array) -> jax.Array:
+        constraint_penalty = self.constraint_check(state)
+        return constraint_penalty
+

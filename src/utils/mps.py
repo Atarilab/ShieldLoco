@@ -3,6 +3,12 @@ import jax.numpy as jnp
 
 from mujoco.mjx._src.math import quat_sub, quat_mul, quat_inv
 
+
+@jax.jit
+def update_params(params, **updates):
+    return params.replace(**updates)
+
+
 # ============================================================================
 # JAX MATH UTILS (QUAT, ROTATIONS, ETC.)
 # ============================================================================

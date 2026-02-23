@@ -67,6 +67,10 @@ class Task(ABC):
         self.u_min = -1
         self.u_max = 1
 
+    def get_reference(self, **kwargs):
+        """Get the reference plan for the current task."""
+        return kwargs.get("ref", None)
+
     @abstractmethod
     def dynamics(
         self,

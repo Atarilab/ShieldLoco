@@ -12,6 +12,7 @@ from safety_filter.bases.risk import RiskStrategy
 
 
 # MIMPS = MMPI MPS
+@dataclass
 class MIMPSParams(QuadAlgSamplingParams):
     """Policy parameters for model-predictive path integral control.
 
@@ -20,7 +21,7 @@ class MIMPSParams(QuadAlgSamplingParams):
     Attributes:
         best_plan: The best plan spline knots found so far.
     """
-    best_plan: jax.Array
+    best_plan: Optional[jax.Array] = None
 
 
 class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
