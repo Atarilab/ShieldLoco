@@ -9,6 +9,8 @@
 # Configurations
 #==
 
+SAFETY_BUILD=false
+
 # Exits if error occurs
 set -e
 
@@ -26,7 +28,9 @@ print_help () {
     echo -e "\t-h, --help           Display the help content."
     echo -e "\t-i, --install        Install ATARI DOOM, build docker container and setup network interface with Go2."
     echo -e "\t-b, --build          Build the docker image."
+    echo -e "\t-s, --safety         Build the safety filter docker image."
     echo -e "\t-e, --enter          Enter the DOOM docker container."
+    echo -e "\t    --safety         Use safety filter image (use with -e)"
     echo -e "\t-d, --delete         Delete all existing DOOM docker containers and images."
     echo -e "\t-a, --attach         Attach shell to existing DOOM docker container."
     echo -e "\n" >&2
@@ -80,7 +84,22 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        -s|--safety)
+            # Build Safety Filter Docker Image
+            SAFETY_BUILD=true
+            echo "Building Safety Filter Docker image 'mujuni-image-safety'..."
+            docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -t mujuni-image-safety -f Dockerfile.safety .
+            shift
+            ;;
+
         -e|--enter)
+            # Check for optional image flag
+            IMAGE_NAME="mujuni-image"
+            if [[ "$2" == "--safety" ]]; then
+                IMAGE_NAME="mujuni-image-safety"
+                shift
+            fi
+            
             # Check if a container with the same name exists
             CONTAINER_NAME="DOOM"  # Replace with your container's desired name
             if ! docker ps -a --format '{{.Names}}' | grep -q "$CONTAINER_NAME"; then
@@ -100,7 +119,7 @@ while [[ $# -gt 0 ]]; do
                     -v $PWD/.vscode:/home/atari/workspace/.vscode \
                     -v $PWD/pyproject.toml:/home/atari/workspace/pyproject.toml \
                     --env XAUTHORITY=/root/.Xauthority \
-                    --name $CONTAINER_NAME mujuni-image
+                    --name $CONTAINER_NAME $IMAGE_NAME
             else
                 # If container exists, just start it
                 echo "Container $CONTAINER_NAME already exists. Starting the container..."

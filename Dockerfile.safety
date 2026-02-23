@@ -1,0 +1,19 @@
+# Safety filter extension image
+FROM mujuni-image
+
+USER root
+
+# ============================================================
+# SAFETY FILTER DEPENDENCIES
+# ============================================================
+
+RUN pip install "jax[cuda12]" 
+RUN pip install "mujoco-mjx==3.3.7" "mujoco-warp==0.0.1" "warp-lang==1.9.1" 
+RUN pip install flax interpax
+RUN pip install --upgrade numpy
+RUN pip install torchax
+
+
+# ============================================================
+
+USER atari
