@@ -22,7 +22,7 @@ def main():
     parser.add_argument(
         "--task",
         type=str,
-        default="rl-velocity-sim-go2",
+        default="rl-mps-sim-go2",
         help="Task name to run (e.g., rl-sim, mpc-real).",
     )
     parser.add_argument("--log", type=str, default="test", help="Experiment name to log information")

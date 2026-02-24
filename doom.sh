@@ -100,31 +100,30 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             
-            # Check if a container with the same name exists
+            # Check if a container with the same name exists and remove it
             CONTAINER_NAME="DOOM"  # Replace with your container's desired name
-            if ! docker ps -a --format '{{.Names}}' | grep -q "$CONTAINER_NAME"; then
-                # If container doesn't exist, create and start a new container
-                xhost +local:root & \
-                docker run --shm-size=2g -it --privileged \
-                    --env-file .env.docker \
-                    --network host \
-                    --device /dev/input \
-                    --group-add 107 \
-                    --user $(id -u):$(id -g) \
-                    --gpus all \
-                    -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
-                    -v /dev/shm:/dev/shm \
-                    -v $PWD/src:/home/atari/workspace/DOOM/src \
-                    -v $HOME/.Xauthority:/root/.Xauthority \
-                    -v $PWD/.vscode:/home/atari/workspace/.vscode \
-                    -v $PWD/pyproject.toml:/home/atari/workspace/pyproject.toml \
-                    --env XAUTHORITY=/root/.Xauthority \
-                    --name $CONTAINER_NAME $IMAGE_NAME
-            else
-                # If container exists, just start it
-                echo "Container $CONTAINER_NAME already exists. Starting the container..."
-                docker start -i $CONTAINER_NAME
+            if docker ps -a --format '{{.Names}}' | grep -q "$CONTAINER_NAME"; then
+                echo "Container $CONTAINER_NAME already exists. Removing..."
+                docker rm -f $CONTAINER_NAME
             fi
+            
+            # Always create fresh container with --user flag to match host UID/GID
+            xhost +local:root & \
+            docker run --shm-size=2g -it --privileged \
+                --env-file .env.docker \
+                --network host \
+                --device /dev/input \
+                --group-add 107 \
+                --user $(id -u):$(id -g) \
+                --gpus all \
+                -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
+                -v /dev/shm:/dev/shm \
+                -v $PWD/src:/home/atari/workspace/DOOM/src \
+                -v $HOME/.Xauthority:/root/.Xauthority \
+                -v $PWD/.vscode:/home/atari/workspace/.vscode \
+                -v $PWD/pyproject.toml:/home/atari/workspace/pyproject.toml \
+                --env XAUTHORITY=/root/.Xauthority \
+                --name $CONTAINER_NAME $IMAGE_NAME
             shift
             ;;
 
@@ -138,8 +137,14 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         -a|--attach)
+            # Check for optional image flag
+            IMAGE_NAME="mujuni-image"
+            if [[ "$2" == "--safety" ]]; then
+                IMAGE_NAME="mujuni-image-safety"
+                shift
+            fi
             # Attach shell to existing docker container
-            docker exec -it $(docker ps --filter "ancestor=mujuni-image" -q | head -n 1) /bin/bash
+            docker exec -it $(docker ps --filter "ancestor=$IMAGE_NAME" -q | head -n 1) /bin/bash
             shift
             ;;
 

@@ -1,0 +1,42 @@
+# policy_path: "contact_policy_actuatorRand.pt"
+# policy_path: "locomotion_go2/contact_policy_feetRandom.pt"
+policy_path: "locomotion_go2/contact_policy_stanceSeperate.pt"
+# policy_path: "locomotion_go2/contact_policy_latest.pt"
+fixed_feet_positions: false
+control_dt: 0.005
+decimation: 4
+action_dim: 12
+action_scale: 0.35
+stiffness: 30.0
+damping: 0.5
+use_threading: False
+use_buffer: False
+device: 'cpu' #"cuda:0"  
+feet_step_size: 0.0
+horizon_length: 200
+action_filter_alpha: 0.5
+transition_duration: 0
+visualize: 
+  future_feet_positions: false
+  current_contact_locations: true
+  opt_contact_locations: true
+  feet_error: false
+  contact_plan: false
+  foot_forces: false
+  contact_status: false
+
+
+ISAAC_LAB_DEFAULT_JOINT_POS: [
+    0.1000, # 0
+    -0.1000, # 1
+    0.1000, # 2
+    -0.1000, # 3
+    0.8000, # 4
+    0.8000, # 5
+    1.0000, # 6
+    1.0000, # 7
+    -1.5000, # 8
+    -1.5000, # 9
+    -1.5000, # 10
+    -1.5000, # 11
+  ] # from asset.data.default_joint_pos; corresponds to ISAACLAB_JOINT_ORDER; is used as action offset

@@ -1,7 +1,9 @@
 # Safety filter extension image
 FROM mujuni-image
 
-USER root
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN usermod -u $USER_UID -g $USER_GID atari || true
 
 # ============================================================
 # SAFETY FILTER DEPENDENCIES
@@ -11,9 +13,11 @@ RUN pip install "jax[cuda12]"
 RUN pip install "mujoco-mjx==3.3.7" "mujoco-warp==0.0.1" "warp-lang==1.9.1" 
 RUN pip install flax interpax
 RUN pip install --upgrade numpy
+RUN pip install --upgrade matplotlib
 RUN pip install torchax
-
 
 # ============================================================
 
-USER atari
+RUN echo "alias go2_mps_sim='cd /home/atari/workspace/DOOM/src && python3 simulate.py --task=rl-mps-sim-go2'" >> /home/atari/.bashrc
+
+RUN echo "alias go2_mps_ros='ros2 run master_manager master_node --task=rl-mps-sim-go2'" >> /home/atari/.bashrc
