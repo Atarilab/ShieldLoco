@@ -196,14 +196,27 @@ class QuadRLTask(Task):
         return jnp.clip(plan * self.plan_lim, -self.plan_lim, self.plan_lim)
 
     @partial(jax.jit, static_argnames=["self"])
-    def get_reference(self, **kwargs):
+    def get_exec_plan(self, plan: jax.Array) -> jax.Array:
+        """Get the executable plan by reshaping and denormalizing the best_plan."""
+        plan_denorm = self.denormalize(plan)
+
+        # Reshape from (H, plan_dim) to (H, 4, 3)
+        plan_reshaped = plan_denorm.reshape(-1, 4, 3)
+
+        return jnp.transpose(plan_reshaped, (1, 0, 2))  # Shape: (4, H, 3)
+
+    @partial(jax.jit, static_argnames=["self"])
+    def get_reference_plan(self, **kwargs):
         """Get the reference trajectory for the MPS planner."""
         ref = kwargs.get("ref", None)
         if ref is not None:
             # action_mps = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
             # plan_dim = ([ref1, ref2], [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]) = 12
-            plan = jnp.transpose(ref, (1, 0, 2)).reshape(-1, self.plan_dim)  # Shape: (H, plan_dim)
-            return plan
+            ref_plan = jnp.transpose(ref, (1, 0, 2)).reshape(-1, self.plan_dim)  # Shape: (H, plan_dim)
+            
+            return self.normalize(ref_plan)
+        else:
+            raise ValueError("Reference plan not provided in kwargs.")
 
     @partial(jax.jit, static_argnames=["self"])
     def update_params(self, task_params: QuadRLTaskParams, kwargs):

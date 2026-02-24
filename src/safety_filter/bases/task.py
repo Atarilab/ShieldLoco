@@ -67,9 +67,21 @@ class Task(ABC):
         self.u_min = -1
         self.u_max = 1
 
-    def get_reference(self, **kwargs):
-        """Get the reference plan for the current task."""
+    def get_reference_plan(self, **kwargs):
+        """Get the reference plan (in optimization) for the current task."""
         return kwargs.get("ref", None)
+
+    def get_exec_plan(self, plan: jax.Array) -> jax.Array:
+        """Get the executable plan by reshaping and denormalizing the optimized plan."""
+        return plan
+
+    @abstractmethod
+    def normalize(self, plan: jax.Array) -> jax.Array:
+        """Normalize the control plan if necessary."""
+        
+    @abstractmethod
+    def denormalize(self, plan: jax.Array) -> jax.Array:
+        """Denormalize the control plan if necessary."""
 
     @abstractmethod
     def dynamics(
