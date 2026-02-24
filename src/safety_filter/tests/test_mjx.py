@@ -91,3 +91,32 @@ for _ in range(10):
     jit_forward(model, data)
 
     print(f"Forward pass took {1000 * (time.time() - start):.2f} ms")
+
+
+import numpy as np
+ngeom = mj_model.ngeom
+geom_is_hazard_np = np.zeros(ngeom, dtype=bool)
+geom_is_robot_np = np.zeros(ngeom, dtype=bool)
+
+# Make it xml specific remember!
+hazard_prefixes = ("obstacle_",)
+base_link_id = mj_model.body("base_link").id
+
+for gid in range(ngeom):
+    # -- HAZARD CHECK --
+    # Handle the case where a geom might not have a name (returns None or empty)
+    geom_name = mj_model.geom(gid).name or ""
+
+    if any(geom_name.startswith(p) for p in hazard_prefixes):
+        geom_is_hazard_np[gid] = True
+
+    # -- ROBOT CHECK --
+    # Find which body this geom belongs to
+    body_id = mj_model.geom_bodyid[gid]
+
+    # Check if this body's ultimate parent is the base_link
+    if mj_model.body_rootid[body_id] == base_link_id:
+        geom_is_robot_np[gid] = True
+
+print("Hazard geoms:", np.where(geom_is_hazard_np)[0])
+print("Robot geoms:", np.where(geom_is_robot_np)[0])

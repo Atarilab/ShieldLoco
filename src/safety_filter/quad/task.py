@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import mujoco
 from mujoco import mjx
+import numpy as np
 
 from utils.mps import *
 from safety_filter.bases.task import Task, TaskParams
@@ -28,10 +29,10 @@ def get_torch_policy():
                 nn.ReLU(),
                 nn.Linear(128, action_dim),
             )
-        
+
         def forward(self, x):
             return self.actor(x)
-    
+
     model = ActorNetwork()
     return model
 
@@ -182,10 +183,34 @@ class QuadRLTask(Task):
         self.plan_dim = 4 * 3  # 4 legs, 3D position
         self.horizon_length = rl_config["horizon_length"]
 
-        # TODO: will be made more general
-        self.obstacles = jnp.array(rl_config.get("obstacles", []))  # Shape: (N, 4)
-        self.safety_margin = rl_config.get("safety_margin", 0.25)
-        self.robot_radius = rl_config.get("robot_radius", 0.15)
+        self.body_name_to_id = {mj_model.body(i).name: i for i in range(mj_model.nbody)}
+        ngeom = mj_model.ngeom
+        geom_is_hazard_np = np.zeros(ngeom, dtype=bool)
+        geom_is_robot_np = np.zeros(ngeom, dtype=bool)
+
+        # Make it xml specific remember!
+        hazard_prefixes = ("obstacle_",)
+        base_link_id = mj_model.body("base_link").id
+
+        for gid in range(ngeom):
+            # -- HAZARD CHECK --
+            # Handle the case where a geom might not have a name (returns None or empty)
+            geom_name = mj_model.geom(gid).name or ""
+
+            if any(geom_name.startswith(p) for p in hazard_prefixes):
+                geom_is_hazard_np[gid] = True
+
+            # -- ROBOT CHECK --
+            # Find which body this geom belongs to
+            body_id = mj_model.geom_bodyid[gid]
+
+            # Check if this body's ultimate parent is the base_link
+            if mj_model.body_rootid[body_id] == base_link_id:
+                geom_is_robot_np[gid] = True
+
+        # Convert to JAX arrays and store them
+        self.geom_is_hazard = jnp.array(geom_is_hazard_np)
+        self.geom_is_robot = jnp.array(geom_is_robot_np)
 
     def normalize(self, plan: jax.Array) -> jax.Array:
         """Normalize the plan to be within [-1, 1] based on plan_lim."""
@@ -212,8 +237,10 @@ class QuadRLTask(Task):
         if ref is not None:
             # action_mps = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
             # plan_dim = ([ref1, ref2], [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]) = 12
-            ref_plan = jnp.transpose(ref, (1, 0, 2)).reshape(-1, self.plan_dim)  # Shape: (H, plan_dim)
-            
+            ref_plan = jnp.transpose(ref, (1, 0, 2)).reshape(
+                -1, self.plan_dim
+            )  # Shape: (H, plan_dim)
+
             return self.normalize(ref_plan)
         else:
             raise ValueError("Reference plan not provided in kwargs.")
@@ -253,7 +280,8 @@ class QuadRLTask(Task):
             new_goal_idx = jnp.where(
                 num_phases == 4,
                 goal_idx + jnp.where(jnp.mod(new_counter, 4) == 0, 1, 0),
-                goal_idx + jnp.where((jnp.mod(new_counter, 2) != 0) & (new_counter > 0), 1, 0),
+                goal_idx
+                + jnp.where((jnp.mod(new_counter, 2) != 0) & (new_counter > 0), 1, 0),
             )
 
             # Safety reset if exceeds horizon
@@ -283,10 +311,7 @@ class QuadRLTask(Task):
 
         # Skip if stance or transition
         task_params = jax.lax.cond(
-            gait <= 1,
-            lambda _: task_params,
-            lambda _: _update_goal(task_params),
-            None
+            gait <= 1, lambda _: task_params, lambda _: _update_goal(task_params), None
         )
 
         return task_params
@@ -327,8 +352,8 @@ class QuadRLTask(Task):
         # 5. contact_time_left = 1
         elapsed = state.time - task_params.command_start_time
         time_left = jnp.maximum(0.0, self.command_duration - elapsed)
-        time_left = jnp.expand_dims(time_left, axis=-1) 
-        
+        time_left = jnp.expand_dims(time_left, axis=-1)
+
         new_start_time = jnp.where(
             elapsed > self.command_duration, state.time, task_params.command_start_time
         )
@@ -428,8 +453,12 @@ class QuadRLTask(Task):
         for _ in range(self.decimation):
             # Here we would apply the joint PD targets to the MuJoCo simulation and step forward
 
-            q = state.qpos[7:self.num_joints + 7]  # Assuming first 7 are base pos and quat
-            dq = state.qvel[6:self.num_joints + 6]  # Assuming first 6 are base lin and ang vel
+            q = state.qpos[
+                7 : self.num_joints + 7
+            ]  # Assuming first 7 are base pos and quat
+            dq = state.qvel[
+                6 : self.num_joints + 6
+            ]  # Assuming first 6 are base lin and ang vel
 
             q_des = u
             dq_des = jnp.zeros_like(dq)
@@ -447,36 +476,52 @@ class QuadRLTask(Task):
 
     @partial(jax.jit, static_argnames=["self"])
     def constraint_check(self, state: mjx.Data) -> jax.Array:
-        """Check for constraint violations (collisions with obstacles)."""
-        if len(self.obstacles) == 0:
-            return jnp.array(0.0)
+        """
+        Safety cost: Penalizes if any robot body collides with any hazard.
+        """
+        data_warp = state._impl  # DataWarp
 
-        base_pos = state.qpos[:2]  # x, y position
+        # Extract contact arrays
+        geom_pairs = data_warp.contact__geom
+        efc_address = data_warp.contact__efc_address
 
-        # Extract obstacle xy positions and sizes
-        obs_xy = self.obstacles[:, :2]  # (N, 2)
-        obs_size = self.obstacles[:, 3:5]  # (N, 2) - half_size_x, half_size_y
+        # Active contact slot if *any* of the 4 constraint dims is active.
+        valid = (efc_address >= 0).any(axis=-1)  # (ncon,)
 
-        # Distance to each obstacle center
-        diff = base_pos - obs_xy  # (N, 2)
+        g1 = geom_pairs[..., 0]  # (ncon,)
+        g2 = geom_pairs[..., 1]  # (ncon,)
 
-        # Box collision: check if robot is within obstacle bounds + safety margin
-        # robot_radius + safety_margin is the effective robot size
-        margin = self.robot_radius + self.safety_margin
+        # Look up categories using the arrays we built in Python
+        is_hazard_1 = self.geom_is_hazard[g1]
+        is_hazard_2 = self.geom_is_hazard[g2]
+        is_robot_1 = self.geom_is_robot[g1]
+        is_robot_2 = self.geom_is_robot[g2]
 
-        # Check if robot center is inside expanded obstacle box
-        within_x = jnp.abs(diff[:, 0]) < (obs_size[:, 0] + margin)
-        within_y = jnp.abs(diff[:, 1]) < (obs_size[:, 1] + margin)
-        collision = within_x & within_y
+        # Logical OR: Collision happens if (G1 is robot AND G2 is hazard) OR vice versa
+        robot_hazard_collision = (is_robot_1 & is_hazard_2) | (is_robot_2 & is_hazard_1)
 
-        # Return penalty (number of collisions)
-        return jnp.sum(collision)
+        # Filter by valid contacts
+        bad_contacts = robot_hazard_collision & valid
+        collides = jnp.any(bad_contacts)  # scalar boolean
+
+        # Check for falling
+        pelvis_id = self.body_name_to_id["pelvis"]
+        pelvis_quat = state.xquat[pelvis_id]
+
+        up_vector = quat_rotate(pelvis_quat, jnp.array([0.0, 0.0, 1.0]))
+        fall_down = up_vector[2] < 0.5
+
+        # Return 1.0 if failure condition met, else 0.0
+        collision_check = jnp.where(collides | fall_down, 1.0, 0.0)
+
+        return collision_check
 
     def terminal_cost(self, task_params: TaskParams, state: mjx.Data) -> jax.Array:
         constraint_penalty = self.constraint_check(state)
         return constraint_penalty
 
-    def running_cost(self, task_params: TaskParams, state: mjx.Data, plan: jax.Array) -> jax.Array:
+    def running_cost(
+        self, task_params: TaskParams, state: mjx.Data, plan: jax.Array
+    ) -> jax.Array:
         constraint_penalty = self.constraint_check(state)
         return constraint_penalty
-
