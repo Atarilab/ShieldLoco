@@ -43,7 +43,7 @@ async def main_async(args=None):
 
     # Parse arguments
     parser = argparse.ArgumentParser(description="ATARI DOOM Robot Controller")
-    parser.add_argument("--task", type=str, default="rl-velocity-sim-go2", help="Task name to run")
+    parser.add_argument("--task", type=str, default="rl-mps-sim-go2", help="Task name to run")
     parser.add_argument("--log", type=str, default="test", help="Experiment name to log information")
     parser.add_argument("--debug", action="store_true", help="Show debug logs")
     parser.add_argument("--ui", action="store_true", help="Enable the Robot Control UI")

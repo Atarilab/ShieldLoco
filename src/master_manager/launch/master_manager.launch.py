@@ -9,7 +9,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     # Define launch arguments
-    task = LaunchConfiguration("task", default="rl-velocity-sim-go2")
+    task = LaunchConfiguration("task", default="rl-mps-sim-go2")
     log = LaunchConfiguration("log", default="test")
     run_simulation = LaunchConfiguration("sim", default="true")
 

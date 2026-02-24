@@ -5,6 +5,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as Go2LowCmd_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as Go2LowState_
 
 from controllers.rl_contact_locomotion_controller import RLQuadrupedLocomotionContactController
+from controllers.rl_mps_controller import RLQuadrupedMPSController
 from controllers.rl_velocity_locomotion_controller import RLQuadrupedLocomotionVelocityController
 from controllers.stand_controller import (
     Go2StanceController,
@@ -255,6 +256,7 @@ class Go2(RobotBase):
         - "STAND_UP": the Go2StandUpController class.
         - "STAND_DOWN": the Go2StandDownController class.
         - "RL-CONTACT": the RLQuadrupedLocomotionContactController class.
+        - "STANCE": the RLQuadrupedMPSController class.
         - "RL-VELOCITY": the RLQuadrupedLocomotionVelocityController class.
 
         The available controllers are determined by the task.
@@ -273,6 +275,18 @@ class Go2(RobotBase):
                 },
                 "LOCOMOTION": {
                     "RL-CONTACT": RLQuadrupedLocomotionContactController,
+                },
+            }
+        elif "mps" in self.task:
+            controllers = {
+                "STAND": {
+                    "STAY_DOWN": Go2StayDownController,
+                    "STAND_UP": Go2StandUpController,
+                    "STAND_DOWN": Go2StandDownController,
+                    "STANCE": Go2StanceController,
+                },
+                "LOCOMOTION": {
+                    "RL-MPS": RLQuadrupedMPSController,
                 },
             }
         elif "velocity" in self.task:
