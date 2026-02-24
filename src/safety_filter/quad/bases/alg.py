@@ -360,7 +360,7 @@ class QuadSamplingBasedPlanner(ABC):
         """Rollout control sequences (in parallel) with optional value bootstrap."""
 
         states, final_state, task_costs, constraint_flags, discount = self.get_rollouts(
-            model, state, params.task_params, plans
+            model, state, params, plans
         )
 
         return states, QuadAlgTrajectory(
@@ -373,7 +373,7 @@ class QuadSamplingBasedPlanner(ABC):
         self,
         model: mjx.Model,
         state: mjx.Data,
-        task_params: QuadRLTaskParams,
+        params: QuadAlgSamplingParams,
         plans: jax.Array,
     ) -> Tuple[mjx.Data, mjx.Data, jax.Array, jax.Array, jax.Array]:
         """Rollout control sequences (in parallel) with optional value bootstrap."""
@@ -383,17 +383,16 @@ class QuadSamplingBasedPlanner(ABC):
         states_list = []
         
         x = state
-        tp = task_params
+        tp = params.task_params
         discount = jnp.asarray(1.0)
         
         for i in range(self.plan_steps - 1):
             a = plans[i:i+2] # shape (2, plan_dim)
+            a_ref = params.ref[i:i+2] # shape (2, plan_dim)
+            
+            tp, x_next = self.task.dynamics(model, tp, x, a, a_ref)
 
-            a_denormalized = self.task.denormalize(a)
-
-            tp, x_next = self.task.dynamics(model, tp, x, a_denormalized)
-
-            task_cost = self.dt * self.task.running_cost(tp, x, a_denormalized) * discount
+            task_cost = self.dt * self.task.running_cost(tp, x, a, a_ref) * discount
 
             constraint_flag = self.task.constraint_check(x) * discount
             

@@ -40,10 +40,6 @@ def get_torch_policy():
 @dataclass
 class QuadRLTaskParams(TaskParams):
     """Task parameters specific to the MPSQuadRL task."""
-
-    # (4 legs, 2 reference points, 3D)
-    nominal_contact_locations_w: jax.Array = jnp.zeros((4, 2, 3))
-
     command_start_time: float = 0.0
     goal_idx: int = 0
     contact_plan: jax.Array = jnp.zeros((4, 2))  # Example shape, adjust as needed
@@ -449,6 +445,7 @@ class QuadRLTask(Task):
         task_params: QuadRLTaskParams,
         state: mjx.Data,
         plan_segment: jax.Array,
+        plan_segment_ref: jax.Array,
     ) -> mjx.Data:
 
         # TODO: check if pending change check is required. See IsaacLab code
@@ -456,7 +453,8 @@ class QuadRLTask(Task):
         # Update goal
         tp = self.update_goal(task_params)
 
-        tp, u = self.rl_forward(tp, state, plan_segment)
+        plan_segment_denorm = self.denormalize(plan_segment)
+        tp, u = self.rl_forward(tp, state, plan_segment_denorm)
 
         # PD Loop
         for _ in range(self.decimation):
@@ -529,15 +527,12 @@ class QuadRLTask(Task):
         return jnp.array(0.0)
 
     def running_cost(
-        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array
+        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array, plan_segment_ref: jax.Array
     ) -> jax.Array:
         # Quadratic cost on MPS action magnitude
         action_cost = jnp.sum(plan_segment**2)
 
-        # be close to nominal contact locations
-        contact_locations_w = self.plan_seg_to_contact_locations(plan_segment)
-        nominal_cost = jnp.sum(
-            (contact_locations_w - task_params.nominal_contact_locations_w) ** 2
-        )
+        # be close to reference plan
+        ref_cost = jnp.sum((plan_segment - plan_segment_ref)**2)
 
-        return action_cost + nominal_cost
+        return action_cost + ref_cost
