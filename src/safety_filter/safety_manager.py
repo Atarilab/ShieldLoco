@@ -1,6 +1,7 @@
 import threading
 import time
 from typing import Callable, Dict, Optional, Any
+from weakref import ref
 
 import numpy as np
 
@@ -54,6 +55,8 @@ class SafetyManager:
         self._safety_override: Optional[Any] = None
 
         self.updated_state = False
+        self.updated_plan = False
+        self.override = False
 
     def init_thread(self):
         self.setup_jax_policy(self.torch_script_policy)
@@ -95,8 +98,7 @@ class SafetyManager:
         self.jit_constraint_check = jax.jit(self.task.constraint_check)
 
         random_seed = np.random.randint(0, 2**31)
-        self.ref = None
-        self.plan = None
+        self.exec_plan = None
         self.policy_params = self.planner.init_params(
             task_params=self.task_params, seed=random_seed
         )
@@ -159,10 +161,7 @@ class SafetyManager:
             qpos = kwargs.get("qpos")
             qvel = kwargs.get("qvel")
             time = kwargs.get("time")
-            ref = kwargs.get("ref")
 
-            # update task_params
-            self.task_params = self.task.update_params(self.task_params, kwargs)
 
             # Update task_data
             self.task.data = update_params(
@@ -171,13 +170,27 @@ class SafetyManager:
                 qvel=jnp.asarray(qvel),
                 time=jnp.asarray(time),
             )
-
-            self.plan = ref
-
-            self.ref = self.task.get_reference(ref=ref)
             self.updated_state = True
 
-    def check(self) -> Any:
+
+            # update task_params
+            self.task_params = self.task.update_params(self.task_params, kwargs)
+
+
+            ref = kwargs.get("ref")
+            ref_plan_normalized = self.task.get_reference_plan(ref=ref)
+            # update policy_params with new reference
+            self.policy_params = update_params(
+                self.policy_params,
+                task_params=self.task_params,
+                ref=ref_plan_normalized,
+            )
+
+
+            self.exec_plan = None
+            self.updated_plan = False
+
+    def check(self):
         """Check for safety and return override command if needed.
 
         This method runs the safety RL policy to find safe contact locations.
@@ -195,7 +208,9 @@ class SafetyManager:
         #     "Safety check not implemented. "
         #     "This method should run the RL policy to find safe contact locations."
         # )
-        return True
+
+        # TODO: add a real check
+        self.override = True
 
     def is_running(self) -> bool:
         """Check if the safety filter is running.
@@ -214,19 +229,22 @@ class SafetyManager:
         while self._thread_manager.should_continue():
             start_time = time.perf_counter()
 
-            if self.updated_state:
-                with self._safety_lock:
+            with self._safety_lock:
+                if self.updated_state:
                     # check safety
-                    override = self.check()
+                    self.check()
 
+                    # optimize plan
                     self.policy_params = self.jit_optimize(
                         self.task.data,
                         self.policy_params,
-                        override
+                        self.override
                     )
 
-                    self.plan = np.asarray(self.policy_params.best_plan)
-                self.updated_state = False
+                    self.exec_plan = np.asarray(self.policy_params.best_plan)
+
+                    self.updated_plan = True
+                    self.updated_state = False
 
             elapsed = time.perf_counter() - start_time
             sleep_time = max(0, (1.0 / self.rate) - elapsed)
