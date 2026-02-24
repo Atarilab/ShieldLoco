@@ -94,7 +94,7 @@ def get_rl_config():
         "mps_iterations": 1,
         "mps_gamma": 0.99,
         "mps_safety_weight": 1e3,
-        "mps_collect_data": False,
+        "mps_collect_data": True,
         "mps_top_fraction": 0.01,
         
         # Obstacles (from scene.xml)
@@ -245,13 +245,52 @@ def main():
     # Check if plan was updated
     print("Checking plan update...")
     with safety_manager._safety_lock:
-        plan = safety_manager.plan
+        plan = safety_manager.exec_plan
     
     if plan is not None:
         print(f"✓ Plan shape: {plan.shape}")
         assert plan.shape == (horizon_length, 12), f"Expected {(horizon_length, 12)}, got {plan.shape}"
     else:
         print("⚠ Plan is None (may need more time or check() implementation)")
+    
+    # Plot 2D trajectory from train_data
+    print("\n--- Plotting 2D Trajectory ---")
+    try:
+        with safety_manager._safety_lock:
+            train_data = safety_manager.policy_params.train_data
+        
+        if train_data is not None:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            
+            # Get x,y from qpos (first 2 elements are x, y of base)
+            qpos = np.array(train_data.states.qpos)
+            num_traj = qpos.shape[0]
+            
+            # Plot all trajectories
+            plt.figure(figsize=(8, 8))
+            for i in range(num_traj):
+                plt.plot(qpos[i, :, 0], qpos[i, :, 1], 'b-', alpha=0.3)
+            
+            # Mark start and end points
+            plt.plot(qpos[:, 0, 0], qpos[:, 0, 1], 'go', label='Start', markersize=10)
+            plt.plot(qpos[:, -1, 0], qpos[:, -1, 1], 'r*', label='End', markersize=10)
+            
+            plt.xlabel('X position')
+            plt.ylabel('Y position')
+            plt.title('Robot 2D Trajectory (from train_data)')
+            plt.legend()
+            plt.grid(True)
+            plt.axis('equal')
+            
+            plot_path = os.path.join(os.path.dirname(__file__), 'trajectory_plot.png')
+            plt.savefig(plot_path)
+            print(f"✓ Trajectory plot saved to {plot_path}")
+        else:
+            print("⚠ train_data is None (collect_data may be False)")
+    except Exception as e:
+        print(f"⚠ Plotting error: {e}")
     
     # Test thread stop
     print("\nStopping safety thread...")
@@ -263,7 +302,9 @@ def main():
     # Test constraint_check (if implemented)
     print("\n--- Verification: Constraint Check ---")
     try:
-        constraint = safety_manager.jit_constraint_check(data)
+        with safety_manager._safety_lock:
+            task_data = safety_manager.task.data
+        constraint = jax.jit(safety_manager.task.constraint_check)(task_data)
         print(f"✓ Constraint check result: {constraint}")
     except NotImplementedError:
         print("⚠ constraint_check not implemented yet")
@@ -273,9 +314,19 @@ def main():
     # Test running_cost and terminal_cost (if implemented)
     print("\n--- Verification: Cost Functions ---")
     try:
-        # Create dummy plan
-        dummy_plan = jnp.zeros((horizon_length, 12))
-        running_cost = safety_manager.task.running_cost(safety_manager.task_params, data, dummy_plan)
+        # Create dummy plan segment (updated API expects 2-point segment + ref segment)
+        plan_dim = getattr(safety_manager.task, "plan_dim", 12)
+        dummy_plan_segment = jnp.zeros((2, plan_dim))
+        dummy_ref_segment = jnp.zeros_like(dummy_plan_segment)
+        with safety_manager._safety_lock:
+            task_params = safety_manager.task_params
+            task_data = safety_manager.task.data
+        running_cost = safety_manager.task.running_cost(
+            task_params,
+            task_data,
+            dummy_plan_segment,
+            dummy_ref_segment,
+        )
         print(f"✓ Running cost: {running_cost}")
     except NotImplementedError:
         print("⚠ running_cost not implemented yet")
@@ -283,7 +334,10 @@ def main():
         print(f"⚠ running_cost error: {e}")
     
     try:
-        terminal_cost = safety_manager.task.terminal_cost(safety_manager.task_params, data)
+        with safety_manager._safety_lock:
+            task_params = safety_manager.task_params
+            task_data = safety_manager.task.data
+        terminal_cost = safety_manager.task.terminal_cost(task_params, task_data)
         print(f"✓ Terminal cost: {terminal_cost}")
     except NotImplementedError:
         print("⚠ terminal_cost not implemented yet")
