@@ -41,6 +41,9 @@ def get_torch_policy():
 class QuadRLTaskParams(TaskParams):
     """Task parameters specific to the MPSQuadRL task."""
 
+    # (4 legs, 2 reference points, 3D)
+    nominal_contact_locations_w: jax.Array = jnp.zeros((4, 2, 3))
+
     command_start_time: float = 0.0
     goal_idx: int = 0
     contact_plan: jax.Array = jnp.zeros((4, 2))  # Example shape, adjust as needed
@@ -95,16 +98,16 @@ class QuadRLTask(Task):
 
     Input:
         mjx.Data: the current state of the system
-        action_mps: the MPS action (delta of contact_locations)
+        plan_segment: the MPS action (delta of contact_locations)
 
     Output:
-        mjx.Data: the next state of the system after applying the action_mps
+        mjx.Data: the next state of the system after applying the plan_segment
 
     Internal Logic:
-        1. action_mps (delta of contact_locations) # TODO: contact_time_left, contact_plan
+        1. plan_segment (delta of contact_locations) # TODO: contact_time_left, contact_plan
             contact_locations: (4, 2, 3) 4 is legs, 2 is reference length, and 3 is xyz position.
-            action_mps: (4, 2, 3) delta of contact_locations
-        2. action_mps + state to observation_rl
+            plan_segment: (4, 2, 3) delta of contact_locations
+        2. plan_segment + state to observation_rl
         3. observation_rl to action_rl (using the learned policy)
         4. action_rl to joint_pd (using the learned policy)
         5. joint_pd to next_state (using the MuJoCo dynamics)
@@ -235,7 +238,7 @@ class QuadRLTask(Task):
         """Get the reference trajectory for the MPS planner."""
         ref = kwargs.get("ref", None)
         if ref is not None:
-            # action_mps = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
+            # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
             # plan_dim = ([ref1, ref2], [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]) = 12
             ref_plan = jnp.transpose(ref, (1, 0, 2)).reshape(
                 -1, self.plan_dim
@@ -263,6 +266,11 @@ class QuadRLTask(Task):
             goal_completion_counter=jnp.asarray(goal_completion_counter),
             in_transition=jnp.asarray(in_transition),
         )
+
+    def plan_seg_to_contact_locations(self, plan_segment: jax.Array) -> jax.Array:
+        # plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
+        # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
+        return jnp.transpose(plan_segment.reshape(2, 4, 3), (1, 0, 2))
 
     def update_goal(self, task_params: QuadRLTaskParams) -> QuadRLTaskParams:
         """Update goal_idx and contact_plan based on gait phase progression."""
@@ -317,7 +325,10 @@ class QuadRLTask(Task):
         return task_params
 
     def get_observation(
-        self, task_params: QuadRLTaskParams, state: mjx.Data, action_mps: jax.Array
+        self,
+        task_params: QuadRLTaskParams,
+        state: mjx.Data,
+        contact_locations_w: jax.Array,
     ) -> jax.Array:
         # Base position and orientation
         base_pos = state.qpos[:3]
@@ -344,7 +355,7 @@ class QuadRLTask(Task):
 
         # 4. contact_locations_b (4, 2, 3) = 24
         # world -> base: p_b = R(q)^T (p_w - p_base)
-        rel = action_mps - base_pos  # broadcast over (4, 2, 3)
+        rel = contact_locations_w - base_pos  # broadcast over (4, 2, 3)
         rel_flat = rel.reshape(-1, 3)  # (8, 3)
         feet_b_flat = jax.vmap(lambda p: quat_rotate_inv(base_quat, p))(rel_flat)
         contact_locations_b = feet_b_flat.reshape(4, self.obs_horizon, 3)
@@ -370,7 +381,7 @@ class QuadRLTask(Task):
 
         # 9. ee_pos_rel_b = 4
         feet_pos_rel_b = (
-            action_mps[:, task_params.goal_idx] - current_feet_pos_w
+            contact_locations_w[:, task_params.goal_idx] - current_feet_pos_w
         )  # (4, 3)
         ee_pos_rel_b = jnp.linalg.norm(feet_pos_rel_b, axis=-1)  # (4,)
 
@@ -407,22 +418,20 @@ class QuadRLTask(Task):
         return joint_pos_targets
 
     def rl_forward(
-        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_mps: jax.Array
+        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array
     ) -> mjx.Data:
         """
         Since this is called inside the planner, state is as it should be but
-            plan_mps shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
+            plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
         We will need to reshape it inside the function.
         But the variables should remain consistent while reshaping.
         """
         # convert carefully
-        # plan_dim = ([ref1, ref2], [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]) = 12
-        # action_mps = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
-        action_mps = jnp.transpose(plan_mps.reshape(2, 4, 3), (1, 0, 2))
+        contact_locations_w = self.plan_seg_to_contact_locations(plan_segment)
 
         # Step 1: Convert MPS action and state to RL observation
         task_params, observation_rl = self.get_observation(
-            task_params, state, action_mps
+            task_params, state, contact_locations_w
         )
 
         # Step 2: Get RL action from the learned policy
@@ -439,7 +448,7 @@ class QuadRLTask(Task):
         model: mjx.Model,
         task_params: QuadRLTaskParams,
         state: mjx.Data,
-        plan_mps: jax.Array,
+        plan_segment: jax.Array,
     ) -> mjx.Data:
 
         # TODO: check if pending change check is required. See IsaacLab code
@@ -447,18 +456,16 @@ class QuadRLTask(Task):
         # Update goal
         tp = self.update_goal(task_params)
 
-        tp, u = self.rl_forward(tp, state, plan_mps)
+        tp, u = self.rl_forward(tp, state, plan_segment)
 
         # PD Loop
         for _ in range(self.decimation):
             # Here we would apply the joint PD targets to the MuJoCo simulation and step forward
 
-            q = state.qpos[
-                7 : self.num_joints + 7
-            ]  # Assuming first 7 are base pos and quat
-            dq = state.qvel[
-                6 : self.num_joints + 6
-            ]  # Assuming first 6 are base lin and ang vel
+            # Assuming first 7 are base pos and quat
+            q = state.qpos[7 : self.num_joints + 7]
+            # Assuming first 6 are base lin and ang vel
+            dq = state.qvel[6 : self.num_joints + 6]
 
             q_des = u
             dq_des = jnp.zeros_like(dq)
@@ -516,12 +523,21 @@ class QuadRLTask(Task):
 
         return collision_check
 
-    def terminal_cost(self, task_params: TaskParams, state: mjx.Data) -> jax.Array:
-        constraint_penalty = self.constraint_check(state)
-        return constraint_penalty
+    def terminal_cost(
+        self, task_params: QuadRLTaskParams, state: mjx.Data
+    ) -> jax.Array:
+        return jnp.array(0.0)
 
     def running_cost(
-        self, task_params: TaskParams, state: mjx.Data, plan: jax.Array
+        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array
     ) -> jax.Array:
-        constraint_penalty = self.constraint_check(state)
-        return constraint_penalty
+        # Quadratic cost on MPS action magnitude
+        action_cost = jnp.sum(plan_segment**2)
+
+        # be close to nominal contact locations
+        contact_locations_w = self.plan_seg_to_contact_locations(plan_segment)
+        nominal_cost = jnp.sum(
+            (contact_locations_w - task_params.nominal_contact_locations_w) ** 2
+        )
+
+        return action_cost + nominal_cost
