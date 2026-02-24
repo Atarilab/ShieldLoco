@@ -67,7 +67,8 @@ class QuadAlgSamplingParams:
     """Parameters for sampling-based control algorithms.
 
     Attributes:
-        mean: The mean of the plan distribution, μ = [u₀, ...].
+        mean: Offset around the reference trajectory (not absolute controls).
+              Absolute plan is typically ref + mean (+ noise).
         rng: The pseudo-random number generator key.
         ref: The reference trajectory that we are sampling around.
 

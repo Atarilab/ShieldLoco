@@ -144,7 +144,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         """Initialize the policy parameters."""
         _params = super().init_params(task_params, initial_mean, ref_traj, seed)
 
-        best_plan = _params.mean.copy()
+        # best_plan should be absolute controls, not offset-only.
+        best_plan = (_params.ref + _params.mean).copy()
 
         return MIMPSParams(
             mean=_params.mean,
@@ -172,7 +173,10 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         return mean, params.replace(rng=rng)  # type: ignore
 
     def prepare_optimize(self, state: mjx.Data, params: MIMPSParams) -> MIMPSParams:
-        new_mean = jnp.clip(params.mean, self.task.u_min, self.task.u_max)
+        # mean is an offset; clip in absolute control space, then map back.
+        abs_plan = params.ref + params.mean
+        abs_plan = jnp.clip(abs_plan, self.task.u_min, self.task.u_max)
+        new_mean = abs_plan - params.ref
 
         params = params.replace(  # type: ignore
             mean=new_mean
@@ -180,8 +184,11 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         return params
 
-    def update_without_plan(self, params):
-        return params.replace(
+    def update_without_plan(self, params: MIMPSParams):
+        zero_offset = jnp.zeros_like(params.ref)
+        return params.replace(  # type: ignore
+            mean=zero_offset,
+            best_plan=params.ref,
             train_data=(
                 self._empty_train_data(self.num_samples) if self.collect_data else None
             )
@@ -189,8 +196,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
     def finalize_best_plan(self, params: MIMPSParams) -> MIMPSParams:
         """Finalize the best plan by clip and denormalizing if necessary."""
-        best_plan = jnp.clip(params.best_plan, self.task.u_min, self.task.u_max)
-
-        best_plan = self.task.denormalize(best_plan)
+        best_plan = self.task.get_exec_plan(params.best_plan)
 
         return params.replace(best_plan=best_plan)  # type: ignore
