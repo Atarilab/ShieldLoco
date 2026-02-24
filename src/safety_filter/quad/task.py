@@ -1,5 +1,5 @@
 import copy
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +40,7 @@ def get_torch_policy():
 @dataclass
 class QuadRLTaskParams(TaskParams):
     """Task parameters specific to the MPSQuadRL task."""
+
     command_start_time: float = 0.0
     goal_idx: int = 0
     contact_plan: jax.Array = jnp.zeros((4, 2))  # Example shape, adjust as needed
@@ -325,7 +326,7 @@ class QuadRLTask(Task):
         task_params: QuadRLTaskParams,
         state: mjx.Data,
         contact_locations_w: jax.Array,
-    ) -> jax.Array:
+    ) -> Tuple[QuadRLTaskParams, jax.Array]:
         # Base position and orientation
         base_pos = state.qpos[:3]
         base_quat = state.qpos[3:7]
@@ -415,7 +416,7 @@ class QuadRLTask(Task):
 
     def rl_forward(
         self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array
-    ) -> mjx.Data:
+    ) -> Tuple[QuadRLTaskParams, jax.Array]:
         """
         Since this is called inside the planner, state is as it should be but
             plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
@@ -445,8 +446,11 @@ class QuadRLTask(Task):
         task_params: QuadRLTaskParams,
         state: mjx.Data,
         plan_segment: jax.Array,
-        plan_segment_ref: jax.Array,
-    ) -> mjx.Data:
+        plan_segment_ref: jax.Array | None = None,
+    ) -> Tuple[QuadRLTaskParams, mjx.Data]:
+        # If ref is optional, default to zeros (or task's current ref convention)
+        if plan_segment_ref is None:
+            plan_segment_ref = jnp.zeros_like(plan_segment)
 
         # TODO: check if pending change check is required. See IsaacLab code
         # TODO: currently gait is fixed during rollout
@@ -527,12 +531,19 @@ class QuadRLTask(Task):
         return jnp.array(0.0)
 
     def running_cost(
-        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array, plan_segment_ref: jax.Array
+        self,
+        task_params: QuadRLTaskParams,
+        state: mjx.Data,
+        plan_segment: jax.Array,
+        plan_segment_ref: jax.Array | None = None,
     ) -> jax.Array:
+        if plan_segment_ref is None:
+            plan_segment_ref = jnp.zeros_like(plan_segment)
+
         # Quadratic cost on MPS action magnitude
         action_cost = jnp.sum(plan_segment**2)
 
         # be close to reference plan
-        ref_cost = jnp.sum((plan_segment - plan_segment_ref)**2)
+        ref_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
 
         return action_cost + ref_cost

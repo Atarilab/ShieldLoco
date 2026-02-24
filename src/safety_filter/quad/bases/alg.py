@@ -424,7 +424,6 @@ class QuadSamplingBasedPlanner(ABC):
 
         H = self.plan_steps
         B = int(R * N * self.top_fraction)
-        T = H + 1
 
         def make_leaf(x):
             return jnp.zeros((B, H) + x.shape, dtype=x.dtype)
@@ -436,9 +435,9 @@ class QuadSamplingBasedPlanner(ABC):
             xquat=jnp.zeros(self.task.data.xquat.shape),  # type: ignore
         )
         dummy_states = jax.tree_util.tree_map(make_leaf, state)
-        dummy_plans = jnp.zeros((B, H, self.task.plan_dim), dtype=jnp.float32)
-        dummy_costs = jnp.zeros((B, T), dtype=jnp.float32)
-        dummy_constraint_flags = jnp.zeros((B, T), dtype=jnp.float32)
+        dummy_plans = jnp.zeros((B, H-1, self.task.plan_dim), dtype=jnp.float32)
+        dummy_costs = jnp.zeros((B, H), dtype=jnp.float32)
+        dummy_constraint_flags = jnp.zeros((B, H), dtype=jnp.float32)
 
         return QuadAlgTrainData(
             states=dummy_states,

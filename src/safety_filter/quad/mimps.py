@@ -69,6 +69,9 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             iterations=iterations,
         )
 
+        if temperature <= 0.0:
+            raise ValueError("temperature must be > 0")
+
         self.noise_level = noise_level
         self.num_samples = num_samples
         self.temperature = temperature

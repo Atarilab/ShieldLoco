@@ -90,6 +90,7 @@ class Task(ABC):
         task_params: TaskParams,
         state: mjx.Data,
         control: jax.Array,
+        control_ref: jax.Array | None = None,
     ) -> Tuple[TaskParams, mjx.Data]:
         """The dynamics function f(xₜ, uₜ) that maps the current state and control to
         the next state.
@@ -108,7 +109,11 @@ class Task(ABC):
 
     @abstractmethod
     def running_cost(
-        self, task_params: TaskParams, state: mjx.Data, control: jax.Array
+        self,
+        task_params: TaskParams,
+        state: mjx.Data,
+        control: jax.Array,
+        control_ref: jax.Array | None = None,
     ) -> jax.Array:
         """The running cost ℓ(xₜ, uₜ).
 
