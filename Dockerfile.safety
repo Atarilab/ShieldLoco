@@ -15,6 +15,7 @@ RUN pip install flax interpax
 RUN pip install --upgrade numpy
 RUN pip install --upgrade matplotlib
 RUN pip install torchax
+RUN pip install viser
 
 # ============================================================
 

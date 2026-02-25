@@ -5,6 +5,11 @@ BASE_LINK: "base_link"
 
 SIMULATION_DT: 0.005
 VIEWER_DT: 0.02  # 50 fps for viewer
+WEB_VIEWER_BACKEND: "viser"  # "none" | "viser"
+WEB_VIEWER_HOST: "0.0.0.0"
+WEB_VIEWER_PORT: 8080
+WEB_VIEWER_DT: 0.03  # ~33 fps for web updates
+WEB_VIEWER_SHARE_URL: False
 PRINT_SCENE_INFORMATION: True
 INTERFACE: "lo"
 DOMAIN_ID: 1
