@@ -64,11 +64,20 @@ class SimRobotInterface:
         self.web_viewer_port = int(config.get("WEB_VIEWER_PORT", 8080))
         self.web_viewer_dt = float(config.get("WEB_VIEWER_DT", config["VIEWER_DT"]))
         self.web_viewer_share_url = bool(config.get("WEB_VIEWER_SHARE_URL", False))
+        self.web_viewer_show_base = bool(config.get("WEB_VIEWER_SHOW_BASE", True))
+        self.web_viewer_tracked_bodies = config.get("WEB_VIEWER_TRACKED_BODIES", None)
+        self.web_viewer_auto_track_filters = [
+            str(value).lower() for value in config.get("WEB_VIEWER_AUTO_TRACK_FILTERS", ["foot", "toe"])
+        ]
+        self.web_viewer_base_axes_length = float(config.get("WEB_VIEWER_BASE_AXES_LENGTH", 0.3))
+        self.web_viewer_base_axes_radius = float(config.get("WEB_VIEWER_BASE_AXES_RADIUS", 0.015))
+        self.web_viewer_body_axes_length = float(config.get("WEB_VIEWER_BODY_AXES_LENGTH", 0.16))
+        self.web_viewer_body_axes_radius = float(config.get("WEB_VIEWER_BODY_AXES_RADIUS", 0.008))
         self.web_server = None
         self.web_viewer_url = None
         self.web_viewer_share_link = None
-        self.web_base_handle = None
-        self.web_object_handle = None
+        self.web_tracked_body_ids = []
+        self.web_tracked_body_handles = {}
 
         if self.web_viewer_backend == "viser":
             self._initialize_web_viewer()
@@ -87,11 +96,12 @@ class SimRobotInterface:
         # Start threads
         self.viewer_thread = Thread(target=self._physics_viewer_thread)
         self.sim_thread = Thread(target=self._simulation_thread)
-        self.web_thread = Thread(target=self._web_viewer_thread)
+        self.web_thread = Thread(target=self._web_viewer_thread) if self.web_server is not None else None
 
         self.viewer_thread.start()
         self.sim_thread.start()
-        self.web_thread.start()
+        if self.web_thread is not None:
+            self.web_thread.start()
 
     def _initialize_web_viewer(self):
         if viser is None:
@@ -113,20 +123,62 @@ class SimRobotInterface:
 
         self.web_server.scene.set_up_direction("+z")
         self.web_server.scene.add_grid("/world/grid", width=8.0, height=8.0, plane="xy")
-        self.web_base_handle = self.web_server.scene.add_frame(
-            "/robot/base",
-            axes_length=0.3,
-            axes_radius=0.015,
-        )
-        if self.object_id >= 0:
-            self.web_object_handle = self.web_server.scene.add_icosphere(
-                "/world/object",
-                radius=0.06,
-                color=(255, 140, 0),
-            )
+        self._initialize_web_body_frames()
 
         if self.web_viewer_share_url:
             self.web_viewer_share_link = self.web_server.request_share_url(verbose=False)
+
+    def _resolve_web_tracked_body_names(self):
+        selected_body_names = []
+
+        if self.web_viewer_tracked_bodies is not None:
+            selected_body_names.extend([str(name) for name in self.web_viewer_tracked_bodies])
+        else:
+            for body_id in range(1, self.mj_model.nbody):
+                body_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                if body_name is None:
+                    continue
+                lowered_name = body_name.lower()
+                if any(token in lowered_name for token in self.web_viewer_auto_track_filters):
+                    selected_body_names.append(body_name)
+
+        if self.web_viewer_show_base and self.base_body_id >= 0:
+            selected_body_names.insert(0, self.base_link_name)
+
+        unique_names = []
+        seen = set()
+        for body_name in selected_body_names:
+            if body_name in seen:
+                continue
+            seen.add(body_name)
+            unique_names.append(body_name)
+        return unique_names
+
+    def _initialize_web_body_frames(self):
+        if self.web_server is None:
+            return
+
+        selected_body_names = self._resolve_web_tracked_body_names()
+
+        for body_name in selected_body_names:
+            body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                continue
+            self.web_tracked_body_ids.append(body_id)
+            if body_id == self.base_body_id:
+                axes_length = self.web_viewer_base_axes_length
+                axes_radius = self.web_viewer_base_axes_radius
+                frame_path = "/robot/base"
+            else:
+                axes_length = self.web_viewer_body_axes_length
+                axes_radius = self.web_viewer_body_axes_radius
+                frame_path = f"/robot/frames/{body_name}"
+
+            self.web_tracked_body_handles[body_id] = self.web_server.scene.add_frame(
+                frame_path,
+                axes_length=axes_length,
+                axes_radius=axes_radius,
+            )
 
     def _simulation_thread(self):
         ChannelFactoryInitialize(self.domain_id, self.interface)
@@ -172,20 +224,27 @@ class SimRobotInterface:
         self.viewer.opt.frame = mujoco.mjtFrame.mjFRAME_WORLD
         while not self.stop_event.is_set() and self.viewer.is_running():
             with self.locker:
-                # Find the robot body (might need adjustment based on your exact model)
-                robot_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.base_link_name)
-                if robot_body_id >= 0 and self.fixed_base_pos is None:
-                    robot_pos = self.mj_data.xpos[robot_body_id]
-
-                    # Set camera lookat point
-                    self.viewer.cam.lookat[:] = robot_pos
-
-                    # Optional: soft zoom and angle
-                    self.viewer.cam.distance = 3.0
-                    self.viewer.cam.elevation = -20
+                self._update_mujoco_viewer_camera()
 
                 self.viewer.sync()
             time.sleep(self.viewer_dt)
+
+    def _update_mujoco_viewer_camera(self):
+        if self.viewer is None or self.base_body_id < 0 or self.fixed_base_pos is not None:
+            return
+        robot_pos = self.mj_data.xpos[self.base_body_id]
+        self.viewer.cam.lookat[:] = robot_pos
+        self.viewer.cam.distance = 3.0
+        self.viewer.cam.elevation = -20
+
+    def _snapshot_tracked_body_poses(self):
+        tracked_body_poses = {}
+        for body_id in self.web_tracked_body_ids:
+            tracked_body_poses[body_id] = (
+                np.array(self.mj_data.xpos[body_id], copy=True),
+                np.array(self.mj_data.xquat[body_id], copy=True),
+            )
+        return tracked_body_poses
 
     def _web_viewer_thread(self):
         if self.web_server is None:
@@ -193,25 +252,15 @@ class SimRobotInterface:
 
         while not self.stop_event.is_set():
             with self.locker:
-                if self.base_body_id >= 0:
-                    base_pos = np.array(self.mj_data.xpos[self.base_body_id], copy=True)
-                    base_quat = np.array(self.mj_data.xquat[self.base_body_id], copy=True)
-                else:
-                    base_pos = None
-                    base_quat = None
-
-                if self.object_id >= 0:
-                    object_pos = np.array(self.mj_data.xpos[self.object_id], copy=True)
-                else:
-                    object_pos = None
+                tracked_body_poses = self._snapshot_tracked_body_poses()
 
             with self.web_server.atomic():
-                if self.web_base_handle is not None and base_pos is not None and base_quat is not None:
-                    self.web_base_handle.position = tuple(base_pos.tolist())
-                    self.web_base_handle.wxyz = tuple(base_quat.tolist())
-
-                if self.web_object_handle is not None and object_pos is not None:
-                    self.web_object_handle.position = tuple(object_pos.tolist())
+                for body_id, (body_pos, body_quat) in tracked_body_poses.items():
+                    body_handle = self.web_tracked_body_handles.get(body_id)
+                    if body_handle is None:
+                        continue
+                    body_handle.position = tuple(body_pos.tolist())
+                    body_handle.wxyz = tuple(body_quat.tolist())
 
             time.sleep(self.web_viewer_dt)
 
@@ -233,7 +282,8 @@ class SimRobotInterface:
 
         self.viewer_thread.join()
         self.sim_thread.join()
-        self.web_thread.join()
+        if self.web_thread is not None:
+            self.web_thread.join()
         logger.info("Simulation exited successfully.")
 
 
