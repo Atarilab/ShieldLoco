@@ -100,15 +100,26 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             
-            # Check if a container with the same name exists and remove it
-            CONTAINER_NAME="DOOM"  # Replace with your container's desired name
+            CONTAINER_NAME="DOOM"
             if docker ps -a --format '{{.Names}}' | grep -q "$CONTAINER_NAME"; then
-                # echo "Container $CONTAINER_NAME already exists. Removing..."
-                # docker rm -f $CONTAINER_NAME
-                echo "Container $CONTAINER_NAME already exists..."
+                EXISTING_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME")
+                if [[ "$EXISTING_IMAGE" != "$IMAGE_NAME" ]]; then
+                    echo "Container $CONTAINER_NAME exists with image '$EXISTING_IMAGE' (requested '$IMAGE_NAME'). Reusing existing container."
+                else
+                    echo "Container $CONTAINER_NAME already exists. Reusing it."
+                fi
+
+                if ! docker ps --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
+                    echo "Starting container $CONTAINER_NAME..."
+                    docker start "$CONTAINER_NAME" >/dev/null
+                fi
+
+                docker exec -it "$CONTAINER_NAME" /bin/bash
+                shift
+                continue
             fi
             
-            # Always create fresh container with --user flag to match host UID/GID
+            # Create container only if it does not exist
             xhost +local:root & \
             docker run --shm-size=2g -it --privileged \
                 --env-file .env.docker \
