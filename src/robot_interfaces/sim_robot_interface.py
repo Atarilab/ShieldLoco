@@ -66,6 +66,7 @@ class SimRobotInterface:
         self.web_viewer_dt = float(config.get("WEB_VIEWER_DT", config["VIEWER_DT"]))
         self.web_viewer_share_url = bool(config.get("WEB_VIEWER_SHARE_URL", False))
         self.web_viewer_show_base = bool(config.get("WEB_VIEWER_SHOW_BASE", True))
+        self.web_viewer_show_frames = bool(config.get("WEB_VIEWER_SHOW_FRAMES", True))
         self.web_viewer_tracked_bodies = config.get("WEB_VIEWER_TRACKED_BODIES", None)
         self.web_viewer_auto_track_filters = [
             str(value).lower() for value in config.get("WEB_VIEWER_AUTO_TRACK_FILTERS", ["foot", "toe"])
@@ -74,12 +75,22 @@ class SimRobotInterface:
         self.web_viewer_base_axes_radius = float(config.get("WEB_VIEWER_BASE_AXES_RADIUS", 0.015))
         self.web_viewer_body_axes_length = float(config.get("WEB_VIEWER_BODY_AXES_LENGTH", 0.16))
         self.web_viewer_body_axes_radius = float(config.get("WEB_VIEWER_BODY_AXES_RADIUS", 0.008))
+        self.web_viewer_show_collisions = bool(config.get("WEB_VIEWER_SHOW_COLLISIONS", False))
+        collision_group = config.get("WEB_VIEWER_COLLISION_GROUP", None)
+        self.web_viewer_collision_group = None if collision_group is None else int(collision_group)
+        self.web_viewer_collision_opacity = float(config.get("WEB_VIEWER_COLLISION_OPACITY", 0.35))
+        self.web_viewer_collision_wireframe = bool(config.get("WEB_VIEWER_COLLISION_WIREFRAME", False))
+        raw_collision_color = config.get("WEB_VIEWER_COLLISION_COLOR", [255, 120, 80])
+        self.web_viewer_collision_color = tuple(raw_collision_color)
         self.web_server = None
         self.web_viewer_url = None
         self.web_viewer_share_link = None
         self.web_tracked_body_ids = []
         self.web_tracked_body_handles = {}
+        self.web_collision_body_ids = []
+        self.web_collision_body_handles = {}
         self.web_reset_button = None
+        self.web_toggle_frames_button = None
 
         if self.web_viewer_backend == "viser":
             self._initialize_web_viewer()
@@ -132,7 +143,15 @@ class SimRobotInterface:
         except Exception:
             self.web_reset_button = None
 
+        try:
+            self.web_toggle_frames_button = self.web_server.gui.add_button("Toggle Frames")
+            self.web_toggle_frames_button.on_click(lambda _: self._toggle_web_frames_visibility())
+        except Exception:
+            self.web_toggle_frames_button = None
+
         self._initialize_web_body_frames()
+        if self.web_viewer_show_collisions:
+            self._initialize_web_collision_geometries()
 
         if self.web_viewer_share_url:
             self.web_viewer_share_link = self.web_server.request_share_url(verbose=False)
@@ -187,7 +206,108 @@ class SimRobotInterface:
                 frame_path,
                 axes_length=axes_length,
                 axes_radius=axes_radius,
+                visible=self.web_viewer_show_frames,
             )
+
+    def _set_web_frames_visibility(self, visible: bool):
+        self.web_viewer_show_frames = visible
+        for body_handle in self.web_tracked_body_handles.values():
+            body_handle.visible = visible
+
+    def _toggle_web_frames_visibility(self):
+        self._set_web_frames_visibility(not self.web_viewer_show_frames)
+
+    def _should_visualize_collision_geom(self, geom_id):
+        geom_contype = int(self.mj_model.geom_contype[geom_id])
+        geom_conaffinity = int(self.mj_model.geom_conaffinity[geom_id])
+        if geom_contype == 0 and geom_conaffinity == 0:
+            return False
+
+        if self.web_viewer_collision_group is not None:
+            geom_group = int(self.mj_model.geom_group[geom_id])
+            if geom_group != self.web_viewer_collision_group:
+                return False
+
+        return True
+
+    def _initialize_web_collision_geometries(self):
+        if self.web_server is None:
+            return
+
+        added_body_ids = set()
+        for geom_id in range(self.mj_model.ngeom):
+            if not self._should_visualize_collision_geom(geom_id):
+                continue
+
+            geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
+            if geom_body_id < 0:
+                continue
+
+            body_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, geom_body_id)
+            if body_name is None:
+                body_name = f"body_{geom_body_id}"
+
+            body_frame_path = f"/robot/collisions/bodies/{body_name}"
+            if geom_body_id not in self.web_collision_body_handles:
+                self.web_collision_body_handles[geom_body_id] = self.web_server.scene.add_frame(
+                    body_frame_path,
+                    show_axes=False,
+                )
+
+            if geom_body_id not in added_body_ids:
+                self.web_collision_body_ids.append(geom_body_id)
+                added_body_ids.add(geom_body_id)
+
+            geom_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            if geom_name is None:
+                geom_name = f"geom_{geom_id}"
+
+            geom_path = f"{body_frame_path}/{geom_name}_{geom_id}"
+            geom_type = int(self.mj_model.geom_type[geom_id])
+            geom_pos = tuple(self.mj_model.geom_pos[geom_id].tolist())
+            geom_quat = tuple(self.mj_model.geom_quat[geom_id].tolist())
+            geom_size = self.mj_model.geom_size[geom_id]
+
+            if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+                radius = float(geom_size[0])
+                self.web_server.scene.add_icosphere(
+                    geom_path,
+                    radius=radius,
+                    color=self.web_viewer_collision_color,
+                    opacity=self.web_viewer_collision_opacity,
+                    wireframe=self.web_viewer_collision_wireframe,
+                    wxyz=geom_quat,
+                    position=geom_pos,
+                )
+            elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+                dimensions = (
+                    float(2.0 * geom_size[0]),
+                    float(2.0 * geom_size[1]),
+                    float(2.0 * geom_size[2]),
+                )
+                self.web_server.scene.add_box(
+                    geom_path,
+                    dimensions=dimensions,
+                    color=self.web_viewer_collision_color,
+                    opacity=self.web_viewer_collision_opacity,
+                    wireframe=self.web_viewer_collision_wireframe,
+                    wxyz=geom_quat,
+                    position=geom_pos,
+                )
+            elif geom_type in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE):
+                radius = float(geom_size[0])
+                half_length = float(geom_size[1])
+                height = float(2.0 * half_length)
+                self.web_server.scene.add_cylinder(
+                    geom_path,
+                    radius=radius,
+                    height=height,
+                    color=self.web_viewer_collision_color,
+                    opacity=self.web_viewer_collision_opacity,
+                    wireframe=self.web_viewer_collision_wireframe,
+                    wxyz=geom_quat,
+                    position=geom_pos,
+                )
 
     def _simulation_thread(self):
         ChannelFactoryInitialize(self.domain_id, self.interface)
@@ -242,7 +362,10 @@ class SimRobotInterface:
 
     def _snapshot_tracked_body_poses(self):
         tracked_body_poses = {}
-        for body_id in self.web_tracked_body_ids:
+        tracked_ids = set(self.web_tracked_body_ids)
+        tracked_ids.update(self.web_collision_body_ids)
+
+        for body_id in tracked_ids:
             tracked_body_poses[body_id] = (
                 np.array(self.mj_data.xpos[body_id], copy=True),
                 np.array(self.mj_data.xquat[body_id], copy=True),
@@ -260,10 +383,14 @@ class SimRobotInterface:
             with self.web_server.atomic():
                 for body_id, (body_pos, body_quat) in tracked_body_poses.items():
                     body_handle = self.web_tracked_body_handles.get(body_id)
-                    if body_handle is None:
-                        continue
-                    body_handle.position = tuple(body_pos.tolist())
-                    body_handle.wxyz = tuple(body_quat.tolist())
+                    if body_handle is not None:
+                        body_handle.position = tuple(body_pos.tolist())
+                        body_handle.wxyz = tuple(body_quat.tolist())
+
+                    collision_body_handle = self.web_collision_body_handles.get(body_id)
+                    if collision_body_handle is not None:
+                        collision_body_handle.position = tuple(body_pos.tolist())
+                        collision_body_handle.wxyz = tuple(body_quat.tolist())
 
             time.sleep(self.web_viewer_dt)
 
