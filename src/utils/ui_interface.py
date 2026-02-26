@@ -26,14 +26,14 @@ class RobotControlUI(App):
         Screen {
             background: rgb(0, 0, 0);
             color: rgb(220, 220, 240);
-            align: center middle;
+            align: center top;
         }
 
         #main-container {
             width: 100%;
             height: 100%;
             layout: horizontal;
-            padding: 1;
+            padding: 0 1;
         }
 
         #menu-container {
@@ -57,10 +57,10 @@ class RobotControlUI(App):
 
         #control-container {
             width: 100%;
-            height: 80%;
+            height: auto;
             border: round $primary;
             background: rgb(30, 30, 45);
-            padding: 2;
+            padding: 1;
         }
         
 
@@ -75,6 +75,8 @@ class RobotControlUI(App):
         #subtitle {
             text-align: center;
             color: #6cb4ee;
+            width: 100%;
+            height: auto;
             margin-top: 1;
             margin-bottom: 1;
         }
@@ -89,7 +91,7 @@ class RobotControlUI(App):
 
         .menu {
             height: auto;
-            margin: 1;
+            margin: 0 1;
             padding: 1;
             display: none;
             background: rgb(40, 40, 60);
@@ -112,7 +114,7 @@ class RobotControlUI(App):
         }
 
         Button {
-            min-width: 20;
+            min-width: 14;
             margin: 1 0;
             background: rgb(50, 50, 80);  /* Darker button background */
             color: rgb(200, 200, 230);    /* Soft light text */
@@ -158,14 +160,14 @@ class RobotControlUI(App):
         }
 
         .command-label {
-            width: 40%;
+            width: 100%;
             text-align: right;
             padding-right: 1;
             margin-right: 1;
         }
 
        .command-input {
-            width: 40%;
+            width: 100%;
             margin-right: 1;
         }
 
@@ -202,7 +204,7 @@ class RobotControlUI(App):
         }
 
         .gait-button {
-            width: 50%;
+            width: 100%;
             margin: 0 1;
             background: rgb(50, 50, 80);
             color: rgb(200, 200, 230);
@@ -264,7 +266,10 @@ class RobotControlUI(App):
                         controller_type, task, interface, robot = self.task_name.split("-")
                     except ValueError:
                         controller_type = task = interface = robot = "Unknown"
-                    subtitle = f"[b]Controller:[/b] {controller_type.upper()}    [b]Task:[/b] {task.capitalize()}    [b]Interface:[/b] {interface.capitalize()}    [b]Robot:[/b] {robot.capitalize()}"
+                    subtitle = (
+                        f"[b]Controller:[/b] {controller_type.upper()}    [b]Task:[/b] {task.capitalize()}\n"
+                        f"[b]Interface:[/b] {interface.capitalize()}    [b]Robot:[/b] {robot.capitalize()}"
+                    )
                     yield Static(subtitle, id="subtitle")
                     yield Static("Current Status: ZERO", id="status")
 
