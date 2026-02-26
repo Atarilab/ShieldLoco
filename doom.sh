@@ -151,12 +151,38 @@ while [[ $# -gt 0 ]]; do
         -a|--attach)
             # Check for optional image flag
             IMAGE_NAME="mujuni-image"
+            SAFETY_FLAG=""
             if [[ "$2" == "--safety" ]]; then
                 IMAGE_NAME="mujuni-image-safety"
+                SAFETY_FLAG=" --safety"
                 shift
             fi
+
+            CONTAINER_NAME="DOOM"
+            TARGET_CONTAINER=""
+
+            if docker ps -a --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
+                EXISTING_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME")
+                if [[ "$EXISTING_IMAGE" != "$IMAGE_NAME" ]]; then
+                    echo "Container $CONTAINER_NAME uses image '$EXISTING_IMAGE' (requested '$IMAGE_NAME'). Attaching to existing container."
+                fi
+                TARGET_CONTAINER="$CONTAINER_NAME"
+            else
+                TARGET_CONTAINER=$(docker ps -a --filter "ancestor=$IMAGE_NAME" --format '{{.Names}}' | head -n 1)
+            fi
+
+            if [[ -z "$TARGET_CONTAINER" ]]; then
+                echo "[Error] No container found for image '$IMAGE_NAME'. Start one with: ./doom.sh -e$SAFETY_FLAG" >&2
+                exit 1
+            fi
+
+            if ! docker ps --format '{{.Names}}' | grep -q "^$TARGET_CONTAINER$"; then
+                echo "Starting container $TARGET_CONTAINER..."
+                docker start "$TARGET_CONTAINER" >/dev/null
+            fi
+
             # Attach shell to existing docker container
-            docker exec -it $(docker ps --filter "ancestor=$IMAGE_NAME" -q | head -n 1) /bin/bash
+            docker exec -it "$TARGET_CONTAINER" /bin/bash
             shift
             ;;
 
