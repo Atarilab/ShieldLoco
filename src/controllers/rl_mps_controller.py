@@ -12,13 +12,18 @@ from state_manager.obs_manager import ObsTerm
 
 from utils.frequency_tracker import FrequencyTracker
 
+from safety_filter.safety_manager import SafetyManager
+
 if TYPE_CHECKING:
     from robots.robot_base import RobotBase
+    from commands.command_manager import CommandManager
+
+import numpy as np
 
 
 class RLQuadrupedMPSController(RLControllerBase):
     """
-    Contact-conditioned RL Locomotion Controller
+    MPS Contact-conditioned RL Locomotion Controller
     Uses contact-explicit reinforcement learning policy
     """
 
@@ -220,6 +225,29 @@ class RLQuadrupedMPSController(RLControllerBase):
         #     logger=self.logger  # Will be updated when logger is available
         # )
 
+        self.safety_manager = SafetyManager(
+            mj_model=self.robot.mj_model.model,
+            rl_policy=self.policy,
+            rl_config=configs["controller_config"],
+            rate=20,
+            logger=self.logger,
+        )
+
+    def set_cmd_manager(self, cmd_manager: "CommandManager"):
+        """
+        Configure command manager for the controller.
+
+        :param obs_manager: Command manager instance
+        """
+        super().set_cmd_manager(cmd_manager)
+
+        safety_manager = getattr(self, "safety_manager", None)
+        if safety_manager is not None:
+            safety_manager.logger = self.logger
+            thread_manager = getattr(safety_manager, "_thread_manager", None)
+            if thread_manager is not None:
+                thread_manager.logger = self.logger
+
     def register_observations(self):
         """
         Register observations for contact-conditioned locomotion.
@@ -351,6 +379,28 @@ class RLQuadrupedMPSController(RLControllerBase):
 
         self.joint_pos_targets = self.default_joint_pos.clone()
 
+        self.safety_manager.start()
+
+        # TODO: see what can be done here
+        # # update when manager starts running
+        # while not self.safety_manager.is_running():
+        #     time.sleep(0.1)  # Small delay to avoid busy waiting
+        #     print("Waiting for safety manager to start...")
+
+        # self.safety_manager.update_state(
+        #     ref=self.future_feet_positions_w.detach().cpu().numpy(),
+        #     qpos=self.robot.mj_model.data.qpos,
+        #     qvel=self.robot.mj_model.data.qvel,
+        #     time=time.time(),
+
+        #     command_start_time=self.command_start_time,
+        #     goal_idx=self.current_goal_idx,
+        #     contact_plan=self.current_contact_plan.detach().cpu().numpy(),
+        #     current_gait=self.current_gait,
+        #     goal_completion_counter=self.goal_completion_counter,
+        #     in_transition=self.in_transition,
+        # )
+
     def compute_lowlevelcmd(self, state):
         """
         Compute motor commands using the learned policy.
@@ -379,9 +429,46 @@ class RLQuadrupedMPSController(RLControllerBase):
                     # # self._update_desired_ee_positions()
                     # self._update_action_scale()
 
-                    if self.visualize["feet_error"]:
-                        self.pub_feet_error()
-                        self.pub_feet_error_norm()
+            # TODO: prolly add in separate thread cuz its blocking the call
+            # update state
+            if self.safety_manager.is_running():
+                safety_gait_id = {
+                    "stance": 0,
+                    "transition": 1,
+                    "trot": 2,
+                    "pace": 3,
+                    "bound": 4,
+                    "jump": 5,
+                }.get(self.current_gait, 0)
+                self.safety_manager.update_state(
+                    ref=self.future_feet_positions_w.detach().cpu().numpy(),
+                    qpos=self.robot.mj_model.data.qpos,
+                    qvel=self.robot.mj_model.data.qvel,
+                    time=current_time,
+
+                    command_start_time=self.command_start_time,
+                    goal_idx=self.current_goal_idx,
+                    contact_plan=self.current_contact_plan.detach().cpu().numpy().reshape(-1),
+                    current_gait=safety_gait_id,
+                    goal_completion_counter=self.goal_completion_counter,
+                    in_transition=self.in_transition,
+                )
+
+            with self.safety_manager._safety_lock:
+                if (
+                    self.safety_manager.override
+                    and self.safety_manager.updated_plan
+                    and self.safety_manager.is_running()
+                ):
+                    # Shape: (H, plan_dim)
+                    new_plan = self.safety_manager.exec_plan
+
+                    opt_future_feet_positions_w = torch.tensor(
+                        new_plan, dtype=torch.float32, device=self.device
+                    )
+
+                    if self.visualize["opt_contact_locations"]:
+                        self.pub_opt_contact_locations(opt_future_feet_positions_w)
 
             if self.visualize["current_contact_locations"]:
                 self.pub_current_contact_locations()
@@ -918,6 +1005,8 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.feet_trajectory_pub = self.create_publisher(MarkerArray, "feet_trajectories", 10)
         if self.visualize["current_contact_locations"]:
             self.contact_locations_pub = self.create_publisher(MarkerArray, "contact_locations", 10)
+        if self.visualize["opt_contact_locations"]:
+            self.opt_contact_locations_pub = self.create_publisher(MarkerArray, "opt_contact_locations", 10)
         if self.visualize["feet_error"]:
             self.feet_error_pub = self.create_publisher(MarkerArray, "feet_error", 10)
             self.feet_error_norm_pub = self.create_publisher(Float32MultiArray, "feet_error_norm", 10)
@@ -1044,6 +1133,62 @@ class RLQuadrupedMPSController(RLControllerBase):
         except Exception as e:
             if self.logger is not None:
                 self.logger.error(f"Failed to publish future feet positions: {e}")
+
+    def pub_opt_contact_locations(self, opt_contact_locations):
+        """
+        Visualizes the current contact locations in the world frame.
+        Colors the markers based on the current contact plan:
+        - Green: for feet that are not in contact (contact_plan is False)
+        - Black: for feet that are in contact (contact_plan is True)
+        """
+        try:
+            marker_array = MarkerArray()
+
+            # Get current desired positions for each foot
+            current_positions = opt_contact_locations[:, self.current_goal_idx]
+
+            # Create markers for each foot
+            for foot_idx in range(4):
+                marker = Marker()
+                marker.header.frame_id = "world"
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "opt_contact_locations"
+                marker.id = foot_idx
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+
+                # Set the scale of the sphere
+                marker.scale.x = 0.05  # radius
+                marker.scale.y = 0.05
+                marker.scale.z = 0.05
+
+                # Set color based on contact plan
+                if self.current_contact_plan[0, foot_idx]:
+                    # Black for feet in contact
+                    marker.color = ColorRGBA(r=0.0, g=0.0, b=0.0, a=1.0)
+                else:
+                    # Green for feet not in contact
+                    marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+
+                # Set position using desired positions
+                marker.pose.position.x = float(current_positions[foot_idx, 0])
+                marker.pose.position.y = float(current_positions[foot_idx, 1])
+                marker.pose.position.z = float(current_positions[foot_idx, 2])
+
+                # Set orientation (identity quaternion)
+                marker.pose.orientation.w = 1.0
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+
+                marker_array.markers.append(marker)
+
+            # Publish the marker array
+            self.contact_locations_pub.publish(marker_array)
+
+        except Exception as e:
+            if self.logger is not None:
+                self.logger.error(f"Failed to publish current contact locations: {e}")
 
     def pub_current_contact_locations(self):
         """
