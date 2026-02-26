@@ -65,7 +65,7 @@ action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
 # DoomMPC/src/robots/go2/go2.py
 foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
-plan_lim: 0.1
+plan_lim: 0.01
 act_rl_clip: 100 # there is no clip on actions actually
 action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
 
@@ -77,11 +77,11 @@ kp: *stiffness
 kd: *damping
 
 mps_alg_name: "MIMPS"
-mps_num_samples: 300
-mps_noise_level: 0.5
+mps_num_samples: 64
+mps_noise_level: 0.3
 mps_temperature: 0.1
 mps_plan_horizon: 0.0125 # timestep * horizon_length = 0.00125 * 10
-mps_iterations: 5
+mps_iterations: 3
 mps_gamma: 0.99
 mps_safety_weight: 1000
 mps_collect_data: false

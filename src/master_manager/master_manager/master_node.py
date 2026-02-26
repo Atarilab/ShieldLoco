@@ -141,6 +141,8 @@ async def main_async(args=None):
 
         except asyncio.CancelledError:
             mode_manager.set_mode("DAMPING")
+            if node:
+                node.request_shutdown()
             logger.info("Cancelling all tasks in master node before shutdown..")
             raise
 
@@ -149,6 +151,8 @@ async def main_async(args=None):
 
         # Set controller to DAMPING mode before shutting down
         mode_manager.set_mode("DAMPING")
+        if node:
+            node.request_shutdown()
         logger.info("Set controller to DAMPING mode before shutdown")
 
     except Exception as e:

@@ -556,9 +556,22 @@ def contact_locations(
     :param device: Desired tensor device
     :return: Contact locations tensor
     """
-    result = mj_model.transform_init_to_base(
-        future_feet_positions_init_frame()[:, current_goal_idx() : current_goal_idx() + obs_horizon]
-    ).flatten()
+    # TODO: check if correct
+    feet_plan = future_feet_positions_init_frame()
+    start_idx = current_goal_idx()
+    end_idx = start_idx + obs_horizon
+    plan_slice = feet_plan[:, start_idx:end_idx]
+
+    if plan_slice.shape[1] < obs_horizon:
+        if plan_slice.shape[1] == 0:
+            pad_source = feet_plan[:, -1:].clone()
+        else:
+            pad_source = plan_slice[:, -1:].clone()
+        pad_count = obs_horizon - plan_slice.shape[1]
+        pad = pad_source.repeat(1, pad_count, 1)
+        plan_slice = torch.cat((plan_slice, pad), dim=1)
+
+    result = mj_model.transform_init_to_base(plan_slice).flatten()
     return tensorify(result, dtype=dtype, device=device)
 
 
@@ -583,9 +596,22 @@ def contact_locations_b(
     :param device: Desired tensor device
     :return: Contact locations in base frame tensor
     """
-    result = mj_model.transform_world_to_base(
-        future_feet_positions_w()[:, current_goal_idx() : current_goal_idx() + obs_horizon]
-    ).flatten()
+    # TODO: check if correct
+    feet_plan = future_feet_positions_w()
+    start_idx = current_goal_idx()
+    end_idx = start_idx + obs_horizon
+    plan_slice = feet_plan[:, start_idx:end_idx]
+
+    if plan_slice.shape[1] < obs_horizon:
+        if plan_slice.shape[1] == 0:
+            pad_source = feet_plan[:, -1:].clone()
+        else:
+            pad_source = plan_slice[:, -1:].clone()
+        pad_count = obs_horizon - plan_slice.shape[1]
+        pad = pad_source.repeat(1, pad_count, 1)
+        plan_slice = torch.cat((plan_slice, pad), dim=1)
+
+    result = mj_model.transform_world_to_base(plan_slice).flatten()
     return tensorify(result, dtype=dtype, device=device)
 
 

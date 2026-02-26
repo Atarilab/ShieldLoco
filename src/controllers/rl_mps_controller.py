@@ -243,10 +243,7 @@ class RLQuadrupedMPSController(RLControllerBase):
 
         safety_manager = getattr(self, "safety_manager", None)
         if safety_manager is not None:
-            safety_manager.logger = self.logger
-            thread_manager = getattr(safety_manager, "_thread_manager", None)
-            if thread_manager is not None:
-                thread_manager.logger = self.logger
+            safety_manager.set_logger(self.logger)
 
     def register_observations(self):
         """
@@ -379,6 +376,8 @@ class RLQuadrupedMPSController(RLControllerBase):
 
         self.joint_pos_targets = self.default_joint_pos.clone()
 
+        self.safety_manager.set_logger(self.logger)
+
         self.safety_manager.start()
 
         # TODO: see what can be done here
@@ -454,19 +453,9 @@ class RLQuadrupedMPSController(RLControllerBase):
                     in_transition=self.in_transition,
                 )
 
-            with self.safety_manager._safety_lock:
-                if (
-                    self.safety_manager.override
-                    and self.safety_manager.updated_plan
-                    and self.safety_manager.is_running()
-                ):
-                    # Shape: (H, plan_dim)
-                    new_plan = self.safety_manager.exec_plan
-
-                    opt_future_feet_positions_w = torch.tensor(
-                        new_plan, dtype=torch.float32, device=self.device
-                    )
-
+                new_plan = self.safety_manager.get_latest_plan()
+                if new_plan is not None:
+                    opt_future_feet_positions_w = torch.tensor(new_plan, dtype=torch.float32, device=self.device)
                     if self.visualize["opt_contact_locations"]:
                         self.pub_opt_contact_locations(opt_future_feet_positions_w)
 
@@ -753,7 +742,9 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.future_feet_positions_w[:, :, 0] += stride_offsets.squeeze(-1) * direction_x
         self.future_feet_positions_w[:, :, 1] += stride_offsets.squeeze(-1) * direction_y
         # self.future_feet_positions_w[:, :, 2] = -0.02 if self.interface == "real" else 0.08
-        self.future_feet_positions_w[:, :, 2] = 0.1
+
+        # TODO BUG: should be what the terrain height or something
+        self.future_feet_positions_w[:, :, 2] = 0.01
 
         # if self.current_gait in ["trot", "pace"]:
         #     self.future_feet_positions_w[[1, 2], :, 0] -= (self.feet_step_size / 2) * direction_x
@@ -1184,11 +1175,11 @@ class RLQuadrupedMPSController(RLControllerBase):
                 marker_array.markers.append(marker)
 
             # Publish the marker array
-            self.contact_locations_pub.publish(marker_array)
+            self.opt_contact_locations_pub.publish(marker_array)
 
         except Exception as e:
             if self.logger is not None:
-                self.logger.error(f"Failed to publish current contact locations: {e}")
+                self.logger.error(f"Failed to publish optimized contact locations: {e}")
 
     def pub_current_contact_locations(self):
         """

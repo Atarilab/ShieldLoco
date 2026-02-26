@@ -42,6 +42,7 @@ class LowLevelCmdPublisher(Node):
         # Control parameters
         self.dt = dt
         self.running_time = 0.0
+        self._is_shutting_down = False
 
         # Timing monitoring
         self.last_callback_time = time.time()
@@ -85,6 +86,9 @@ class LowLevelCmdPublisher(Node):
 
     def low_level_cmd_callback(self):
         """Periodic callback to compute and send motor commands."""
+        if self._is_shutting_down:
+            return
+
         start_time = time.time()
         self.running_time += self.dt
 
@@ -145,7 +149,7 @@ class LowLevelCmdPublisher(Node):
                 self.publish_object_state()
 
         except Exception as e:
-            if self.logger:
+            if self.logger and not self._is_shutting_down:
                 self.logger.error(f"Error in low level callback computation: {e}")
 
         # # self.last_callback_time = current_time
@@ -348,7 +352,26 @@ class LowLevelCmdPublisher(Node):
 
         return computed_torques
 
-        # def cleanup(self):
+    def request_shutdown(self):
+        self._is_shutting_down = True
+
+    def cleanup(self):
         """Clean up resources."""
+        self._is_shutting_down = True
+
+        if hasattr(self, "timer") and self.timer is not None:
+            try:
+                if hasattr(self.timer, "Stop"):
+                    self.timer.Stop()
+                elif hasattr(self.timer, "stop"):
+                    self.timer.stop()
+            except Exception:
+                pass
+
         if hasattr(self, "joystick_manager"):
             self.joystick_manager.cleanup()
+
+        try:
+            self.destroy_node()
+        except Exception:
+            pass

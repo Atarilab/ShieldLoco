@@ -162,6 +162,11 @@ class QuadRLTask(Task):
         self.act_rl_scale = rl_config["action_scale"]
         self.act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
 
+        # We optimize around absolute reference contact locations in normalized space.
+        # Keep planner bounds unbounded to avoid saturating valid world-frame references.
+        self.u_min = -jnp.inf
+        self.u_max = jnp.inf
+
         self.j_pd_min = jnp.asarray(rl_config["j_pd_min"], dtype=jnp.float32)
         self.j_pd_max = jnp.asarray(rl_config["j_pd_max"], dtype=jnp.float32)
 
@@ -218,12 +223,12 @@ class QuadRLTask(Task):
         self.geom_is_robot = jnp.array(geom_is_robot_np)
 
     def normalize(self, plan: jax.Array) -> jax.Array:
-        """Normalize the plan to be within [-1, 1] based on plan_lim."""
-        return jnp.clip(plan / self.plan_lim, -1.0, 1.0)
+        """Normalize plan values by plan_lim without saturating absolute references."""
+        return plan / self.plan_lim
 
     def denormalize(self, plan: jax.Array) -> jax.Array:
-        """Denormalize the plan from [-1, 1] back to the original scale."""
-        return jnp.clip(plan * self.plan_lim, -self.plan_lim, self.plan_lim)
+        """Denormalize normalized plan values back to world-frame units."""
+        return plan * self.plan_lim
 
     @partial(jax.jit, static_argnames=["self"])
     def get_exec_plan(self, plan: jax.Array) -> jax.Array:
@@ -239,10 +244,16 @@ class QuadRLTask(Task):
     def get_reference_plan(self, **kwargs):
         """Get the reference trajectory for the MPS planner."""
         ref = kwargs.get("ref", None)
+        goal_idx = kwargs.get("goal_idx", 0)
         if ref is not None:
+            goal_idx = jnp.asarray(goal_idx, dtype=jnp.int32)
+            ref_horizon = ref.shape[1]
+            safe_goal_idx = jnp.mod(goal_idx, ref_horizon)
+            shifted_ref = jnp.roll(ref, shift=-safe_goal_idx, axis=1)
+
             # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
             # plan_dim = ([ref1, ref2], [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]) = 12
-            ref_plan = jnp.transpose(ref, (1, 0, 2)).reshape(
+            ref_plan = jnp.transpose(shifted_ref, (1, 0, 2)).reshape(
                 -1, self.plan_dim
             )  # Shape: (H, plan_dim)
 
@@ -343,10 +354,10 @@ class QuadRLTask(Task):
         mapping = self.joint_obs_unitree_to_isaac_mapping
 
         # 1. lin_vel_b = 3
-        lin_vel_b = state.qvel[:3]
+        lin_vel_b = quat_rotate_inv(base_quat, state.qvel[:3])
 
         # 2. ang_vel_b = 3
-        ang_vel_b = state.qvel[3:6]
+        ang_vel_b = quat_rotate_inv(base_quat, state.qvel[3:6])
 
         # 3. projected_gravity = 3
         gravity_dir = jnp.array([0, 0, -1])
@@ -380,7 +391,7 @@ class QuadRLTask(Task):
 
         # 9. ee_pos_rel_b = 4
         feet_pos_rel_b = (
-            jax.lax.dynamic_index_in_dim(contact_locations_w, task_params.goal_idx, axis=1, keepdims=False)
+            jax.lax.dynamic_index_in_dim(contact_locations_w, 0, axis=1, keepdims=False)
             - current_feet_pos_w
         )  # (4, 3)
         ee_pos_rel_b = jnp.linalg.norm(feet_pos_rel_b, axis=-1)  # (4,)
@@ -453,10 +464,15 @@ class QuadRLTask(Task):
         if plan_segment_ref is None:
             plan_segment_ref = jnp.zeros_like(plan_segment)
 
-        # TODO: check if pending change check is required. See IsaacLab code
-        # TODO: currently gait is fixed during rollout
-        # Update goal
-        tp = self.update_goal(task_params)
+        # Keep phase/index fixed during short optimization rollouts.
+        # Runtime controller updates gait/goal on command resample boundaries,
+        # not at every internal dynamics step.
+        tp = task_params
+        # # TODO: check if pending change check is required. See IsaacLab code
+        # # TODO: currently gait is fixed during rollout
+        # # Update goal
+        # tp = self.update_goal(task_params)
+
 
         plan_segment_denorm = self.denormalize(plan_segment)
         tp, u = self.rl_forward(tp, state, plan_segment_denorm)
@@ -539,10 +555,6 @@ class QuadRLTask(Task):
         if plan_segment_ref is None:
             plan_segment_ref = jnp.zeros_like(plan_segment)
 
-        # Quadratic cost on MPS action magnitude
-        action_cost = jnp.sum(plan_segment**2)
-
-        # be close to reference plan
-        ref_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
-
-        return action_cost + ref_cost
+        # Penalize deviation from reference contact locations.
+        # Avoid absolute-plan magnitude penalties that bias contacts toward origin.
+        return jnp.sum((plan_segment - plan_segment_ref) ** 2)

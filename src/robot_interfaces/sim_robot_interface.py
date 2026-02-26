@@ -3,6 +3,7 @@ import os
 import threading
 from threading import Thread
 import time
+from typing import Optional
 
 import mujoco
 import mujoco.viewer
@@ -82,6 +83,20 @@ class SimRobotInterface:
         self.web_viewer_collision_wireframe = bool(config.get("WEB_VIEWER_COLLISION_WIREFRAME", False))
         raw_collision_color = config.get("WEB_VIEWER_COLLISION_COLOR", [255, 120, 80])
         self.web_viewer_collision_color = tuple(raw_collision_color)
+        self.web_viewer_show_opt_contact_locations = bool(config.get("WEB_VIEWER_SHOW_OPT_CONTACT_LOCATIONS", True))
+        self.web_viewer_opt_contact_topic = str(config.get("WEB_VIEWER_OPT_CONTACT_TOPIC", "opt_contact_locations"))
+        self.web_viewer_opt_contact_radius = float(config.get("WEB_VIEWER_OPT_CONTACT_RADIUS", 0.04))
+        raw_opt_contact_color = config.get("WEB_VIEWER_OPT_CONTACT_COLOR", [0, 255, 0])
+        self.web_viewer_opt_contact_color = tuple(raw_opt_contact_color)
+        self.web_viewer_show_actual_contact_locations = bool(
+            config.get("WEB_VIEWER_SHOW_ACTUAL_CONTACT_LOCATIONS", True)
+        )
+        self.web_viewer_actual_contact_radius = float(config.get("WEB_VIEWER_ACTUAL_CONTACT_RADIUS", 0.04))
+        raw_actual_contact_color = config.get("WEB_VIEWER_ACTUAL_CONTACT_COLOR", [0, 120, 255])
+        self.web_viewer_actual_contact_color = tuple(raw_actual_contact_color)
+        self.web_viewer_actual_contact_bodies = [
+            str(name) for name in config.get("WEB_VIEWER_ACTUAL_CONTACT_BODIES", ["FL_foot", "FR_foot", "RL_foot", "RR_foot"])
+        ]
         self.web_server = None
         self.web_viewer_url = None
         self.web_viewer_share_link = None
@@ -91,12 +106,26 @@ class SimRobotInterface:
         self.web_collision_body_handles = {}
         self.web_reset_button = None
         self.web_toggle_frames_button = None
+        self.web_opt_contact_handles = {}
+        self.web_opt_contact_positions = {}
+        self.web_opt_contact_last_update = 0.0
+        self.web_actual_contact_handles = {}
+        self.web_actual_contact_body_ids = {}
+        self.opt_contact_node = None
+        self.opt_contact_subscriber = None
+        self.opt_contact_thread: Optional[Thread] = None
+        self._rclpy_initialized_here = False
+
+        # Shared lock used by simulation/viewer/web/subscriber threads
+        self.locker = threading.Lock()
 
         if self.web_viewer_backend == "viser":
             self._initialize_web_viewer()
+            self._initialize_web_opt_contact_locations()
+            self._initialize_web_actual_contact_locations()
+            self._initialize_opt_contact_subscriber()
 
         self.dim_motor_sensor_ = 3 * self.mj_model.nu
-        self.locker = threading.Lock()
 
         # Other configuration variables
         self.simulate_dt = config["SIMULATION_DT"]
@@ -155,6 +184,89 @@ class SimRobotInterface:
 
         if self.web_viewer_share_url:
             self.web_viewer_share_link = self.web_server.request_share_url(verbose=False)
+
+    def _initialize_web_opt_contact_locations(self):
+        if self.web_server is None or not self.web_viewer_show_opt_contact_locations:
+            return
+
+        for foot_idx, foot_name in enumerate(["FL", "FR", "RL", "RR"]):
+            handle = self.web_server.scene.add_icosphere(
+                f"/robot/opt_contact_locations/{foot_name}",
+                radius=self.web_viewer_opt_contact_radius,
+                color=self.web_viewer_opt_contact_color,
+                position=(0.0, 0.0, 0.0),
+                visible=False,
+            )
+            self.web_opt_contact_handles[foot_idx] = handle
+
+    def _initialize_web_actual_contact_locations(self):
+        if self.web_server is None or not self.web_viewer_show_actual_contact_locations:
+            return
+
+        for body_name in self.web_viewer_actual_contact_bodies:
+            body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                continue
+
+            handle = self.web_server.scene.add_icosphere(
+                f"/robot/actual_contact_locations/{body_name}",
+                radius=self.web_viewer_actual_contact_radius,
+                color=self.web_viewer_actual_contact_color,
+                position=(0.0, 0.0, 0.0),
+                visible=True,
+            )
+            self.web_actual_contact_body_ids[body_name] = body_id
+            self.web_actual_contact_handles[body_name] = handle
+
+    def _initialize_opt_contact_subscriber(self):
+        if not self.web_viewer_show_opt_contact_locations:
+            return
+
+        try:
+            import rclpy
+            from visualization_msgs.msg import MarkerArray
+
+            if not rclpy.ok():
+                rclpy.init(args=None)
+                self._rclpy_initialized_here = True
+
+            self.opt_contact_node = rclpy.create_node("viser_opt_contact_locations_subscriber")
+            self.opt_contact_subscriber = self.opt_contact_node.create_subscription(
+                MarkerArray,
+                self.web_viewer_opt_contact_topic,
+                self._on_opt_contact_locations,
+                10,
+            )
+            self.opt_contact_thread = Thread(target=self._opt_contact_spin_thread, daemon=True)
+            self.opt_contact_thread.start()
+        except Exception as e:
+            print(f"Failed to initialize opt contact subscriber for Viser: {e}", flush=True)
+
+    def _opt_contact_spin_thread(self):
+        try:
+            import rclpy
+
+            while not self.stop_event.is_set() and self.opt_contact_node is not None:
+                rclpy.spin_once(self.opt_contact_node, timeout_sec=0.05)
+        except Exception as e:
+            print(f"Opt contact spin thread stopped: {e}", flush=True)
+
+    def _on_opt_contact_locations(self, msg):
+        positions = {}
+        for marker in msg.markers:
+            positions[int(marker.id)] = (
+                float(marker.pose.position.x),
+                float(marker.pose.position.y),
+                float(marker.pose.position.z),
+            )
+
+        lock = getattr(self, "locker", None)
+        if lock is None:
+            return
+
+        with lock:
+            self.web_opt_contact_positions = positions
+            self.web_opt_contact_last_update = time.time()
 
     def _resolve_web_tracked_body_names(self):
         selected_body_names = []
@@ -392,6 +504,26 @@ class SimRobotInterface:
                         collision_body_handle.position = tuple(body_pos.tolist())
                         collision_body_handle.wxyz = tuple(body_quat.tolist())
 
+                if self.web_viewer_show_actual_contact_locations and self.web_actual_contact_handles:
+                    for body_name, handle in self.web_actual_contact_handles.items():
+                        body_id = self.web_actual_contact_body_ids.get(body_name)
+                        if body_id is None:
+                            continue
+                        handle.position = tuple(self.mj_data.xpos[body_id].tolist())
+                        handle.visible = True
+
+                if self.web_viewer_show_opt_contact_locations and self.web_opt_contact_handles:
+                    with self.locker:
+                        opt_positions = dict(self.web_opt_contact_positions)
+                        has_recent_update = (time.time() - self.web_opt_contact_last_update) < 1.0
+
+                    for foot_idx, handle in self.web_opt_contact_handles.items():
+                        if has_recent_update and foot_idx in opt_positions:
+                            handle.position = opt_positions[foot_idx]
+                            handle.visible = True
+                        else:
+                            handle.visible = False
+
             time.sleep(self.web_viewer_dt)
 
     def get_web_viewer_url(self):
@@ -445,6 +577,25 @@ class SimRobotInterface:
 
         if self.web_server is not None:
             self.web_server.stop()
+
+        if self.opt_contact_thread is not None:
+            self.opt_contact_thread.join(timeout=1.0)
+
+        if self.opt_contact_node is not None:
+            try:
+                self.opt_contact_node.destroy_node()
+            except Exception:
+                pass
+            self.opt_contact_node = None
+
+        if self._rclpy_initialized_here:
+            try:
+                import rclpy
+
+                if rclpy.ok():
+                    rclpy.shutdown()
+            except Exception:
+                pass
 
         self.viewer_thread.join()
         self.sim_thread.join()
