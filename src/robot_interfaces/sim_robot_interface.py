@@ -19,6 +19,7 @@ from utils.unitree_sdk2py_bridge import UnitreeSdk2Bridge
 class SimRobotInterface:
     def __init__(self, config, headless=False):
         self.stop_event = threading.Event()
+        self.reset_requested = threading.Event()
 
         self.robot_name = config["ROBOT"]
         self.robot_scene = os.path.join(os.getcwd(), "robots", self.robot_name, config["SCENE"])
@@ -47,10 +48,10 @@ class SimRobotInterface:
         viewer_kwargs: dict[str, object] = {
             "show_left_ui": False,
             "show_right_ui": False,
+            "key_callback": self._viewer_key_callback,
         }
         if use_elastic_band and self.elastic_band is not None:
             self.band_link = self.mj_model.body(self.base_link_name)
-            viewer_kwargs["key_callback"] = self.elastic_band.MujuocoKeyCallback
 
         # Set up viewer (skip if headless mode)
         self.viewer = None
@@ -78,6 +79,7 @@ class SimRobotInterface:
         self.web_viewer_share_link = None
         self.web_tracked_body_ids = []
         self.web_tracked_body_handles = {}
+        self.web_reset_button = None
 
         if self.web_viewer_backend == "viser":
             self._initialize_web_viewer()
@@ -123,6 +125,13 @@ class SimRobotInterface:
 
         self.web_server.scene.set_up_direction("+z")
         self.web_server.scene.add_grid("/world/grid", width=8.0, height=8.0, plane="xy")
+
+        try:
+            self.web_reset_button = self.web_server.gui.add_button("Reset Robot")
+            self.web_reset_button.on_click(lambda _: self.request_reset())
+        except Exception:
+            self.web_reset_button = None
+
         self._initialize_web_body_frames()
 
         if self.web_viewer_share_url:
@@ -184,17 +193,7 @@ class SimRobotInterface:
         ChannelFactoryInitialize(self.domain_id, self.interface)
         unitree = UnitreeSdk2Bridge(self.mj_model, self.mj_data, robot=self.robot_name, object=self.object_id)
 
-        # Set fixed base position for the robot if configured
-        if self.fixed_base_pos is not None:
-            base_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.base_link_name)
-            if base_body_id >= 0:
-                # Set the initial position (x, y, z) for the base link
-                self.mj_data.qpos[:3] = np.array(self.fixed_base_pos)
-                # Set orientation to unit quaternion (no rotation - identity)
-                self.mj_data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])  # w, x, y, z
-                # Reset velocities to zero
-                self.mj_data.qvel[:3] = np.zeros(3)
-                self.mj_data.qvel[3:6] = np.zeros(3)  # angular velocities
+        self._apply_fixed_base_pose()
 
         if self.print_scene_info:
             unitree.PrintSceneInformation()
@@ -206,6 +205,10 @@ class SimRobotInterface:
             step_start = time.perf_counter()
 
             with self.locker:
+                if self.reset_requested.is_set():
+                    self.reset_requested.clear()
+                    self._reset_simulation_state()
+
                 if self.elastic_band:
                     if self.elastic_band.enable:
                         force = self.elastic_band.Advance(self.mj_data.qpos[:3], self.mj_data.qvel[:3])
@@ -269,6 +272,42 @@ class SimRobotInterface:
 
     def get_web_viewer_share_url(self):
         return self.web_viewer_share_link
+
+    def request_reset(self):
+        """Request a simulation reset on the simulation thread."""
+        self.reset_requested.set()
+
+    def _apply_fixed_base_pose(self):
+        """Apply fixed base pose constraints if configured."""
+        if self.fixed_base_pos is None:
+            return
+
+        base_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, self.base_link_name)
+        if base_body_id < 0:
+            return
+
+        self.mj_data.qpos[:3] = np.array(self.fixed_base_pos)
+        self.mj_data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])
+        self.mj_data.qvel[:3] = np.zeros(3)
+        self.mj_data.qvel[3:6] = np.zeros(3)
+
+    def _reset_simulation_state(self):
+        """Reset simulation state to model defaults (MuJoCo Backspace equivalent)."""
+        mujoco.mj_resetData(self.mj_model, self.mj_data)
+        self._apply_fixed_base_pose()
+        if self.mj_data.ctrl is not None:
+            self.mj_data.ctrl[:] = 0.0
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+    def _viewer_key_callback(self, key):
+        """Handle viewer keyboard shortcuts for simulation control."""
+        glfw = mujoco.glfw.glfw
+        if key == glfw.KEY_BACKSPACE:
+            self.request_reset()
+            return
+
+        if self.elastic_band is not None:
+            self.elastic_band.MujuocoKeyCallback(key)
 
     def stop(self, logger):
         """Gracefully stop the simulation and viewer threads."""

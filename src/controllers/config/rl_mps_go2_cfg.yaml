@@ -1,3 +1,5 @@
+# TODO: Clean this config
+
 # policy_path: "contact_policy_actuatorRand.pt"
 # policy_path: "locomotion_go2/contact_policy_feetRandom.pt"
 policy_path: "locomotion_go2/contact_policy_stanceSeperate.pt"
@@ -7,13 +9,13 @@ control_dt: 0.005
 decimation: 4
 action_dim: 12
 action_scale: 0.35
-stiffness: 30.0
-damping: 0.5
-use_threading: False
-use_buffer: False
-device: 'cpu' #"cuda:0"  
+stiffness: &stiffness 30.0
+damping: &damping 0.5
+use_threading: false
+use_buffer: false
+device: 'cpu' # "cuda:0"  
 feet_step_size: 0.0
-horizon_length: 200
+horizon_length: 10
 action_filter_alpha: 0.5
 transition_duration: 0
 visualize: 
@@ -26,7 +28,7 @@ visualize:
   contact_status: false
 
 
-ISAAC_LAB_DEFAULT_JOINT_POS: [
+ISAAC_LAB_DEFAULT_JOINT_POS: &ISAAC_LAB_DEFAULT_JOINT_POS [
     0.1000, # 0
     -0.1000, # 1
     0.1000, # 2
@@ -40,3 +42,47 @@ ISAAC_LAB_DEFAULT_JOINT_POS: [
     -1.5000, # 10
     -1.5000, # 11
   ] # from asset.data.default_joint_pos; corresponds to ISAACLAB_JOINT_ORDER; is used as action offset
+
+
+# MPS stuff
+mps_task_name: "QuadRLTask"
+# 0.005 / 4 = 0.00125
+timestep: 0.00125
+
+obs_horizon: 2 # specific to RL policy
+command_duration: 0.35  # hardcoded in DoomMPC/src/controllers/rl_mps_controller.py
+
+# Use the correct mapping from the existing config
+# JOINT_OBSERVATION_UNITREE_TO_ISAAC_LAB_MAPPING: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+# DoomMPC/src/utils/joint_mapping.py for go2
+joint_obs_unitree_to_isaac_mapping: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+
+# same as ISAAC_LAB_DEFAULT_JOINT_POS
+default_joint_pos: *ISAAC_LAB_DEFAULT_JOINT_POS
+
+action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
+
+# DoomMPC/src/robots/go2/go2.py
+foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+
+plan_lim: 0.1
+act_rl_clip: 100 # there is no clip on actions actually
+action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
+
+# TODO: use limits
+j_pd_min: -100.0
+j_pd_max: 100.0
+
+kp: *stiffness
+kd: *damping
+
+mps_alg_name: "MIMPS"
+mps_num_samples: 300
+mps_noise_level: 0.5
+mps_temperature: 0.1
+mps_plan_horizon: 0.0125 # timestep * horizon_length = 0.00125 * 10
+mps_iterations: 5
+mps_gamma: 0.99
+mps_safety_weight: 1000
+mps_collect_data: false
+mps_top_fraction: 0.01

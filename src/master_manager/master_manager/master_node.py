@@ -3,6 +3,15 @@ import asyncio
 import os
 import time
 
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_triton_gemm_any=true "
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_deterministic_ops=true "
+    "--xla_gpu_autotune_level=0"
+)
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
+
 import rclpy
 
 # DOOM Imports

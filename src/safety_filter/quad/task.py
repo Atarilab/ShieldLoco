@@ -43,7 +43,7 @@ class QuadRLTaskParams(TaskParams):
 
     command_start_time: float = 0.0
     goal_idx: int = 0
-    contact_plan: jax.Array = jnp.zeros((4, 2))  # Example shape, adjust as needed
+    contact_plan: jax.Array = jnp.zeros(8)
     last_action: jax.Array = jnp.zeros(12)  # Assuming 12-dimensional action space
 
     current_gait: int = 0  # 0=stance, 1=transition, 2=trot, 3=pace, etc.
@@ -143,27 +143,27 @@ class QuadRLTask(Task):
         super().__init__(mj_model, trace_sites)
 
         self.rl_policy = rl_policy
-        self.rl_config = rl_config
 
         self.obs_horizon = rl_config["obs_horizon"]
         self.command_duration = rl_config["command_duration"]
-        self.joint_obs_unitree_to_isaac_mapping = rl_config[
-            "joint_obs_unitree_to_isaac_mapping"
-        ]
-        self.default_joint_pos = rl_config["default_joint_pos"]
+        self.joint_obs_unitree_to_isaac_mapping = np.asarray(
+            rl_config["joint_obs_unitree_to_isaac_mapping"], dtype=np.int32
+        )
+        self.default_joint_pos = jnp.asarray(rl_config["default_joint_pos"], dtype=jnp.float32)
 
         self.num_joints = len(self.default_joint_pos)
 
-        self.foot_ids = rl_config["foot_ids"]
+        foot_names = rl_config["foot_names"]
+        self.foot_ids = np.asarray([mj_model.body(foot).id for foot in foot_names], dtype=np.int32)
 
         self.plan_lim = rl_config["plan_lim"]
         self.act_rl_clip = rl_config["act_rl_clip"]
-        self.act_rl_offset = rl_config["action_offset"]
+        self.act_rl_offset = jnp.asarray(rl_config["action_offset"])
         self.act_rl_scale = rl_config["action_scale"]
-        self.act_rl_mapping = rl_config["action_mapping"]
+        self.act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
 
-        self.j_pd_min = rl_config["j_pd_min"]
-        self.j_pd_max = rl_config["j_pd_max"]
+        self.j_pd_min = jnp.asarray(rl_config["j_pd_min"], dtype=jnp.float32)
+        self.j_pd_max = jnp.asarray(rl_config["j_pd_max"], dtype=jnp.float32)
 
         self.kp = rl_config["kp"]
         self.kd = rl_config["kd"]
@@ -184,6 +184,11 @@ class QuadRLTask(Task):
         self.horizon_length = rl_config["horizon_length"]
 
         self.body_name_to_id = {mj_model.body(i).name: i for i in range(mj_model.nbody)}
+        self.base_body_id = self.body_name_to_id.get("base_link", None)
+        if self.base_body_id is None:
+            raise KeyError(
+                "No 'base_link' found in model bodies for constraint check"
+            )
         ngeom = mj_model.ngeom
         geom_is_hazard_np = np.zeros(ngeom, dtype=bool)
         geom_is_robot_np = np.zeros(ngeom, dtype=bool)
@@ -257,11 +262,11 @@ class QuadRLTask(Task):
         return update_params(
             task_params,
             command_start_time=jnp.asarray(command_start_time),
-            goal_idx=jnp.asarray(goal_idx),
-            contact_plan=jnp.asarray(contact_plan),
-            current_gait=jnp.asarray(current_gait),
-            goal_completion_counter=jnp.asarray(goal_completion_counter),
-            in_transition=jnp.asarray(in_transition),
+            goal_idx=jnp.asarray(goal_idx, dtype=jnp.int32),
+            contact_plan=jnp.asarray(contact_plan, dtype=jnp.float32),
+            current_gait=jnp.asarray(current_gait, dtype=jnp.int32),
+            goal_completion_counter=jnp.asarray(goal_completion_counter, dtype=jnp.int32),
+            in_transition=jnp.asarray(in_transition, dtype=jnp.bool_),
         )
 
     def plan_seg_to_contact_locations(self, plan_segment: jax.Array) -> jax.Array:
@@ -271,9 +276,9 @@ class QuadRLTask(Task):
 
     def update_goal(self, task_params: QuadRLTaskParams) -> QuadRLTaskParams:
         """Update goal_idx and contact_plan based on gait phase progression."""
-        gait = task_params.current_gait
-        counter = task_params.goal_completion_counter
-        goal_idx = task_params.goal_idx
+        gait = jnp.asarray(task_params.current_gait, dtype=jnp.int32)
+        counter = jnp.asarray(task_params.goal_completion_counter, dtype=jnp.int32)
+        goal_idx = jnp.asarray(task_params.goal_idx, dtype=jnp.int32)
 
         def _update_goal(params):
             new_counter = counter + 1
@@ -299,14 +304,11 @@ class QuadRLTask(Task):
             phase_idx = jnp.mod(new_counter, num_phases)
             next_phase_idx = jnp.mod(new_counter + 1, num_phases)
 
-            current_phase = jnp.take(self.gait_patterns, gait, axis=0)[phase_idx]
-            next_phase = jnp.take(self.gait_patterns, gait, axis=0)[next_phase_idx]
+            gait_pattern = jax.lax.dynamic_index_in_dim(self.gait_patterns, gait, axis=0, keepdims=False)
+            current_phase = jax.lax.dynamic_index_in_dim(gait_pattern, phase_idx, axis=0, keepdims=False)
+            next_phase = jax.lax.dynamic_index_in_dim(gait_pattern, next_phase_idx, axis=0, keepdims=False)
 
-            new_contact_plan = (
-                jnp.concatenate([current_phase, next_phase])
-                .astype(jnp.float32)
-                .reshape(4, 2)
-            )
+            new_contact_plan = jnp.concatenate([current_phase, next_phase]).astype(jnp.float32)
 
             return params.replace(  # type: ignore
                 goal_completion_counter=new_counter,
@@ -378,7 +380,8 @@ class QuadRLTask(Task):
 
         # 9. ee_pos_rel_b = 4
         feet_pos_rel_b = (
-            contact_locations_w[:, task_params.goal_idx] - current_feet_pos_w
+            jax.lax.dynamic_index_in_dim(contact_locations_w, task_params.goal_idx, axis=1, keepdims=False)
+            - current_feet_pos_w
         )  # (4, 3)
         ee_pos_rel_b = jnp.linalg.norm(feet_pos_rel_b, axis=-1)  # (4,)
 
@@ -406,9 +409,7 @@ class QuadRLTask(Task):
     def compute_low_level_cmd(self, action_rl: jax.Array) -> jax.Array:
         action_rl = jnp.clip(action_rl, -self.act_rl_clip, self.act_rl_clip)
 
-        joint_pos_targets = (action_rl * self.act_rl_scale + self.act_rl_offset)[
-            self.act_rl_mapping
-        ]
+        joint_pos_targets = (action_rl * self.act_rl_scale + self.act_rl_offset)[self.act_rl_mapping]
 
         joint_pos_targets = jnp.clip(joint_pos_targets, self.j_pd_min, self.j_pd_max)
 
@@ -473,9 +474,8 @@ class QuadRLTask(Task):
             dq_des = jnp.zeros_like(dq)
 
             torq = self.kp * (q_des - q) + self.kd * (dq_des - dq)  # PD control law
-            torq = jnp.clip(
-                torq, self.j_min, self.j_max
-            )  # Clip the torques to prevent excessive forces
+            # Clip the torques to prevent excessive forces
+            torq = jnp.clip(torq, self.j_min, self.j_max)
 
             state = state.replace(ctrl=torq)
 
@@ -514,10 +514,9 @@ class QuadRLTask(Task):
         collides = jnp.any(bad_contacts)  # scalar boolean
 
         # Check for falling
-        pelvis_id = self.body_name_to_id["pelvis"]
-        pelvis_quat = state.xquat[pelvis_id]
+        base_quat = state.xquat[self.base_body_id]
 
-        up_vector = quat_rotate(pelvis_quat, jnp.array([0.0, 0.0, 1.0]))
+        up_vector = quat_rotate(base_quat, jnp.array([0.0, 0.0, 1.0]))
         fall_down = up_vector[2] < 0.5
 
         # Return 1.0 if failure condition met, else 0.0

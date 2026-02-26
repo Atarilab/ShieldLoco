@@ -182,7 +182,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         new_mean = abs_plan - params.ref
 
         params = params.replace(  # type: ignore
-            mean=new_mean
+            mean=new_mean,
+            best_plan=abs_plan,
         )
 
         return params

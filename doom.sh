@@ -103,8 +103,9 @@ while [[ $# -gt 0 ]]; do
             # Check if a container with the same name exists and remove it
             CONTAINER_NAME="DOOM"  # Replace with your container's desired name
             if docker ps -a --format '{{.Names}}' | grep -q "$CONTAINER_NAME"; then
-                echo "Container $CONTAINER_NAME already exists. Removing..."
-                docker rm -f $CONTAINER_NAME
+                # echo "Container $CONTAINER_NAME already exists. Removing..."
+                # docker rm -f $CONTAINER_NAME
+                echo "Container $CONTAINER_NAME already exists..."
             fi
             
             # Always create fresh container with --user flag to match host UID/GID

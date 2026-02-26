@@ -11,6 +11,8 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from utils.config_loader import load_config
+
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_triton_gemm_any=true "
     "--xla_gpu_enable_latency_hiding_scheduler=true "
@@ -22,103 +24,29 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
 
 def get_rl_config():
-    """Create rl_config dictionary for SafetyManager."""
-    
-    # Robot joint configuration
-    default_joint_pos = np.array([
-        0.1, -0.1, 0.1, -0.1,  # FL hip, FR hip, RL hip, RR hip
-        0.8, 0.8, 1.0, 1.0,    # FL thigh, FR thigh, RL thigh, RR thigh
-        -1.5, -1.5, -1.5, -1.5  # FL calf, FR calf, RL calf, RR calf
-    ])
-    
-    action_offset = default_joint_pos.copy()
-    action_scale = 0.35
-    
-    # Joint position limits (approximate for Go2)
-    j_pd_min = np.array([
-        -1.0472, -1.0472, -1.0472, -1.0472,  # hip
-        -2.775, -2.775, -2.775, -2.775,       # thigh
-        -2.775, -2.775, -2.775, -2.775         # calf
-    ])
-    j_pd_max = np.array([
-        1.0472, 1.0472, 1.0472, 1.0472,  # hip
-        2.775, 2.775, 2.775, 2.775,      # thigh
-        -0.524, -0.524, -0.524, -0.524    # calf (negative!)
-    ])
-    
-    # Foot site IDs - will be set after loading model
-    foot_ids = np.array([0, 1, 2, 3])  # Placeholder, updated below
-    
-    # Joint observation mapping (Unitree to IsaacLab)
-    joint_obs_unitree_to_isaac_mapping = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
-    
-    # Action mapping
-    action_mapping = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
-    
-    rl_config = {
-        # Physics
-        "timestep": 0.01,
-        
-        # Observation
-        "obs_horizon": 2,
-        "command_duration": 0.35,
-        
-        # Robot config
-        "joint_obs_unitree_to_isaac_mapping": joint_obs_unitree_to_isaac_mapping,
-        "default_joint_pos": default_joint_pos,
-        "foot_ids": foot_ids,
-        
-        # Action limits
-        "plan_lim": 0.1,
-        "act_rl_clip": 0.5,
-        "action_offset": action_offset,
-        "action_scale": action_scale,
-        "action_mapping": action_mapping,
-        
-        # PD control
-        "j_pd_min": j_pd_min,
-        "j_pd_max": j_pd_max,
-        "kp": 30.0,
-        "kd": 0.5,
-        
-        # MPC
-        "decimation": 4,
-        
-        # MPS Planner config
-        "mps_task_name": "QuadRLTask",
-        "mps_alg_name": "MIMPS",
-        "mps_num_samples": 100,
-        "mps_noise_level": 0.5,
-        "mps_temperature": 0.1,
-        "mps_plan_horizon": 0.1,
-        "mps_iterations": 1,
-        "mps_gamma": 0.99,
-        "mps_safety_weight": 1e3,
-        "mps_collect_data": True,
-        "mps_top_fraction": 0.01,
-        
-        # Obstacles (from scene.xml)
-        "obstacles": [
-            [1.5, -0.3, 0.2, 0.15, 0.15, 0.2],
-            [3.0, 0.5, 0.2, 0.15, 0.15, 0.2],
-            [4.0, 0.0, 0.2, 0.15, 0.15, 0.2],
-            [4.7, -0.8, 0.2, 0.15, 0.15, 0.2],
-            [5.5, 0.0, 0.2, 0.15, 0.15, 0.2],
-        ],
-        "safety_margin": 0.15,
-        "robot_radius": 0.15,
-    }
-    
+    """Load rl_config dictionary directly from RL-MPS controller config."""
+    rl_config = load_config("controllers/config/rl_mps_go2_cfg.yaml")
+
+    for key in [
+        "joint_obs_unitree_to_isaac_mapping",
+        "default_joint_pos",
+        "action_offset",
+        "action_mapping",
+        "j_pd_min",
+        "j_pd_max",
+    ]:
+        rl_config[key] = np.asarray(rl_config[key])
+
     return rl_config
 
 
-def get_policy():
+def get_policy(rl_config):
     """Load the real RL policy."""
     from controllers.policies.policy import TorchScriptPolicy
     
     policy_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "controllers", "policies", "locomotion_go2", "contact_policy_stanceSeperate.pt"
+        "..", "..", "controllers", "policies", rl_config["policy_path"]
     )
     policy_path = os.path.normpath(policy_path)
     
@@ -145,24 +73,12 @@ def main():
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
     print(f"Model loaded: {mj_model.nq} DOFs, {mj_model.nu} actuators")
     
-    # Get foot site IDs
-    foot_site_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
-    foot_ids = []
-    for name in foot_site_names:
-        try:
-            foot_ids.append(mj_model.site(name).id)
-        except:
-            print(f"Warning: Could not find site {name}, using placeholder")
-            foot_ids.append(len(foot_ids))
-    print(f"Foot site IDs: {foot_ids}")
-    
-    # Get config and update foot_ids
+    # Load config directly from controller YAML
     rl_config = get_rl_config()
-    rl_config["foot_ids"] = np.array(foot_ids)
     
     # Load policy
     print("\nLoading policy...")
-    policy = get_policy()
+    policy = get_policy(rl_config)
     print(f"Policy loaded: {type(policy)}")
 
 
@@ -245,52 +161,55 @@ def main():
     # Check if plan was updated
     print("Checking plan update...")
     with safety_manager._safety_lock:
-        plan = safety_manager.exec_plan
-    
+        if safety_manager.updated_plan:
+            plan = safety_manager.exec_plan
+        else:
+            plan = None
+
     if plan is not None:
         print(f"✓ Plan shape: {plan.shape}")
-        assert plan.shape == (horizon_length, 12), f"Expected {(horizon_length, 12)}, got {plan.shape}"
+        assert plan.shape == (4, horizon_length, 3), f"Expected {(4, horizon_length, 3)}, got {plan.shape}"
     else:
         print("⚠ Plan is None (may need more time or check() implementation)")
     
-    # Plot 2D trajectory from train_data
-    print("\n--- Plotting 2D Trajectory ---")
-    try:
-        with safety_manager._safety_lock:
-            train_data = safety_manager.policy_params.train_data
+    # # Plot 2D trajectory from train_data
+    # print("\n--- Plotting 2D Trajectory ---")
+    # try:
+    #     with safety_manager._safety_lock:
+    #         train_data = safety_manager.policy_params.train_data
         
-        if train_data is not None:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
+    #     if train_data is not None:
+    #         import matplotlib
+    #         matplotlib.use('Agg')
+    #         import matplotlib.pyplot as plt
             
-            # Get x,y from qpos (first 2 elements are x, y of base)
-            qpos = np.array(train_data.states.qpos)
-            num_traj = qpos.shape[0]
+    #         # Get x,y from qpos (first 2 elements are x, y of base)
+    #         qpos = np.array(train_data.states.qpos)
+    #         num_traj = qpos.shape[0]
             
-            # Plot all trajectories
-            plt.figure(figsize=(8, 8))
-            for i in range(num_traj):
-                plt.plot(qpos[i, :, 0], qpos[i, :, 1], 'b-', alpha=0.3)
+    #         # Plot all trajectories
+    #         plt.figure(figsize=(8, 8))
+    #         for i in range(num_traj):
+    #             plt.plot(qpos[i, :, 0], qpos[i, :, 1], 'b-', alpha=0.3)
             
-            # Mark start and end points
-            plt.plot(qpos[:, 0, 0], qpos[:, 0, 1], 'go', label='Start', markersize=10)
-            plt.plot(qpos[:, -1, 0], qpos[:, -1, 1], 'r*', label='End', markersize=10)
+    #         # Mark start and end points
+    #         plt.plot(qpos[:, 0, 0], qpos[:, 0, 1], 'go', label='Start', markersize=10)
+    #         plt.plot(qpos[:, -1, 0], qpos[:, -1, 1], 'r*', label='End', markersize=10)
             
-            plt.xlabel('X position')
-            plt.ylabel('Y position')
-            plt.title('Robot 2D Trajectory (from train_data)')
-            plt.legend()
-            plt.grid(True)
-            plt.axis('equal')
+    #         plt.xlabel('X position')
+    #         plt.ylabel('Y position')
+    #         plt.title('Robot 2D Trajectory (from train_data)')
+    #         plt.legend()
+    #         plt.grid(True)
+    #         plt.axis('equal')
             
-            plot_path = os.path.join(os.path.dirname(__file__), 'trajectory_plot.png')
-            plt.savefig(plot_path)
-            print(f"✓ Trajectory plot saved to {plot_path}")
-        else:
-            print("⚠ train_data is None (collect_data may be False)")
-    except Exception as e:
-        print(f"⚠ Plotting error: {e}")
+    #         plot_path = os.path.join(os.path.dirname(__file__), 'trajectory_plot.png')
+    #         plt.savefig(plot_path)
+    #         print(f"✓ Trajectory plot saved to {plot_path}")
+    #     else:
+    #         print("⚠ train_data is None (collect_data may be False)")
+    # except Exception as e:
+    #     print(f"⚠ Plotting error: {e}")
     
     # Test thread stop
     print("\nStopping safety thread...")

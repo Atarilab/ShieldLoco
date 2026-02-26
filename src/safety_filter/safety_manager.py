@@ -2,6 +2,7 @@ import threading
 import time
 from typing import Callable, Dict, Optional, Any
 from weakref import ref
+import sys
 
 import numpy as np
 
@@ -15,8 +16,26 @@ from utils.thread_manager import ThreadManager
 from utils.mps import update_params
 
 import functools
+import traceback
 
 from controllers.policies.policy import TorchScriptPolicy
+
+
+def guard_errors(context: str, *, stop_on_error: bool = True):
+    """Decorator to handle repetitive try/except + stop + logging."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as e:
+                tb = traceback.format_exc()
+                self._log_error(f"Error {context}: {e}")
+                self._log_error(tb)
+                if stop_on_error:
+                    self.stop()
+        return wrapper
+    return decorator
 
 
 class SafetyManager:
@@ -54,10 +73,18 @@ class SafetyManager:
         self._latest_state: Optional[mjx.Data] = None
         self._safety_override: Optional[Any] = None
 
+        self.thread_initialized = False
         self.updated_state = False
         self.updated_plan = False
         self.override = False
 
+    def _log_error(self, msg: str):
+        if self.logger:
+            self.logger.error(msg)
+        else:
+            print(msg, file=sys.stderr, flush=True)
+
+    @guard_errors("initializing thread")
     def init_thread(self):
         self.setup_jax_policy(self.torch_script_policy)
 
@@ -67,7 +94,7 @@ class SafetyManager:
             from .quad.task import QuadRLTask, QuadRLTaskParams
             self.task = QuadRLTask(self.mj_model, self.rl_policy_jax, self.rl_config)
 
-            self.task.data = mjx.make_data(self.task.mj_model, impl="warp", nconmax=1000, njmax=1000)
+            self.task.data = mjx.make_data(self.task.mj_model, impl="warp", nconmax=20000, njmax=1000)
 
             self.task_params = QuadRLTaskParams()
 
@@ -103,6 +130,7 @@ class SafetyManager:
             task_params=self.task_params, seed=random_seed
         )
 
+    @guard_errors("setting up JAX policy")
     def setup_jax_policy(self, rl_policy: TorchScriptPolicy):
         import torch
         import torchax
@@ -140,10 +168,12 @@ class SafetyManager:
         else:
             raise ValueError(f"Unsupported task name: {task_name}")
 
+    @guard_errors("starting safety filter thread")
     def start(self):
         """Start the safety filter thread."""
         self._thread_manager.start()
 
+    @guard_errors("stopping safety filter thread")
     def stop(self, timeout: float = 2.0):
         """Stop the safety filter thread.
 
@@ -152,6 +182,7 @@ class SafetyManager:
         """
         self._thread_manager.stop(timeout=timeout)
 
+    @guard_errors("updating state")
     def update_state(self, **kwargs):
         """
             Update the latest robot state for safety checking.
@@ -190,6 +221,7 @@ class SafetyManager:
             self.exec_plan = None
             self.updated_plan = False
 
+    @guard_errors("checking safety")
     def check(self):
         """Check for safety and return override command if needed.
 
@@ -212,19 +244,23 @@ class SafetyManager:
         # TODO: add a real check
         self.override = True
 
+    @guard_errors("checking if safety filter is running")
     def is_running(self) -> bool:
         """Check if the safety filter is running.
 
         Returns:
             True if running, False otherwise.
         """
-        return self._thread_manager.is_running()
+        with self._safety_lock:
+            return self._thread_manager.is_running() and self.thread_initialized
 
+    @guard_errors("running safety loop")
     def _safety_loop(self):
         """Main safety filter loop running in a separate thread."""
 
         with self._safety_lock:
             self.init_thread()
+            self.thread_initialized = True
 
         while self._thread_manager.should_continue():
             start_time = time.perf_counter()

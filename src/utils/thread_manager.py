@@ -25,6 +25,7 @@ class ThreadManager:
         self._thread_names: List[str] = []
         self._running = False
         self._initialized = False
+        self._last_running_state: Optional[bool] = None
 
     def add_thread(self, name: str, target: Callable):
         """
@@ -80,10 +81,15 @@ class ThreadManager:
             return
 
         self._running = False
+        current_thread = threading.current_thread()
 
         # Wait for threads to finish
         for thread, name in zip(self._threads, self._thread_names):
             if thread.is_alive():
+                if thread is current_thread:
+                    if self.logger:
+                        self.logger.debug(f"Skipping self-join for thread: {name}")
+                    continue
                 thread.join(timeout=timeout)
                 if thread.is_alive():
                     if self.logger:
@@ -97,10 +103,11 @@ class ThreadManager:
     def is_running(self) -> bool:
         """Check if any threads are currently running."""
         running = self._running and any(thread.is_alive() for thread in self._threads)
-        if self.logger:
+        if self.logger and self.debug and running != self._last_running_state:
             self.logger.debug(
                 f"ThreadManager.is_running(): _running={self._running}, threads_alive={[thread.is_alive() for thread in self._threads]}, result={running}"
             )
+            self._last_running_state = running
         return running
 
     def should_continue(self) -> bool:
