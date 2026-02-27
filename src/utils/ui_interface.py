@@ -222,6 +222,35 @@ class RobotControlUI(App):
             color: $text;
             border: tall $background;
         }
+
+        .move-buttons-layout {
+            width: 100%;
+            margin: 1 1;
+        }
+
+        .move-row {
+            width: 100%;
+            layout: horizontal;
+            align: center middle;
+            height: auto;
+        }
+
+        .move-spacer {
+            width: 1fr;
+            margin: 0 1;
+        }
+
+        .move-button {
+            width: 1fr;
+            margin: 0 1;
+        }
+
+        .move-center {
+            width: 1fr;
+            margin: 0 1;
+            content-align: center middle;
+            color: rgb(120, 130, 160);
+        }
     """
 
     current_mode = reactive(None)
@@ -585,13 +614,38 @@ class CommandWidget(Vertical):
 
                 elif spec["widget_type"] == "button":
                     # Create button group for discrete choices
-                    with Horizontal(classes="gait-buttons-container"):
-                        for option in spec["options"]:
-                            yield Button(
-                                option.capitalize(),
-                                classes="gait-button",
-                                id=f"button-{spec['name']}-{option}",
-                            )
+                    if spec["name"] == "move":
+                        with Vertical(classes="move-buttons-layout"):
+                            with Horizontal(classes="move-row"):
+                                yield Static("", classes="move-spacer")
+                                yield Button("Up", classes="gait-button move-button", id="button-move-up")
+                                yield Static("", classes="move-spacer")
+
+                            with Horizontal(classes="move-row"):
+                                yield Button("Left", classes="gait-button move-button", id="button-move-left")
+                                yield Button("Centre", classes="gait-button move-button", id="button-move-center")
+                                yield Button("Right", classes="gait-button move-button", id="button-move-right")
+
+                            with Horizontal(classes="move-row"):
+                                yield Static("", classes="move-spacer")
+                                yield Button("Down", classes="gait-button move-button", id="button-move-down")
+                                yield Static("", classes="move-spacer")
+
+                            with Horizontal(classes="move-row"):
+                                yield Button("Turn Left", classes="gait-button move-button", id="button-move-turn-left")
+                                yield Button(
+                                    "Turn Right",
+                                    classes="gait-button move-button",
+                                    id="button-move-turn-right",
+                                )
+                    else:
+                        with Horizontal(classes="gait-buttons-container"):
+                            for option in spec["options"]:
+                                yield Button(
+                                    option.replace("-", " ").title(),
+                                    classes="gait-button",
+                                    id=f"button-{spec['name']}-{option}",
+                                )
 
                 elif spec["widget_type"] == "dropdown":
                     # Create dropdown for multiple choices
@@ -637,8 +691,10 @@ class CommandWidget(Vertical):
 
                     # Visual feedback using predefined colors
                     # Reset all buttons for this command group
+                    group_prefix = f"button-{command_name}-"
                     for btn in self.query(".gait-button"):
-                        btn.styles.background = BUTTON_DEFAULT_COLOR
+                        if btn.id and btn.id.startswith(group_prefix):
+                            btn.styles.background = BUTTON_DEFAULT_COLOR
                     event.button.styles.background = BUTTON_ACTIVE_COLOR
 
     def on_select_changed(self, event: Select.Changed):

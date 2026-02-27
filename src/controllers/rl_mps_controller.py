@@ -339,8 +339,14 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.command_manager.register_button_command(
             name="gait",
             description="Select Gait Pattern",
-            options=list(self.gait_patterns.keys()),
+            options=["stance", "trot"],
             default_value="stance",
+        )
+        self.command_manager.register_button_command(
+            name="move",
+            description="Move Robot",
+            options=["up", "down", "left", "center", "right", "turn-left", "turn-right"],
+            default_value="center",
         )
 
     def set_mode(self):
@@ -847,6 +853,21 @@ class RLQuadrupedMPSController(RLControllerBase):
                                 self.transition_progress = 0.0
                                 self.transition_start_gait = self.current_gait
                                 self.transition_end_gait = new_gait
+
+            if "move" in new_commands:
+                move_command = str(new_commands["move"]).lower()
+                if move_command in ["up", "down"]:
+                    self._handle_step_size_change(move_command)
+                elif move_command == "center":
+                    with self._gait_lock:
+                        self.pending_step_size = 0.0
+                        self.step_size_change_pending = True
+                elif move_command in ["left", "right"]:
+                    self._handle_lateral_pos_change(move_command)
+                elif move_command == "turn-left":
+                    self._handle_heading_change("left")
+                elif move_command == "turn-right":
+                    self._handle_heading_change("right")
 
         except Exception as e:
             self.logger.error(f"Contact command update failed: {e}")
