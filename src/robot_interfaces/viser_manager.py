@@ -45,6 +45,7 @@ class ViserState:
     opt_contact_subscriber: Any = None
     opt_contact_thread: Optional[Thread] = None
     rclpy_initialized_here: bool = False
+    opt_contact_horizon_length: int = 0
 
 
 class ViserManager:
@@ -125,15 +126,26 @@ class ViserManager:
         if self.state.server is None or not self.cfg.show_planned_contact_locations:
             return
 
+        foot_colors = [
+            (255, 0, 0),    # Red for FL
+            (0, 255, 0),    # Green for FR
+            (0, 0, 255),    # Blue for RL
+            (255, 255, 0),  # Yellow for RR
+        ]
+
+        max_horizon = 30
+        self.state.opt_contact_horizon_length = max_horizon
+
         for foot_idx, foot_name in enumerate(["FL", "FR", "RL", "RR"]):
-            handle = self.state.server.scene.add_icosphere(
-                f"/robot/opt_contact_locations/{foot_name}",
-                radius=self.cfg.planned_contact_radius,
-                color=self.cfg.planned_contact_color_rgb,
-                position=(0.0, 0.0, 0.0),
-                visible=False,
-            )
-            self.state.opt_contact_handles[foot_idx] = handle
+            for step in range(max_horizon):
+                handle = self.state.server.scene.add_icosphere(
+                    f"/robot/opt_contact_locations/{foot_name}_step{step}",
+                    radius=self.cfg.planned_contact_radius * 0.8,
+                    color=foot_colors[foot_idx],
+                    position=(0.0, 0.0, 0.0),
+                    visible=False,
+                )
+                self.state.opt_contact_handles[foot_idx * max_horizon + step] = handle
 
     def _initialize_opt_contact_subscriber(self):
         if not self.cfg.show_planned_contact_locations:
@@ -304,11 +316,24 @@ class ViserManager:
                         opt_positions = dict(self.state.opt_contact_positions)
                         has_recent_update = (time.time() - self.state.opt_contact_last_update) < 1.0
 
-                    for foot_idx, handle in self.state.opt_contact_handles.items():
-                        if has_recent_update and foot_idx in opt_positions:
-                            handle.position = opt_positions[foot_idx]
-                            handle.visible = True
-                        else:
+                    # Detect horizon from marker IDs: find max ID and compute horizon
+                    max_horizon = 10  # default
+                    if opt_positions:
+                        max_marker_id = max(opt_positions.keys())
+                        # Assume 4 feet, so horizon = max_id / 4 (rounded up)
+                        detected_horizon = (max_marker_id // 4) + 1
+                        if detected_horizon > 1:
+                            max_horizon = min(detected_horizon, self.state.opt_contact_horizon_length)
+
+                    # Controller sends: marker.id = foot_idx * horizon + step
+                    if has_recent_update:
+                        for marker_id, pos in opt_positions.items():
+                            handle = self.state.opt_contact_handles.get(marker_id)
+                            if handle is not None:
+                                handle.position = pos
+                                handle.visible = True
+                    else:
+                        for handle in self.state.opt_contact_handles.values():
                             handle.visible = False
 
             time.sleep(self.cfg.dt)

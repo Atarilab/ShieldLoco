@@ -37,13 +37,16 @@ class RobotControlUI(App):
         }
 
         #menu-container {
-            width: 2fr;
+            width: 1fr;
+            min-width: 46;
+            max-width: 72;
             height: 100%;
             margin-right: 1;
         }
 
         #command-container {
-            width: 1fr;
+            width: 2fr;
+            min-width: 56;
             height: 100%;
             background: rgb(40, 40, 60);
             border: round $background;

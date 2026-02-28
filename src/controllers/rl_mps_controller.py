@@ -1176,54 +1176,55 @@ class RLQuadrupedMPSController(RLControllerBase):
 
     def pub_opt_contact_locations(self, opt_contact_locations):
         """
-        Visualizes the current contact locations in the world frame.
-        Colors the markers based on the current contact plan:
-        - Green: for feet that are not in contact (contact_plan is False)
-        - Black: for feet that are in contact (contact_plan is True)
+        Visualizes the optimized contact locations in the world frame.
+        Shows ALL time steps in the horizon at once.
+        Colors the markers by foot:
+        - Red: FL
+        - Green: FR
+        - Blue: RL
+        - Yellow: RR
         """
         try:
             marker_array = MarkerArray()
 
-            # Get current desired positions for each foot
-            current_positions = opt_contact_locations[:, self.current_goal_idx]
+            colors = [
+                ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0),  # Red for FL
+                ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0),  # Green for FR
+                ColorRGBA(r=0.0, g=0.0, b=1.0, a=1.0),  # Blue for RL
+                ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0),  # Yellow for RR
+            ]
 
-            # Create markers for each foot
-            for foot_idx in range(4):
-                marker = Marker()
-                marker.header.frame_id = "world"
-                marker.header.stamp = self.get_clock().now().to_msg()
-                marker.ns = "opt_contact_locations"
-                marker.id = foot_idx
-                marker.type = Marker.SPHERE
-                marker.action = Marker.ADD
+            foot_names = ["FL", "FR", "RL", "RR"]
 
-                # Set the scale of the sphere
-                marker.scale.x = 0.05  # radius
-                marker.scale.y = 0.05
-                marker.scale.z = 0.05
+            positions_for_viz = opt_contact_locations.permute(1, 0, 2).numpy()
 
-                # Set color based on contact plan
-                if self.current_contact_plan[0, foot_idx]:
-                    # Black for feet in contact
-                    marker.color = ColorRGBA(r=0.0, g=0.0, b=0.0, a=1.0)
-                else:
-                    # Green for feet not in contact
-                    marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+            for foot_idx in range(len(foot_names)):
+                for step in range(positions_for_viz.shape[0]):
+                    marker = Marker()
+                    marker.header.frame_id = "world"
+                    marker.header.stamp = self.get_clock().now().to_msg()
+                    marker.ns = f"opt_foot_trajectory_{foot_names[foot_idx]}"
+                    marker.id = foot_idx * self.horizon_length + step
+                    marker.type = Marker.SPHERE
+                    marker.action = Marker.ADD
 
-                # Set position using desired positions
-                marker.pose.position.x = float(current_positions[foot_idx, 0])
-                marker.pose.position.y = float(current_positions[foot_idx, 1])
-                marker.pose.position.z = float(current_positions[foot_idx, 2])
+                    marker.scale.x = 0.03
+                    marker.scale.y = 0.03
+                    marker.scale.z = 0.03
 
-                # Set orientation (identity quaternion)
-                marker.pose.orientation.w = 1.0
-                marker.pose.orientation.x = 0.0
-                marker.pose.orientation.y = 0.0
-                marker.pose.orientation.z = 0.0
+                    marker.color = colors[foot_idx]
 
-                marker_array.markers.append(marker)
+                    marker.pose.position.x = float(positions_for_viz[step, foot_idx, 0])
+                    marker.pose.position.y = float(positions_for_viz[step, foot_idx, 1])
+                    marker.pose.position.z = float(positions_for_viz[step, foot_idx, 2])
 
-            # Publish the marker array
+                    marker.pose.orientation.w = 1.0
+                    marker.pose.orientation.x = 0.0
+                    marker.pose.orientation.y = 0.0
+                    marker.pose.orientation.z = 0.0
+
+                    marker_array.markers.append(marker)
+
             self.opt_contact_locations_pub.publish(marker_array)
 
         except Exception as e:
