@@ -71,16 +71,19 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.feet_step_size = configs["controller_config"]["feet_step_size"]
         self.base_link = self.robot.base_link
         self.lateral_pos = 0.0
-        self.future_feet_positions_init_frame = None
+        self.lateral_step_size = 0.0
+        self.pending_lateral_step_size = 0.0
+        self.lateral_step_size_change_pending = False
+        self.pending_heading = 0.0
+        self.pending_step_size = 0.0
+
         self.future_feet_positions_w = torch.zeros(4, self.horizon_length, 3, device=self.device)
         self.future_feet_positions_b = torch.zeros(4, self.horizon_length, 3, device=self.device)
-        self.desired_ee_position_w = torch.zeros((4, 3))
 
         # Heading command for feet positions
         self.heading_command = 0.0  # Default heading (in radians)
         self.heading_command_lock = threading.RLock()  # Lock for heading command updates
         self.heading_change_pending = False  # Flag to indicate pending heading change
-        self.lateral_pos_change_pending = False  # Flag to indicate pending lateral pos change
 
         # Define gait patterns (FL, FR, RL, RR)
         self.gait_patterns = {
@@ -370,9 +373,9 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.feet_step_size = 0.0
             self.command_duration = 0.35
             self.heading_command = 0.0
-            self.pending_heading = 0.0
-            self.pending_step_size = 0.0
-            self.pending_lateral_pos = 0.0
+            self.lateral_step_size = 0.0
+            self.pending_lateral_step_size = 0.0
+            self.lateral_step_size_change_pending = False
 
         base_pos_w = torch.tensor(
             self.robot.mj_model.get_body_position_world("base_link"), dtype=torch.float32, device=self.device
@@ -422,6 +425,11 @@ class RLQuadrupedMPSController(RLControllerBase):
             start_time = time.perf_counter()
 
             self.update_state(state)
+
+            # Update lateral_pos from current robot position
+            if self.robot.mj_model is not None:
+                base_pos_w = self.robot.mj_model.get_body_position_world(self.base_link)
+                self.lateral_pos = base_pos_w[1]
 
             # Update contact plan timing with thread safety
             with self._gait_lock:
@@ -545,14 +553,13 @@ class RLQuadrupedMPSController(RLControllerBase):
                     # Regenerate future feet positions with new heading
                     self.generate_future_feet_positions()
 
-                if self.lateral_pos_change_pending:
-                    self.lateral_pos = self.pending_lateral_pos
-                    self.lateral_pos_change_pending = False
+                if self.lateral_step_size_change_pending:
+                    self.lateral_step_size = self.pending_lateral_step_size
+                    self.lateral_step_size_change_pending = False
                     if self.logger is not None:
-                        self.logger.debug(f"Applied lateral pos change: {self.lateral_pos:.2f} meters")
-                    # Regenerate future feet positions with new heading
+                        self.logger.debug(f"Applied lateral step size change: {self.lateral_step_size:.2f} meters")
+                    # Regenerate future feet positions with new lateral step size
                     avg_base_xy = self.future_feet_positions_w[:, self.current_goal_idx].mean(dim=0).clone()
-                    avg_base_xy[1] = self.lateral_pos
                     self.generate_future_feet_positions(pos=avg_base_xy)
 
                 # Apply pending command duration change if any
@@ -693,7 +700,7 @@ class RLQuadrupedMPSController(RLControllerBase):
     def generate_future_feet_positions(self, pos=None):
         """
         Generates future feet positions for the controller.
-        Uses the heading_command relative to the robot's base yaw to determine the direction of movement.
+        Uses the heading_command to determine the direction of movement.
         """
         if pos is None:
             pos = torch.zeros(3, device=self.device)
@@ -701,14 +708,23 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.goal_completion_counter = 0
         self.current_goal_idx = 0
 
+        # Check if pos is a tensor of zeros (default case)
+        if torch.all(pos == 0):
+            # Get the robot's current position
+            robot_pos = torch.tensor(
+                self.robot.mj_model.get_body_position_world(self.base_link), dtype=torch.float32, device=self.device
+            )
+            # Use robot's actual current X and Y positions
+            pos = torch.tensor([robot_pos[0], robot_pos[1], 0.0], dtype=torch.float32, device=self.device)
+
         # Use current offset values
         offset = self.current_offset.clone()
 
-        # Use the heading command relative to robot's yaw
+        # Use the heading command as desired turn angle
         with self.heading_command_lock:
             # Convert heading command to tensor for calculations
             heading_command_tensor = torch.tensor(self.heading_command, dtype=torch.float32, device=self.device)
-            # Calculate target yaw by adding the heading command to the robot's yaw
+            # Target yaw is the heading command value
             target_yaw = heading_command_tensor
 
         # Create rotation matrix for the target yaw
@@ -723,30 +739,25 @@ class RLQuadrupedMPSController(RLControllerBase):
         # Rotate the offset positions
         rotated_offset = torch.matmul(rotation_matrix, offset.T).T
 
-        # Check if pos is a tensor of zeros (default case)
-        if torch.all(pos == 0):
-            # Get the robot's current position
-            robot_pos = torch.tensor(
-                self.robot.mj_model.get_body_position_world(self.base_link), dtype=torch.float32, device=self.device
-            )
-            # Use only the x-dimension of the robot's position
-            pos = torch.tensor([robot_pos[0], self.lateral_pos, 0.0], dtype=torch.float32, device=self.device)
-
         self.future_feet_positions_w[:] = (pos + rotated_offset).unsqueeze(1)
 
+        # Apply heading ONLY to stride direction (forward movement)
         stride_offsets = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).unsqueeze(
             0
         ) * torch.tensor(self.feet_step_size, dtype=torch.float32, device=self.device).unsqueeze(-1)
-
-        # r = torch.zeros(4, self.horizon_length)
-        # x_rand = r.uniform_(-0.06, 0.06).clone()
-        # y_rand = r.uniform_(-0.06, 0.06).clone()
-
-        # Apply stride in the direction of the target heading
         direction_x = cos_yaw
         direction_y = sin_yaw
         self.future_feet_positions_w[:, :, 0] += stride_offsets.squeeze(-1) * direction_x
         self.future_feet_positions_w[:, :, 1] += stride_offsets.squeeze(-1) * direction_y
+
+        lateral_stride_offsets = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).unsqueeze(
+            0
+        ) * torch.tensor(self.lateral_step_size, dtype=torch.float32, device=self.device).unsqueeze(-1)
+        lateral_direction_x = -sin_yaw
+        lateral_direction_y = cos_yaw
+        self.future_feet_positions_w[:, :, 0] += lateral_stride_offsets.squeeze(-1) * lateral_direction_x
+        self.future_feet_positions_w[:, :, 1] += lateral_stride_offsets.squeeze(-1) * lateral_direction_y
+
         # self.future_feet_positions_w[:, :, 2] = -0.02 if self.interface == "real" else 0.08
 
         # TODO BUG: should be what the terrain height or something
@@ -862,6 +873,8 @@ class RLQuadrupedMPSController(RLControllerBase):
                     with self._gait_lock:
                         self.pending_step_size = 0.0
                         self.step_size_change_pending = True
+                        self.pending_lateral_step_size = 0.0
+                        self.lateral_step_size_change_pending = True
                 elif move_command in ["left", "right"]:
                     self._handle_lateral_pos_change(move_command)
                 elif move_command == "turn-left":
@@ -874,13 +887,13 @@ class RLQuadrupedMPSController(RLControllerBase):
 
     def _handle_step_size_change(self, direction: str):
         """Handle forwardstep size changes."""
-        # Increase step size by 0.01 meters when up button is pressed
-        if direction == "up":
-            new_step_size = self.feet_step_size + 0.1
-        elif direction == "down":
-            new_step_size = self.feet_step_size - 0.1
-        # Limit maximum step size to 0.2 meters for safety
-        new_step_size = max(-0.3, min(new_step_size, 0.3))
+        new_step_size = self._compute_discrete_step(
+            current_value=self.feet_step_size,
+            direction=direction,
+            step=0.1,
+            minimum=-0.3,
+            maximum=0.3,
+        )
 
         # Set the pending step size change instead of applying it immediately
         with self._gait_lock:
@@ -894,31 +907,38 @@ class RLQuadrupedMPSController(RLControllerBase):
         Args:
             direction: String indicating the direction to turn ("left" or "right")
         """
-        # Define heading change amount in radians
-        heading_change = 0.05  # About 11.5 degrees
+        heading_change = 0.05  # radians per press
 
         with self._gait_lock:
             if direction == "left":
-                # Turn left (positive heading)
                 self.pending_heading = self.heading_command + heading_change
             elif direction == "right":
-                # Turn right (negative heading)
                 self.pending_heading = self.heading_command - heading_change
 
-            # # Keep heading within -pi to pi range
-            # self.pending_heading = (self.pending_heading + np.pi) % (2 * np.pi) - np.pi
-
-            # Set the pending flag
             self.heading_change_pending = True
 
     def _handle_lateral_pos_change(self, direction: str):
         """Handle lateral step size changes."""
         with self._gait_lock:
-            if direction == "left":
-                self.pending_lateral_pos = self.lateral_pos + 0.015
-            elif direction == "right":
-                self.pending_lateral_pos = self.lateral_pos - 0.015
-            self.lateral_pos_change_pending = True
+            self.pending_lateral_step_size = self._compute_discrete_step(
+                current_value=self.lateral_step_size,
+                direction=direction,
+                step=0.1,
+                minimum=-0.3,
+                maximum=0.3,
+            )
+            self.lateral_step_size_change_pending = True
+
+    @staticmethod
+    def _compute_discrete_step(current_value: float, direction: str, step: float, minimum: float, maximum: float) -> float:
+        """Compute one discrete command step with clamping."""
+        if direction in ["up", "left"]:
+            updated = current_value + step
+        elif direction in ["down", "right"]:
+            updated = current_value - step
+        else:
+            updated = current_value
+        return max(minimum, min(updated, maximum))
 
     def _handle_command_duration_change(self, direction: str):
         """
