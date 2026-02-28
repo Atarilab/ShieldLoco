@@ -871,10 +871,15 @@ class RLQuadrupedMPSController(RLControllerBase):
                     self._handle_step_size_change(move_command)
                 elif move_command == "center":
                     with self._gait_lock:
+                        # Reset current values immediately
+                        self.feet_step_size = 0.0
+                        self.lateral_step_size = 0.0
+                        # Also reset pending values
                         self.pending_step_size = 0.0
                         self.step_size_change_pending = True
                         self.pending_lateral_step_size = 0.0
                         self.lateral_step_size_change_pending = True
+                        # Don't reset heading - keep current heading
                 elif move_command in ["left", "right"]:
                     self._handle_lateral_pos_change(move_command)
                 elif move_command == "turn-left":
@@ -914,6 +919,9 @@ class RLQuadrupedMPSController(RLControllerBase):
                 self.pending_heading = self.heading_command + heading_change
             elif direction == "right":
                 self.pending_heading = self.heading_command - heading_change
+
+            # Wrap heading to [-pi, pi] to prevent unbounded growth
+            self.pending_heading = (self.pending_heading + np.pi) % (2 * np.pi) - np.pi
 
             self.heading_change_pending = True
 
