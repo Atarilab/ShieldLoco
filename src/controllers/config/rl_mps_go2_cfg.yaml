@@ -84,5 +84,5 @@ mps_plan_horizon: 0.0125 # timestep * horizon_length = 0.00125 * 10
 mps_iterations: 3
 mps_gamma: 0.99
 mps_safety_weight: 1000
-mps_collect_data: false
+mps_collect_data: true
 mps_top_fraction: 0.01

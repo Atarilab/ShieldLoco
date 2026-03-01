@@ -91,13 +91,29 @@ def main():
     mj_data.qvel[:] = 0  # Reset velocity
     mj_data.time = 0.0
     
-    # Create initial reference plan
+    # Create reference plan with forward movement (trot gait)
     horizon_length = int(rl_config["mps_plan_horizon"] / rl_config["timestep"])
     rl_config["horizon_length"] = horizon_length
+    
+    # Default stance offset for GO2 (FL, FR, RL, RR)
+    default_stance = np.array([
+        [0.1934, 0.1465, 0.0],   # FL
+        [0.1934, -0.1465, 0.0],  # FR
+        [-0.1934, 0.1465, 0.0],  # RL
+        [-0.1934, -0.1465, 0.0], # RR
+    ])
+    
+    # Create reference with forward movement (stride = 0.1m per step)
     ref = np.zeros((4, horizon_length, 3))
-    ref[:, :, 2] = 0.1  # Foot height
-
-
+    stride = 0.1  # forward stride per timestep
+    for t in range(horizon_length):
+        ref[:, t, 0] = default_stance[:, 0] + t * stride  # forward in X
+        ref[:, t, 1] = default_stance[:, 1]  # lateral stays same
+        ref[:, t, 2] = 0.1  # foot height
+    
+    print(f"\nReference plan shape: {ref.shape}")
+    print(f"Ref at t=0: FL={ref[0, 0]}, FR={ref[1, 0]}")
+    print(f"Ref at t={horizon_length-1}: FL={ref[0, horizon_length-1]}, FR={ref[1, horizon_length-1]}")
 
     # Create SafetyManager
     print("\nInitializing SafetyManager...")
@@ -125,8 +141,8 @@ def main():
     print("\n--- Verification: State Update ---")
     
     
-    # Update state
-    print("Sending state update to worker...", flush=True)
+    # Update state with trot gait (gait=2) and forward movement
+    print("\nSending state update with trot gait and forward movement...", flush=True)
     safety_manager.update_state(
         ref=ref,
         qpos=mj_data.qpos,
@@ -134,8 +150,8 @@ def main():
         time=mj_data.time,
         command_start_time=0.0,
         goal_idx=0,
-        contact_plan=np.zeros(8),
-        current_gait=0,
+        contact_plan=np.array([1, 0, 0, 1]),  # Will be updated by gait
+        current_gait=2,  # trot
         goal_completion_counter=0,
         in_transition=False,
     )
@@ -163,6 +179,22 @@ def main():
         )
     print(f"✓ Plan shape: {plan.shape}")
     assert plan.shape == (4, horizon_length, 3), f"Expected {(4, horizon_length, 3)}, got {plan.shape}"
+    
+    # Get COM trajectory from train_data
+    print("\n--- Checking COM Trajectory ---")
+    train_data = safety_manager.get_train_data()
+    if train_data is not None and train_data.get("com") is not None:
+        com = train_data["com"]
+        print(f"COM trajectory shape: {com.shape}")
+        print(f"COM at t=0: {com[0, 0]}")
+        print(f"COM at t=mid: {com[0, com.shape[1]//2]}")
+        print(f"COM at t=end: {com[0, -1]}")
+        
+        # Check movement in each direction
+        movement = com[0, -1] - com[0, 0]
+        print(f"COM movement: X={movement[0]:.4f}, Y={movement[1]:.4f}, Z={movement[2]:.4f}")
+    else:
+        print("WARNING: No train_data or COM available!")
     
     # Test thread stop
     print("\nStopping safety thread...")

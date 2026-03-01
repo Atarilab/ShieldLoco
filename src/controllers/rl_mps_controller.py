@@ -473,6 +473,14 @@ class RLQuadrupedMPSController(RLControllerBase):
                     if self.visualize["opt_contact_locations"]:
                         self.pub_opt_contact_locations(opt_future_feet_positions_w)
 
+                # Publish COM trajectory from train_data
+                if self.visualize["opt_contact_locations"]:
+                    train_data = self.safety_manager.get_train_data()
+                    if train_data is not None and "com" in train_data:
+                        com_traj = train_data["com"]  # shape: (num_traj, horizon+1, 3)
+                                                
+                        self.pub_com_trajectory(com_traj)
+
             if self.visualize["current_contact_locations"]:
                 self.pub_current_contact_locations()
 
@@ -1047,6 +1055,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.contact_locations_pub = self.create_publisher(MarkerArray, "contact_locations", 10)
         if self.visualize["opt_contact_locations"]:
             self.opt_contact_locations_pub = self.create_publisher(MarkerArray, "opt_contact_locations", 10)
+            self.com_trajectory_pub = self.create_publisher(MarkerArray, "com_trajectory", 10)
         if self.visualize["feet_error"]:
             self.feet_error_pub = self.create_publisher(MarkerArray, "feet_error", 10)
             self.feet_error_norm_pub = self.create_publisher(Float32MultiArray, "feet_error_norm", 10)
@@ -1230,6 +1239,50 @@ class RLQuadrupedMPSController(RLControllerBase):
         except Exception as e:
             if self.logger is not None:
                 self.logger.error(f"Failed to publish optimized contact locations: {e}")
+
+    def pub_com_trajectory(self, com_traj):
+        """
+        Visualizes the COM trajectory from collected train_data.
+        com_traj: shape (num_traj, horizon+1, 3) - x, y, z positions
+        """
+        try:
+            marker_array = MarkerArray()
+
+            # Get first trajectory (best one)
+            traj = com_traj[0]  # shape: (horizon+1, 3)
+
+            for step in range(traj.shape[0]):
+                marker = Marker()
+                marker.header.frame_id = "world"
+                marker.header.stamp = self.get_clock().now().to_msg()
+                marker.ns = "com_trajectory"
+                marker.id = step
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+
+                marker.scale.x = 0.02
+                marker.scale.y = 0.02
+                marker.scale.z = 0.02
+
+                # Cyan color for COM trajectory
+                marker.color = ColorRGBA(r=0.0, g=1.0, b=1.0, a=1.0)
+
+                marker.pose.position.x = float(traj[step, 0])
+                marker.pose.position.y = float(traj[step, 1])
+                marker.pose.position.z = float(traj[step, 2])
+
+                marker.pose.orientation.w = 1.0
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+
+                marker_array.markers.append(marker)
+
+            self.com_trajectory_pub.publish(marker_array)
+
+        except Exception as e:
+            if self.logger is not None:
+                self.logger.error(f"Failed to publish COM trajectory: {e}")
 
     def pub_current_contact_locations(self):
         """

@@ -80,6 +80,7 @@ class SafetyManager:
         self.updated_plan = False
         self.override = False
         self.exec_plan = None
+        self._last_train_data = None
 
     def _log_error(self, msg: str):
         if self.logger:
@@ -362,6 +363,14 @@ class SafetyManager:
         self._last_result_seq = result_seq
         self.exec_plan = self._shared_result.get("plan")
         self.override = bool(self._shared_result.get("override", False))
+        
+        # Fetch train_data COM trajectory
+        train_data_dict = self._shared_result.get("train_data")
+        if train_data_dict is not None:
+            self._last_train_data = train_data_dict
+        else:
+            self._last_train_data = None
+            
         if self.exec_plan is not None:
             self.updated_plan = self.exec_plan is not None
             self.updated_state = False
@@ -385,6 +394,11 @@ class SafetyManager:
             self.updated_plan = False
             return self.exec_plan
         return None
+
+    @guard_errors("getting train data", stop_on_error=False)
+    def get_train_data(self):
+        self._poll_results()
+        return self._last_train_data
 
     def __enter__(self):
         """Context manager entry."""
@@ -482,6 +496,7 @@ def _safety_worker_main(
     stop_event: Any,
 ):
     import jax.numpy as jnp
+    from mujoco import mjx
 
     task, task_params, policy_params, jit_optimize = _init_worker_objects(mj_model, rl_policy, rl_config)
 
@@ -507,7 +522,9 @@ def _safety_worker_main(
             qvel=jnp.asarray(latest_state.get("qvel")),
             time=jnp.asarray(latest_state.get("time")),
         )
-
+        # Refresh derived kinematics/contact fields after injecting raw state.
+        task.data = mjx.forward(task.model, task.data)
+        
         task_params = task.update_params(task_params, latest_state)
         ref_plan_normalized = task.get_reference_plan(
             ref=latest_state.get("ref"),
@@ -522,6 +539,14 @@ def _safety_worker_main(
         override = True
         policy_params = jit_optimize(task.data, policy_params, override)
         exec_plan = np.asarray(policy_params.best_plan)
+
+        # Share train_data COM trajectory if available
+        if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:
+            # Extract base position trajectory (x,y,z) from qpos.
+            com_traj = np.array(policy_params.train_data.states.qpos[:, :, :3])
+            shared_result["train_data"] = {"com": com_traj}
+        else:
+            shared_result["train_data"] = None
 
         shared_result["plan"] = exec_plan
         shared_result["override"] = override

@@ -46,6 +46,11 @@ class ViserState:
     opt_contact_thread: Optional[Thread] = None
     rclpy_initialized_here: bool = False
     opt_contact_horizon_length: int = 0
+    # COM trajectory visualization
+    com_trajectory_handles: dict[int, Any] = field(default_factory=dict)
+    com_trajectory_positions: dict[int, tuple[float, float, float]] = field(default_factory=dict)
+    com_trajectory_last_update: float = 0.0
+    com_trajectory_subscriber: Any = None
 
 
 class ViserManager:
@@ -147,6 +152,18 @@ class ViserManager:
                 )
                 self.state.opt_contact_handles[foot_idx * max_horizon + step] = handle
 
+        # Initialize COM trajectory handles (max 20 steps)
+        com_horizon = 20
+        for step in range(com_horizon):
+            handle = self.state.server.scene.add_icosphere(
+                f"/robot/com_trajectory/step{step}",
+                radius=0.015,
+                color=(0, 255, 255),  # Cyan
+                position=(0.0, 0.0, 0.0),
+                visible=False,
+            )
+            self.state.com_trajectory_handles[step] = handle
+
     def _initialize_opt_contact_subscriber(self):
         if not self.cfg.show_planned_contact_locations:
             return
@@ -164,6 +181,13 @@ class ViserManager:
                 MarkerArray,
                 self.cfg.planned_contact_topic,
                 self._on_opt_contact_locations,
+                10,
+            )
+            # COM trajectory subscriber
+            self.state.com_trajectory_subscriber = self.state.opt_contact_node.create_subscription(
+                MarkerArray,
+                "com_trajectory",
+                self._on_com_trajectory,
                 10,
             )
             self.state.opt_contact_thread = Thread(target=self._opt_contact_spin_thread, daemon=True)
@@ -214,6 +238,19 @@ class ViserManager:
         with self.locker:
             self.state.opt_contact_positions = positions
             self.state.opt_contact_last_update = time.time()
+
+    def _on_com_trajectory(self, msg):
+        positions = {}
+        for marker in msg.markers:
+            positions[int(marker.id)] = (
+                float(marker.pose.position.x),
+                float(marker.pose.position.y),
+                float(marker.pose.position.z),
+            )
+
+        with self.locker:
+            self.state.com_trajectory_positions = positions
+            self.state.com_trajectory_last_update = time.time()
 
     def _should_visualize_collision_geom(self, geom_id):
         geom_contype = int(self.mj_model.geom_contype[geom_id])
@@ -346,6 +383,22 @@ class ViserManager:
                                 handle.visible = True
                     else:
                         for handle in self.state.opt_contact_handles.values():
+                            handle.visible = False
+
+                # Update COM trajectory visualization
+                if self.state.com_trajectory_handles:
+                    with self.locker:
+                        com_positions = dict(self.state.com_trajectory_positions)
+                        has_com_update = (time.time() - self.state.com_trajectory_last_update) < 1.0
+
+                    if has_com_update:
+                        for marker_id, pos in com_positions.items():
+                            handle = self.state.com_trajectory_handles.get(marker_id)
+                            if handle is not None:
+                                handle.position = pos
+                                handle.visible = True
+                    else:
+                        for handle in self.state.com_trajectory_handles.values():
                             handle.visible = False
 
             time.sleep(self.cfg.dt)
