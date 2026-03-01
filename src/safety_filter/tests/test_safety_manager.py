@@ -150,7 +150,7 @@ def main():
         time=mj_data.time,
         command_start_time=0.0,
         goal_idx=0,
-        contact_plan=np.array([1, 0, 0, 1]),  # Will be updated by gait
+        contact_plan=np.array([1, 0, 0, 1, 0, 1, 1, 0]),  # Will be updated by gait
         current_gait=2,  # trot
         goal_completion_counter=0,
         in_transition=False,
