@@ -5,10 +5,7 @@ import sys
 
 import numpy as np
 
-import jax
-import jax.numpy as jnp
 import mujoco
-from mujoco import mjx
 
 from utils.mps import update_params
 
@@ -76,6 +73,7 @@ class SafetyManager:
         self._last_health_log_time = 0.0
         self._health_log_interval = 5.0
         self._first_plan_logged = False
+        self._worker_error_logged = False
 
         self.thread_initialized = False
         self.updated_state = False
@@ -108,6 +106,9 @@ class SafetyManager:
 
     @guard_errors("initializing thread")
     def init_thread(self):
+        import jax
+        from mujoco import mjx
+
         self.setup_jax_policy(self.torch_script_policy)
 
         # set the task
@@ -154,6 +155,7 @@ class SafetyManager:
 
     @guard_errors("setting up JAX policy")
     def setup_jax_policy(self, rl_policy: TorchScriptPolicy):
+        import jax
         import torch
         import torchax
         from torchax.interop import jax_view
@@ -198,7 +200,7 @@ class SafetyManager:
 
         self._manager = self._ctx.Manager()
         self._shared_state = self._manager.dict({"payload": None, "seq": 0})
-        self._shared_result = self._manager.dict({"plan": None, "override": False, "seq": -1})
+        self._shared_result = self._manager.dict({"plan": None, "override": False, "seq": -1, "error": None})
         self._state_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
         self._process = self._ctx.Process(
@@ -221,6 +223,7 @@ class SafetyManager:
         self._plan_count = 0
         self._last_health_log_time = time.time()
         self._first_plan_logged = False
+        self._worker_error_logged = False
         self._log_info(
             f"Safety worker started (pid={self._process.pid}, rate={self.rate:.1f}Hz)"
         )
@@ -235,15 +238,22 @@ class SafetyManager:
         if self._stop_event is not None:
             self._stop_event.set()
 
-        if self._process is not None:
-            self._process.join(timeout=timeout)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=1.0)
+        # Only join if process was actually started
+        if self._process is not None and hasattr(self._process, '_popen'):
+            try:
+                self._process.join(timeout=timeout)
+                if self._process.is_alive():
+                    self._process.terminate()
+                    self._process.join(timeout=1.0)
+            except Exception as e:
+                print(f"[SafetyManager] Error joining process: {e}", flush=True)
 
         self._process = None
         if self._manager is not None:
-            self._manager.shutdown()
+            try:
+                self._manager.shutdown()
+            except Exception as e:
+                print(f"[SafetyManager] Error shutting down manager: {e}", flush=True)
         self._manager = None
         self._stop_event = None
         self._state_event = None
@@ -252,6 +262,7 @@ class SafetyManager:
         self._last_result_seq = -1
         self._plan_count = 0
         self._first_plan_logged = False
+        self._worker_error_logged = False
         self.thread_initialized = False
         self._log_info("Safety worker stopped")
 
@@ -315,12 +326,34 @@ class SafetyManager:
         Returns:
             True if running, False otherwise.
         """
-        return self._process is not None and self._process.is_alive() and self.thread_initialized
+        if self._process is None or not self.thread_initialized:
+            return False
+
+        alive = self._process.is_alive()
+        if not alive and not self._worker_error_logged:
+            self._poll_results()
+            worker_error = None
+            if self._shared_result is not None:
+                worker_error = self._shared_result.get("error")
+            if worker_error:
+                self._log_error(f"Safety worker crashed:\n{worker_error}")
+            else:
+                self._log_error(
+                    f"Safety worker exited unexpectedly with exitcode={self._process.exitcode}"
+                )
+            self._worker_error_logged = True
+
+        return alive
 
     @guard_errors("polling safety result", stop_on_error=False)
     def _poll_results(self):
         if self._shared_result is None:
             return
+
+        worker_error = self._shared_result.get("error")
+        if worker_error and not self._worker_error_logged:
+            self._log_error(f"Safety worker reported error:\n{worker_error}")
+            self._worker_error_logged = True
 
         result_seq = int(self._shared_result.get("seq", -1))
         if result_seq <= self._last_result_seq:
@@ -371,6 +404,7 @@ class SafetyManager:
 
 
 def _setup_jax_policy(rl_policy: TorchScriptPolicy, rl_config: Dict[str, Any]):
+    import jax
     import torch
     import torchax
     from torchax.interop import jax_view
@@ -401,6 +435,9 @@ def _setup_jax_policy(rl_policy: TorchScriptPolicy, rl_config: Dict[str, Any]):
 
 
 def _init_worker_objects(mj_model, rl_policy, rl_config):
+    import jax
+    from mujoco import mjx
+
     rl_policy_jax = _setup_jax_policy(rl_policy, rl_config)
 
     task_name = rl_config.get("mps_task_name", "QuadRLTask")
@@ -444,6 +481,8 @@ def _safety_worker_main(
     state_event: Any,
     stop_event: Any,
 ):
+    import jax.numpy as jnp
+
     task, task_params, policy_params, jit_optimize = _init_worker_objects(mj_model, rl_policy, rl_config)
 
     period = 1.0 / max(rate, 1e-3)

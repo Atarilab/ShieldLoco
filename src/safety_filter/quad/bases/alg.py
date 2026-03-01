@@ -300,7 +300,7 @@ class QuadSamplingBasedPlanner(ABC):
             # Compute summed cost per trajectory and select top fraction (lowest cost)
             R = rollouts.costs.shape[0]
             N = rollouts.costs.shape[1]
-            B = int((R * N) * self.top_fraction)
+            B = max(1, int((R * N) * self.top_fraction))
 
             per_traj_costs = jnp.sum(
                 rollouts.costs + self.safety_weight * rollouts.constraint_flags,
@@ -423,7 +423,7 @@ class QuadSamplingBasedPlanner(ABC):
         R = self.num_randomizations
 
         H = self.plan_steps
-        B = int(R * N * self.top_fraction)
+        B = max(1, int((R * N) * self.top_fraction))
 
         def make_leaf(x):
             return jnp.zeros((B, H) + x.shape, dtype=x.dtype)
@@ -435,9 +435,12 @@ class QuadSamplingBasedPlanner(ABC):
             xquat=jnp.zeros(self.task.data.xquat.shape),  # type: ignore
         )
         dummy_states = jax.tree_util.tree_map(make_leaf, state)
-        dummy_plans = jnp.zeros((B, H-1, self.task.plan_dim), dtype=jnp.float32)
-        dummy_costs = jnp.zeros((B, H), dtype=jnp.float32)
-        dummy_constraint_flags = jnp.zeros((B, H), dtype=jnp.float32)
+        # Match rollout outputs exactly:
+        # - plans: (B, H, plan_dim)
+        # - costs/constraint_flags: (B, H + 1) including terminal value
+        dummy_plans = jnp.zeros((B, H, self.task.plan_dim), dtype=jnp.float32)
+        dummy_costs = jnp.zeros((B, H + 1), dtype=jnp.float32)
+        dummy_constraint_flags = jnp.zeros((B, H + 1), dtype=jnp.float32)
 
         return QuadAlgTrainData(
             states=dummy_states,

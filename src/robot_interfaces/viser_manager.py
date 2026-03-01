@@ -182,12 +182,34 @@ class ViserManager:
 
     def _on_opt_contact_locations(self, msg):
         positions = {}
+        foot_order = ["FL", "FR", "RL", "RR"]
+        foot_to_markers = {name: [] for name in foot_order}
+
         for marker in msg.markers:
-            positions[int(marker.id)] = (
+            ns = str(marker.ns)
+            foot_name = None
+            prefix = "opt_foot_trajectory_"
+            if ns.startswith(prefix):
+                suffix = ns[len(prefix):]
+                if suffix in foot_to_markers:
+                    foot_name = suffix
+
+            if foot_name is None:
+                continue
+
+            pos = (
                 float(marker.pose.position.x),
                 float(marker.pose.position.y),
                 float(marker.pose.position.z),
             )
+            foot_to_markers[foot_name].append((int(marker.id), pos))
+
+        max_horizon = self.state.opt_contact_horizon_length
+        for foot_idx, foot_name in enumerate(foot_order):
+            marker_list = sorted(foot_to_markers[foot_name], key=lambda x: x[0])
+            for step, (_, pos) in enumerate(marker_list[:max_horizon]):
+                handle_id = foot_idx * max_horizon + step
+                positions[handle_id] = pos
 
         with self.locker:
             self.state.opt_contact_positions = positions
@@ -316,16 +338,6 @@ class ViserManager:
                         opt_positions = dict(self.state.opt_contact_positions)
                         has_recent_update = (time.time() - self.state.opt_contact_last_update) < 1.0
 
-                    # Detect horizon from marker IDs: find max ID and compute horizon
-                    max_horizon = 10  # default
-                    if opt_positions:
-                        max_marker_id = max(opt_positions.keys())
-                        # Assume 4 feet, so horizon = max_id / 4 (rounded up)
-                        detected_horizon = (max_marker_id // 4) + 1
-                        if detected_horizon > 1:
-                            max_horizon = min(detected_horizon, self.state.opt_contact_horizon_length)
-
-                    # Controller sends: marker.id = foot_idx * horizon + step
                     if has_recent_update:
                         for marker_id, pos in opt_positions.items():
                             handle = self.state.opt_contact_handles.get(marker_id)
