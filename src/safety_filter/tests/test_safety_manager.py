@@ -161,8 +161,8 @@ def main():
     # Cannot access directly - verify via public API instead
     
     # Wait for first plan (first optimize pass can take longer due JIT/warmup)
-    print("Waiting for first plan (up to 90s)...")
-    deadline = time.time() + 90.0
+    print("Waiting for first plan (up to 900s)...")
+    deadline = time.time() + 900.0
     plan = None
     while time.time() < deadline and safety_manager.is_running():
         plan = safety_manager.get_latest_plan()
@@ -180,19 +180,19 @@ def main():
     print(f"✓ Plan shape: {plan.shape}")
     assert plan.shape == (4, horizon_length, 3), f"Expected {(4, horizon_length, 3)}, got {plan.shape}"
     
-    # Get COM trajectory from train_data
-    print("\n--- Checking COM Trajectory ---")
+    # Get base trajectory + rollout diagnostics from train_data
+    print("\n--- Checking Rollout Trajectory ---")
     train_data = safety_manager.get_train_data()
     if train_data is not None and train_data.get("com") is not None:
         com = train_data["com"]
-        print(f"COM trajectory shape: {com.shape}")
-        print(f"COM at t=0: {com[0, 0]}")
-        print(f"COM at t=mid: {com[0, com.shape[1]//2]}")
-        print(f"COM at t=end: {com[0, -1]}")
+        print(f"Base trajectory shape: {com.shape}")
+        print(f"Base at t=0: {com[0, 0]}")
+        print(f"Base at t=mid: {com[0, com.shape[1]//2]}")
+        print(f"Base at t=end: {com[0, -1]}")
         
         # Check movement in each direction
         movement = com[0, -1] - com[0, 0]
-        print(f"COM movement: X={movement[0]:.4f}, Y={movement[1]:.4f}, Z={movement[2]:.4f}")
+        print(f"Base movement: X={movement[0]:.4f}, Y={movement[1]:.4f}, Z={movement[2]:.4f}")
     else:
         print("WARNING: No train_data or COM available!")
     

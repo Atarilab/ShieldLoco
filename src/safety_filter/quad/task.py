@@ -22,11 +22,11 @@ def get_torch_policy():
             super().__init__()
             self.actor = nn.Sequential(
                 nn.Linear(obs_dim, 512),
-                nn.ReLU(),
+                nn.ELU(),
                 nn.Linear(512, 256),
-                nn.ReLU(),
+                nn.ELU(),
                 nn.Linear(256, 128),
-                nn.ReLU(),
+                nn.ELU(),
                 nn.Linear(128, action_dim),
             )
 

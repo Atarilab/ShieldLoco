@@ -480,6 +480,8 @@ class RLQuadrupedMPSController(RLControllerBase):
                         com_traj = train_data["com"]  # shape: (num_traj, horizon+1, 3)
                                                 
                         self.pub_com_trajectory(com_traj)
+                    if train_data is not None and "qpos" in train_data:
+                        self.pub_qpos_trajectory(train_data["qpos"])
 
             if self.visualize["current_contact_locations"]:
                 self.pub_current_contact_locations()
@@ -1056,6 +1058,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         if self.visualize["opt_contact_locations"]:
             self.opt_contact_locations_pub = self.create_publisher(MarkerArray, "opt_contact_locations", 10)
             self.com_trajectory_pub = self.create_publisher(MarkerArray, "com_trajectory", 10)
+            self.qpos_trajectory_pub = self.create_publisher(Float32MultiArray, "qpos_trajectory", 10)
         if self.visualize["feet_error"]:
             self.feet_error_pub = self.create_publisher(MarkerArray, "feet_error", 10)
             self.feet_error_norm_pub = self.create_publisher(Float32MultiArray, "feet_error_norm", 10)
@@ -1283,6 +1286,37 @@ class RLQuadrupedMPSController(RLControllerBase):
         except Exception as e:
             if self.logger is not None:
                 self.logger.error(f"Failed to publish COM trajectory: {e}")
+
+    def pub_qpos_trajectory(self, qpos_traj):
+        """
+        Publishes predicted qpos trajectory from train_data.
+
+        qpos_traj can be:
+        - (num_traj, horizon+1, nq): first trajectory is used
+        - (horizon+1, nq)
+        """
+        try:
+            qpos_arr = np.asarray(qpos_traj, dtype=np.float32)
+            if qpos_arr.ndim == 3:
+                qpos_arr = qpos_arr[0]
+
+            if qpos_arr.ndim != 2:
+                return
+
+            msg = Float32MultiArray()
+            msg.layout.dim = [MultiArrayDimension(), MultiArrayDimension()]
+            msg.layout.dim[0].label = "step"
+            msg.layout.dim[0].size = int(qpos_arr.shape[0])
+            msg.layout.dim[0].stride = int(qpos_arr.size)
+            msg.layout.dim[1].label = "qpos"
+            msg.layout.dim[1].size = int(qpos_arr.shape[1])
+            msg.layout.dim[1].stride = int(qpos_arr.shape[1])
+            msg.data = qpos_arr.reshape(-1).tolist()
+
+            self.qpos_trajectory_pub.publish(msg)
+        except Exception as e:
+            if self.logger is not None:
+                self.logger.error(f"Failed to publish qpos trajectory: {e}")
 
     def pub_current_contact_locations(self):
         """
