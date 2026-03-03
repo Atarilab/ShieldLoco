@@ -495,94 +495,98 @@ def _safety_worker_main(
     state_event: Any,
     stop_event: Any,
 ):
-    import jax.numpy as jnp
-    from mujoco import mjx
-    import jax
+    try:
+        import jax.numpy as jnp
+        from mujoco import mjx
+        import jax
 
-    task, task_params, policy_params, jit_optimize = _init_worker_objects(mj_model, rl_policy, rl_config)
-    jit_mjx_forward = jax.jit(mjx.forward)
+        task, task_params, policy_params, jit_optimize = _init_worker_objects(mj_model, rl_policy, rl_config)
+        jit_mjx_forward = jax.jit(mjx.forward)
 
-    period = 1.0 / max(rate, 1e-3)
-    last_processed_seq = -1
-    while not stop_event.is_set():
-        loop_start = time.perf_counter()
-        state_event.wait(timeout=period)
-        state_event.clear()
+        period = 1.0 / max(rate, 1e-3)
+        last_processed_seq = -1
+        while not stop_event.is_set():
+            loop_start = time.perf_counter()
+            state_event.wait(timeout=period)
+            state_event.clear()
 
-        latest_seq = int(shared_state.get("seq", -1))
-        if latest_seq <= last_processed_seq:
-            continue
+            latest_seq = int(shared_state.get("seq", -1))
+            if latest_seq <= last_processed_seq:
+                continue
 
-        latest_state = shared_state.get("payload")
-        if latest_state is None:
-            continue
+            latest_state = shared_state.get("payload")
+            if latest_state is None:
+                continue
 
-        last_processed_seq = latest_seq
-        task.data = update_params(
-            task.data,
-            qpos=jnp.asarray(latest_state.get("qpos")),
-            qvel=jnp.asarray(latest_state.get("qvel")),
-            time=jnp.asarray(latest_state.get("time")),
-        )
-        # Refresh derived kinematics/contact fields after injecting raw state.
-        task.data = jit_mjx_forward(task.model, task.data)
-        
-        task_params = task.update_params(task_params, latest_state)
-        ref_plan_normalized = task.get_reference_plan(
-            ref=latest_state.get("ref"),
-            goal_idx=latest_state.get("goal_idx", 0),
-        )
-        policy_params = update_params(
-            policy_params,
-            task_params=task_params,
-            ref=ref_plan_normalized,
-        )
+            last_processed_seq = latest_seq
+            task.data = update_params(
+                task.data,
+                qpos=jnp.asarray(latest_state.get("qpos")),
+                qvel=jnp.asarray(latest_state.get("qvel")),
+                time=jnp.asarray(latest_state.get("time")),
+            )
+            # Refresh derived kinematics/contact fields after injecting raw state.
+            task.data = jit_mjx_forward(task.model, task.data)
+            
+            task_params = task.update_params(task_params, latest_state)
+            ref_plan_normalized = task.get_reference_plan(
+                ref=latest_state.get("ref"),
+                goal_idx=latest_state.get("goal_idx", 0),
+            )
+            policy_params = update_params(
+                policy_params,
+                task_params=task_params,
+                ref=ref_plan_normalized,
+            )
 
-        override = True
-        policy_params = jit_optimize(task.data, policy_params, override)
-        exec_plan = np.asarray(policy_params.best_plan)
+            override = True
+            policy_params = jit_optimize(task.data, policy_params, override)
+            exec_plan = np.asarray(policy_params.best_plan)
 
-        # Share train_data COM trajectory if available
-        if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:
-            qpos_traj = np.array(policy_params.train_data.states.qpos)
-            costs_traj = np.array(policy_params.train_data.costs)
-            constraint_traj = np.array(policy_params.train_data.constraint_flags)
+            # Share train_data COM trajectory if available
+            if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:
+                qpos_traj = np.array(policy_params.train_data.states.qpos)
+                costs_traj = np.array(policy_params.train_data.costs)
+                constraint_traj = np.array(policy_params.train_data.constraint_flags)
 
-            if qpos_traj.ndim == 3 and qpos_traj.shape[0] > 0:
-                best_qpos = qpos_traj[0]
-                best_costs = costs_traj[0] if costs_traj.ndim >= 2 else costs_traj
-                best_constraints = (
-                    constraint_traj[0] if constraint_traj.ndim >= 2 else constraint_traj
-                )
-            elif qpos_traj.ndim == 2:
-                best_qpos = qpos_traj
-                best_costs = costs_traj if costs_traj.ndim == 1 else None
-                best_constraints = (
-                    constraint_traj if constraint_traj.ndim == 1 else None
-                )
-            else:
-                best_qpos = None
-                best_costs = None
-                best_constraints = None
+                if qpos_traj.ndim == 3 and qpos_traj.shape[0] > 0:
+                    best_qpos = qpos_traj[0]
+                    best_costs = costs_traj[0] if costs_traj.ndim >= 2 else costs_traj
+                    best_constraints = (
+                        constraint_traj[0] if constraint_traj.ndim >= 2 else constraint_traj
+                    )
+                elif qpos_traj.ndim == 2:
+                    best_qpos = qpos_traj
+                    best_costs = costs_traj if costs_traj.ndim == 1 else None
+                    best_constraints = (
+                        constraint_traj if constraint_traj.ndim == 1 else None
+                    )
+                else:
+                    best_qpos = None
+                    best_costs = None
+                    best_constraints = None
 
-            if best_qpos is not None:
-                com_traj = best_qpos[:, :3][None, ...]
-                shared_result["train_data"] = {
-                    "com": com_traj,
-                    "qpos": best_qpos,
-                    "costs": best_costs,
-                    "constraint_flags": best_constraints,
-                }
+                if best_qpos is not None:
+                    com_traj = best_qpos[:, :3][None, ...]
+                    shared_result["train_data"] = {
+                        "com": com_traj,
+                        "qpos": best_qpos,
+                        "costs": best_costs,
+                        "constraint_flags": best_constraints,
+                    }
+                else:
+                    shared_result["train_data"] = None
             else:
                 shared_result["train_data"] = None
-        else:
-            shared_result["train_data"] = None
 
-        shared_result["plan"] = exec_plan
-        shared_result["override"] = override
-        shared_result["seq"] = latest_seq
+            shared_result["plan"] = exec_plan
+            shared_result["override"] = override
+            shared_result["seq"] = latest_seq
+    except Exception as e:
+        tb = traceback.format_exc()
+        shared_result["error"] = f"{e}\n{tb}"
 
-        elapsed = time.perf_counter() - loop_start
-        sleep_time = max(0.0, period - elapsed)
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+    elapsed = time.perf_counter() - loop_start
+    sleep_time = max(0.0, period - elapsed)
+    if sleep_time > 0:
+        time.sleep(sleep_time)
