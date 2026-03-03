@@ -445,7 +445,7 @@ def _setup_jax_policy(rl_policy: TorchScriptPolicy, rl_config: Dict[str, Any]):
         return torch.func.functional_call(t_policy, weights, args=(obs,))
 
     jax_weights = jax_view(torch_weights)
-    return functools.partial(jax.jit(jax_view(run_rl_policy)), jax_weights)
+    return functools.partial(jax_view(run_rl_policy), jax_weights)
 
 
 def _init_worker_objects(mj_model, rl_policy, rl_config):
@@ -497,8 +497,10 @@ def _safety_worker_main(
 ):
     import jax.numpy as jnp
     from mujoco import mjx
+    import jax
 
     task, task_params, policy_params, jit_optimize = _init_worker_objects(mj_model, rl_policy, rl_config)
+    jit_mjx_forward = jax.jit(mjx.forward)
 
     period = 1.0 / max(rate, 1e-3)
     last_processed_seq = -1
@@ -523,7 +525,7 @@ def _safety_worker_main(
             time=jnp.asarray(latest_state.get("time")),
         )
         # Refresh derived kinematics/contact fields after injecting raw state.
-        task.data = mjx.forward(task.model, task.data)
+        task.data = jit_mjx_forward(task.model, task.data)
         
         task_params = task.update_params(task_params, latest_state)
         ref_plan_normalized = task.get_reference_plan(

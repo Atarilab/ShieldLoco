@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 import numpy as np
 
+import mujoco
+
 
 class RLQuadrupedMPSController(RLControllerBase):
     """
@@ -228,8 +230,11 @@ class RLQuadrupedMPSController(RLControllerBase):
         #     logger=self.logger  # Will be updated when logger is available
         # )
 
+        xml_path_rel_to_pkg = "robots/go2/scene_mjx.xml"
+        abs_xml_path = '/home/atari/workspace/DOOM/src/' + xml_path_rel_to_pkg
+        mj_model = mujoco.MjModel.from_xml_path(abs_xml_path)
         self.safety_manager = SafetyManager(
-            mj_model=self.robot.mj_model.model,
+            mj_model=mj_model,
             rl_policy=self.policy,
             rl_config=configs["controller_config"],
             rate=20,

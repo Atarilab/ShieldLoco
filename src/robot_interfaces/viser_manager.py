@@ -59,6 +59,7 @@ class ViserState:
     com_trajectory_last_update: float = 0.0
     com_trajectory_subscriber: Any = None
     qpos_trajectory_subscriber: Any = None
+    qpos_ghost_body_ids: list[int] = field(default_factory=list)
     qpos_ghost_body_handles: dict[tuple[int, int], Any] = field(default_factory=dict)
     qpos_ghost_body_poses: dict[tuple[int, int], tuple[tuple[float, float, float], tuple[float, float, float, float]]] = field(default_factory=dict)
     qpos_ghost_steps: int = 0
@@ -332,6 +333,26 @@ class ViserManager:
 
         return True
 
+    def _should_visualize_qpos_ghost_geom(self, geom_id):
+        if not self._should_visualize_collision_geom(geom_id):
+            return False
+
+        geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
+        # Exclude world geoms from ghost overlay to avoid duplicate static scene visuals.
+        if geom_body_id <= 0:
+            return False
+
+        geom_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+        geom_name = (geom_name or "").lower()
+        if geom_name == "floor":
+            return False
+
+        excluded_prefixes = ("obstacle_", "destination_", "finish_")
+        if any(geom_name.startswith(prefix) for prefix in excluded_prefixes):
+            return False
+
+        return True
+
     def _initialize_web_collision_geometries(self):
         if self.state.server is None:
             return
@@ -427,21 +448,21 @@ class ViserManager:
         if self.state.server is None:
             return
 
-        if not self.state.collision_body_ids:
-            added_body_ids = set()
-            for geom_id in range(self.mj_model.ngeom):
-                if not self._should_visualize_collision_geom(geom_id):
-                    continue
-                geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
-                if geom_body_id < 0 or geom_body_id in added_body_ids:
-                    continue
-                self.state.collision_body_ids.append(geom_body_id)
-                added_body_ids.add(geom_body_id)
+        added_body_ids = set()
+        self.state.qpos_ghost_body_ids = []
+        for geom_id in range(self.mj_model.ngeom):
+            if not self._should_visualize_qpos_ghost_geom(geom_id):
+                continue
+            geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
+            if geom_body_id < 0 or geom_body_id in added_body_ids:
+                continue
+            self.state.qpos_ghost_body_ids.append(geom_body_id)
+            added_body_ids.add(geom_body_id)
 
         self.state.ghost_mj_data = mujoco.MjData(self.mj_model)
 
         for step in range(self.cfg.qpos_ghost_max_steps):
-            for body_id in self.state.collision_body_ids:
+            for body_id in self.state.qpos_ghost_body_ids:
                 body_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
                 if body_name is None:
                     body_name = f"body_{body_id}"
@@ -455,7 +476,7 @@ class ViserManager:
                 self.state.qpos_ghost_body_handles[(step, body_id)] = body_handle
 
             for geom_id in range(self.mj_model.ngeom):
-                if not self._should_visualize_collision_geom(geom_id):
+                if not self._should_visualize_qpos_ghost_geom(geom_id):
                     continue
 
                 geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
@@ -485,7 +506,7 @@ class ViserManager:
 
         body_poses = {}
         max_nq = int(self.mj_model.nq)
-        tracked_ids = list(self.state.collision_body_ids)
+        tracked_ids = list(self.state.qpos_ghost_body_ids)
 
         for step_idx, qpos in enumerate(qpos_steps):
             step_qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)

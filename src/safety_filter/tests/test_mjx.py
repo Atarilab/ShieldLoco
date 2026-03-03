@@ -1,8 +1,10 @@
+import argparse
 import time
 import mujoco
+import mujoco.viewer
 from mujoco import mjx
 import jax
-
+import numpy as np
 import os
 os.environ["XLA_FLAGS"] = (
     "--xla_gpu_triton_gemm_any=true "
@@ -10,7 +12,6 @@ os.environ["XLA_FLAGS"] = (
     "--xla_gpu_deterministic_ops=true "
     "--xla_gpu_autotune_level=0"
 )
-# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
@@ -82,15 +83,15 @@ data = mjx.make_data(
         njmax=1000,
 )
 
-jit_forward = jax.jit(mjx.forward)
+# jit_step = jax.jit(mjx.step)
 
-# test forward pass
-for _ in range(10):
-    start = time.time()
+# # test forward pass
+# for _ in range(10):
+#     start = time.time()
 
-    jit_forward(model, data)
+#     data = jit_step(model, data)
 
-    print(f"Forward pass took {1000 * (time.time() - start):.2f} ms")
+#     print(f"Step took {1000 * (time.time() - start):.2f} ms")
 
 
 import numpy as np
@@ -120,3 +121,42 @@ for gid in range(ngeom):
 
 print("Hazard geoms:", np.where(geom_is_hazard_np)[0])
 print("Robot geoms:", np.where(geom_is_robot_np)[0])
+
+
+def run_viewer_rollout(mj_model, mj_data, model, data, num_steps=500):
+    """Run dynamics rollout and visualize in MuJoCo viewer."""
+    viewer = mujoco.viewer.launch_passive(mj_model, mj_data)
+    
+    jit_step = jax.jit(mjx.step)
+    
+    print(f"Running {num_steps} steps with zero torques...")
+    for step in range(num_steps):
+        data = jit_step(model, data)
+                
+        mj_data.qpos[:] = np.asarray(data.qpos)
+        mj_data.qvel[:] = np.asarray(data.qvel)
+        
+        mujoco.mj_forward(mj_model, mj_data)
+        
+        viewer.sync()
+        
+        if step % 50 == 0:
+            print(f"Step {step}/{num_steps}")
+        
+        if not viewer.is_running():
+            print("Viewer closed, exiting...")
+            break
+    
+    viewer.close()
+    print("Rollout complete!")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--viewer", action="store_true", help="Enable MuJoCo viewer visualization")
+    args = parser.parse_args()
+    
+    if args.viewer:
+        run_viewer_rollout(mj_model, mj_data, model, data)
+    else:
+        print("Use --viewer flag to visualize dynamics rollout")

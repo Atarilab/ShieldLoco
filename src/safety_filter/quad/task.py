@@ -152,6 +152,13 @@ class QuadRLTask(Task):
         self.default_joint_pos = jnp.asarray(rl_config["default_joint_pos"], dtype=jnp.float32)
 
         self.num_joints = len(self.default_joint_pos)
+        actuator_joint_ids = np.asarray(mj_model.actuator_trnid[:, 0], dtype=np.int32)
+        self.joint_qpos_indices = np.asarray(
+            mj_model.jnt_qposadr[actuator_joint_ids[: self.num_joints]], dtype=np.int32
+        )
+        self.joint_qvel_indices = np.asarray(
+            mj_model.jnt_dofadr[actuator_joint_ids[: self.num_joints]], dtype=np.int32
+        )
 
         foot_names = rl_config["foot_names"]
         self.foot_ids = np.asarray([mj_model.body(foot).id for foot in foot_names], dtype=np.int32)
@@ -344,10 +351,9 @@ class QuadRLTask(Task):
         base_pos = state.qpos[:3]
         base_quat = state.qpos[3:7]
 
-        # Assuming the first 7 are base pos and quat
-        joint_pos = state.qpos[-self.num_joints :]
-        # Assuming the first 6 are base lin and ang vel
-        joint_vel = state.qvel[-self.num_joints :]
+        # Use actuator-ordered joint states (matches Unitree low-level command/sensor order).
+        joint_pos = state.qpos[self.joint_qpos_indices]
+        joint_vel = state.qvel[self.joint_qvel_indices]
 
         current_feet_pos_w = state.xpos[self.foot_ids]
 
@@ -475,18 +481,16 @@ class QuadRLTask(Task):
 
 
         plan_segment_denorm = self.denormalize(plan_segment)
-        tp, u = self.rl_forward(tp, state, plan_segment_denorm)
+        tp, q_des = self.rl_forward(tp, state, plan_segment_denorm)
 
         # PD Loop
         for _ in range(self.decimation):
             # Here we would apply the joint PD targets to the MuJoCo simulation and step forward
 
-            # Assuming first 7 are base pos and quat
-            q = state.qpos[7 : self.num_joints + 7]
-            # Assuming first 6 are base lin and ang vel
-            dq = state.qvel[6 : self.num_joints + 6]
+            # Use actuator-ordered joint states to match master low-level PD path.
+            q = state.qpos[self.joint_qpos_indices]
+            dq = state.qvel[self.joint_qvel_indices]
 
-            q_des = u
             dq_des = jnp.zeros_like(dq)
 
             torq = self.kp * (q_des - q) + self.kd * (dq_des - dq)  # PD control law
