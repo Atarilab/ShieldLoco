@@ -550,10 +550,17 @@ def _safety_worker_main(
                 constraint_traj = np.array(policy_params.train_data.constraint_flags)
 
                 if qpos_traj.ndim == 3 and qpos_traj.shape[0] > 0:
-                    best_qpos = qpos_traj[0]
-                    best_costs = costs_traj[0] if costs_traj.ndim >= 2 else costs_traj
+                    if costs_traj.ndim >= 2 and constraint_traj.ndim >= 2:
+                        combined = costs_traj + float(rl_config.get("mps_safety_weight", 1e3)) * constraint_traj
+                        per_traj_obj = np.sum(combined, axis=1)
+                        best_idx = int(np.argmin(per_traj_obj))
+                    else:
+                        best_idx = 0
+
+                    best_qpos = qpos_traj[best_idx]
+                    best_costs = costs_traj[best_idx] if costs_traj.ndim >= 2 else costs_traj
                     best_constraints = (
-                        constraint_traj[0] if constraint_traj.ndim >= 2 else constraint_traj
+                        constraint_traj[best_idx] if constraint_traj.ndim >= 2 else constraint_traj
                     )
                 elif qpos_traj.ndim == 2:
                     best_qpos = qpos_traj

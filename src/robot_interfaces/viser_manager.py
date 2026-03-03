@@ -309,8 +309,27 @@ class ViserManager:
                 return
 
             qpos_steps = raw[: num_steps * qpos_dim].reshape(num_steps, qpos_dim)
-            qpos_steps = qpos_steps[:: self.cfg.qpos_ghost_stride]
-            qpos_steps = qpos_steps[: self.cfg.qpos_ghost_max_steps]
+
+            # Build sparse samples across the full horizon and always include the final state.
+            stride = max(1, int(self.cfg.qpos_ghost_stride))
+            max_steps = max(1, int(self.cfg.qpos_ghost_max_steps))
+
+            candidate_indices = np.arange(0, num_steps, stride, dtype=np.int32)
+            if candidate_indices.size == 0 or candidate_indices[-1] != (num_steps - 1):
+                candidate_indices = np.append(candidate_indices, num_steps - 1)
+
+            if candidate_indices.size > max_steps:
+                select_positions = np.linspace(0, candidate_indices.size - 1, num=max_steps)
+                select_positions = np.rint(select_positions).astype(np.int32)
+                selected_indices = candidate_indices[select_positions]
+                selected_indices[-1] = num_steps - 1
+                selected_indices = np.unique(selected_indices)
+                if selected_indices[-1] != (num_steps - 1):
+                    selected_indices = np.append(selected_indices, num_steps - 1)
+            else:
+                selected_indices = candidate_indices
+
+            qpos_steps = qpos_steps[selected_indices]
 
             ghost_poses = self._compute_qpos_ghost_body_poses(qpos_steps)
             with self.locker:
