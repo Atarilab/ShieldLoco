@@ -46,11 +46,10 @@ ISAAC_LAB_DEFAULT_JOINT_POS: &ISAAC_LAB_DEFAULT_JOINT_POS [
 
 # MPS stuff
 mps_task_name: "QuadRLTask"
-# 0.005 / 4 = 0.00125
-timestep: 0.00125
+timestep: 0.02
 
 obs_horizon: 2 # specific to RL policy
-command_duration: 0.35  # hardcoded in DoomMPC/src/controllers/rl_mps_controller.py
+command_duration: 0.02
 
 # Use the correct mapping from the existing config
 # JOINT_OBSERVATION_UNITREE_TO_ISAAC_LAB_MAPPING: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]

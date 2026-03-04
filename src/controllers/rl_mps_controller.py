@@ -462,6 +462,8 @@ class RLQuadrupedMPSController(RLControllerBase):
                     ref=self.future_feet_positions_w.detach().cpu().numpy(),
                     qpos=self.robot.mj_model.data.qpos,
                     qvel=self.robot.mj_model.data.qvel,
+                    xpos=self.robot.mj_model.data.xpos,
+                    xquat=self.robot.mj_model.data.xquat,
                     time=current_time,
 
                     command_start_time=self.command_start_time,

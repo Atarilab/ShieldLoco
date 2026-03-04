@@ -283,6 +283,9 @@ class SafetyManager:
             "qpos": kwargs.get("qpos"),
             "qvel": kwargs.get("qvel"),
             "time": kwargs.get("time"),
+            "xpos": kwargs.get("xpos"),
+            "xquat": kwargs.get("xquat"),
+            
             "ref": kwargs.get("ref"),
             "command_start_time": kwargs.get("command_start_time"),
             "goal_idx": kwargs.get("goal_idx"),
@@ -523,10 +526,12 @@ def _safety_worker_main(
                 task.data,
                 qpos=jnp.asarray(latest_state.get("qpos")),
                 qvel=jnp.asarray(latest_state.get("qvel")),
+                xpos=jnp.asarray(latest_state.get("xpos")),
+                xquat=jnp.asarray(latest_state.get("xquat")),
                 time=jnp.asarray(latest_state.get("time")),
             )
             # Refresh derived kinematics/contact fields after injecting raw state.
-            task.data = jit_mjx_forward(task.model, task.data)
+            # task.data = jit_mjx_forward(task.model, task.data)
             
             task_params = task.update_params(task_params, latest_state)
             ref_plan_normalized = task.get_reference_plan(
@@ -545,9 +550,9 @@ def _safety_worker_main(
 
             # Share train_data COM trajectory if available
             if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:
-                qpos_traj = np.array(policy_params.train_data.states.qpos)
-                costs_traj = np.array(policy_params.train_data.costs)
-                constraint_traj = np.array(policy_params.train_data.constraint_flags)
+                qpos_traj = np.asarray(policy_params.train_data.states.qpos)
+                costs_traj = np.asarray(policy_params.train_data.costs)
+                constraint_traj = np.asarray(policy_params.train_data.constraint_flags)
 
                 if qpos_traj.ndim == 3 and qpos_traj.shape[0] > 0:
                     if costs_traj.ndim >= 2 and constraint_traj.ndim >= 2:
@@ -589,11 +594,13 @@ def _safety_worker_main(
             shared_result["plan"] = exec_plan
             shared_result["override"] = override
             shared_result["seq"] = latest_seq
+
+            elapsed = time.perf_counter() - loop_start
+            sleep_time = max(0.0, period - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
     except Exception as e:
         tb = traceback.format_exc()
         shared_result["error"] = f"{e}\n{tb}"
 
-    elapsed = time.perf_counter() - loop_start
-    sleep_time = max(0.0, period - elapsed)
-    if sleep_time > 0:
-        time.sleep(sleep_time)
