@@ -151,7 +151,9 @@ class QuadRLTask(Task):
         self.joint_obs_unitree_to_isaac_mapping = np.asarray(
             rl_config["joint_obs_unitree_to_isaac_mapping"], dtype=np.int32
         )
-        self.default_joint_pos = jnp.asarray(rl_config["default_joint_pos"], dtype=jnp.float32)
+        self.default_joint_pos = jnp.asarray(
+            rl_config["default_joint_pos"], dtype=jnp.float32
+        )
 
         self.num_joints = len(self.default_joint_pos)
         actuator_joint_ids = np.asarray(mj_model.actuator_trnid[:, 0], dtype=np.int32)
@@ -164,7 +166,9 @@ class QuadRLTask(Task):
         actuator_joint_ids = actuator_joint_ids[: self.num_joints]
 
         foot_names = rl_config["foot_names"]
-        self.foot_ids = np.asarray([mj_model.body(foot).id for foot in foot_names], dtype=np.int32)
+        self.foot_ids = np.asarray(
+            [mj_model.body(foot).id for foot in foot_names], dtype=np.int32
+        )
 
         self.plan_lim = rl_config["plan_lim"]
         self.act_rl_clip = rl_config["act_rl_clip"]
@@ -178,8 +182,12 @@ class QuadRLTask(Task):
         self.u_max = jnp.inf
 
         soft_limit_factor = float(rl_config.get("soft_dof_limit_factor", 0.95))
-        joint_lower = np.asarray(mj_model.jnt_range[actuator_joint_ids, 0], dtype=np.float32)
-        joint_upper = np.asarray(mj_model.jnt_range[actuator_joint_ids, 1], dtype=np.float32)
+        joint_lower = np.asarray(
+            mj_model.jnt_range[actuator_joint_ids, 0], dtype=np.float32
+        )
+        joint_upper = np.asarray(
+            mj_model.jnt_range[actuator_joint_ids, 1], dtype=np.float32
+        )
         joint_center = 0.5 * (joint_lower + joint_upper)
         joint_span = joint_upper - joint_lower
         soft_joint_min = joint_center - 0.5 * joint_span * soft_limit_factor
@@ -192,17 +200,26 @@ class QuadRLTask(Task):
         if cfg_jpd_max.ndim == 0:
             cfg_jpd_max = np.full(self.num_joints, float(cfg_jpd_max), dtype=np.float32)
 
-        self.j_pd_min = jnp.asarray(np.maximum(soft_joint_min, cfg_jpd_min), dtype=jnp.float32)
-        self.j_pd_max = jnp.asarray(np.minimum(soft_joint_max, cfg_jpd_max), dtype=jnp.float32)
+        self.j_pd_min = jnp.asarray(
+            np.maximum(soft_joint_min, cfg_jpd_min), dtype=jnp.float32
+        )
+        self.j_pd_max = jnp.asarray(
+            np.minimum(soft_joint_max, cfg_jpd_max), dtype=jnp.float32
+        )
 
         self.kp = rl_config["kp"]
         self.kd = rl_config["kd"]
 
-        self.decimation = int(rl_config["decimation"])
-        control_dt = float(rl_config.get("control_dt", mj_model.opt.timestep))
-        planner_dt = float(rl_config.get("timestep", mj_model.opt.timestep))
-        policy_update_dt = max(control_dt * float(self.decimation), planner_dt)
-        self.rollout_decimation = max(1, int(round(policy_update_dt / planner_dt)))
+        sim_dt = mj_model.opt.timestep
+        decimation = rl_config["decimation"]
+        # Freq at which the main controller runs (RL + PD)
+        main_controller_dt = rl_config["control_dt"]
+        # It is called every decimation steps of main_controller_dt
+        rl_policy_dt = main_controller_dt * decimation
+        # rollout_decimation is how many sim steps we should take
+        # it should be roughly equal to the command duration
+        self.rollout_decimation = max(1, int(round(self.command_duration / sim_dt)))
+        self.policy_decimation = max(1, int(round(rl_policy_dt / sim_dt)))
 
         self.gait_patterns = jnp.array(
             [
@@ -220,9 +237,7 @@ class QuadRLTask(Task):
         self.body_name_to_id = {mj_model.body(i).name: i for i in range(mj_model.nbody)}
         self.base_body_id = self.body_name_to_id.get("base_link", None)
         if self.base_body_id is None:
-            raise KeyError(
-                "No 'base_link' found in model bodies for constraint check"
-            )
+            raise KeyError("No 'base_link' found in model bodies for constraint check")
         ngeom = mj_model.ngeom
         geom_is_hazard_np = np.zeros(ngeom, dtype=bool)
         geom_is_robot_np = np.zeros(ngeom, dtype=bool)
@@ -305,7 +320,9 @@ class QuadRLTask(Task):
             goal_idx=jnp.asarray(goal_idx, dtype=jnp.int32),
             contact_plan=jnp.asarray(contact_plan, dtype=jnp.float32),
             current_gait=jnp.asarray(current_gait, dtype=jnp.int32),
-            goal_completion_counter=jnp.asarray(goal_completion_counter, dtype=jnp.int32),
+            goal_completion_counter=jnp.asarray(
+                goal_completion_counter, dtype=jnp.int32
+            ),
             in_transition=jnp.asarray(in_transition, dtype=jnp.bool_),
             # Start each planner cycle from a consistent low-level phase so the
             # first rollout step always refreshes policy action for current state.
@@ -341,11 +358,19 @@ class QuadRLTask(Task):
             phase_idx = jnp.mod(new_counter, 2)
             next_phase_idx = jnp.mod(new_counter + 1, 2)
 
-            gait_pattern = jax.lax.dynamic_index_in_dim(self.gait_patterns, gait, axis=0, keepdims=False)
-            current_phase = jax.lax.dynamic_index_in_dim(gait_pattern, phase_idx, axis=0, keepdims=False)
-            next_phase = jax.lax.dynamic_index_in_dim(gait_pattern, next_phase_idx, axis=0, keepdims=False)
+            gait_pattern = jax.lax.dynamic_index_in_dim(
+                self.gait_patterns, gait, axis=0, keepdims=False
+            )
+            current_phase = jax.lax.dynamic_index_in_dim(
+                gait_pattern, phase_idx, axis=0, keepdims=False
+            )
+            next_phase = jax.lax.dynamic_index_in_dim(
+                gait_pattern, next_phase_idx, axis=0, keepdims=False
+            )
 
-            new_contact_plan = jnp.concatenate([current_phase, next_phase]).astype(jnp.float32)
+            new_contact_plan = jnp.concatenate([current_phase, next_phase]).astype(
+                jnp.float32
+            )
 
             return params.replace(  # type: ignore
                 goal_completion_counter=new_counter,
@@ -441,7 +466,9 @@ class QuadRLTask(Task):
     def compute_low_level_cmd(self, action_rl: jax.Array) -> jax.Array:
         action_rl = jnp.clip(action_rl, -self.act_rl_clip, self.act_rl_clip)
 
-        joint_pos_targets = (action_rl * self.act_rl_scale + self.act_rl_offset)[self.act_rl_mapping]
+        joint_pos_targets = (action_rl * self.act_rl_scale + self.act_rl_offset)[
+            self.act_rl_mapping
+        ]
 
         joint_pos_targets = jnp.clip(joint_pos_targets, self.j_pd_min, self.j_pd_max)
 
@@ -485,49 +512,58 @@ class QuadRLTask(Task):
         if plan_segment_ref is None:
             plan_segment_ref = jnp.zeros_like(plan_segment)
 
-        tp = task_params
-
-        # Match controller semantics: update phase/goal only on command resample events.
-        elapsed = state.time - tp.command_start_time
-        should_resample = elapsed > self.command_duration
-        new_start_time = jnp.where(should_resample, state.time, tp.command_start_time)
-        tp = tp.replace(command_start_time=new_start_time)  # type: ignore
-        tp = jax.lax.cond(
-            should_resample,
-            lambda p: self.update_goal(p),
-            lambda p: p,
-            tp,
-        )
-
-
         plan_segment_denorm = self.denormalize(plan_segment)
-        should_update_policy = jnp.equal(jnp.mod(tp.lowlevel_step_counter, self.rollout_decimation), 0)
 
-        def _update_policy(_):
-            tp_new, q_des_new = self.rl_forward(tp, state, plan_segment_denorm)
+        def _update_policy(tp, s):
+            tp_new, q_des_new = self.rl_forward(tp, s, plan_segment_denorm)
             tp_new = tp_new.replace(last_q_des=q_des_new)  # type: ignore
             return tp_new, q_des_new
 
-        def _hold_policy(_):
+        def _hold_policy(tp, s):
             return tp, tp.last_q_des
 
-        tp, q_des = jax.lax.cond(should_update_policy, _update_policy, _hold_policy, operand=None)
+        for _ in range(self.rollout_decimation):
+            # Match controller semantics: update phase/goal only on command resample events.
+            elapsed = state.time - task_params.command_start_time
+            should_resample = elapsed > self.command_duration
+            new_start_time = jnp.where(
+                should_resample, state.time, task_params.command_start_time
+            )
+            task_params = task_params.replace(command_start_time=new_start_time)  # type: ignore
+            task_params = jax.lax.cond(
+                should_resample,
+                lambda p: self.update_goal(p),
+                lambda p: p,
+                task_params,
+            )
 
-        # Use actuator-ordered joint states to match master low-level PD path.
-        q = state.qpos[self.joint_qpos_indices]
-        dq = state.qvel[self.joint_qvel_indices]
+            should_update_policy = jnp.equal(
+                jnp.mod(task_params.lowlevel_step_counter, self.policy_decimation), 0
+            )
 
-        dq_des = jnp.zeros_like(dq)
+            task_params, q_des = jax.lax.cond(
+                should_update_policy,
+                lambda _: _update_policy(task_params, state),
+                lambda _: _hold_policy(task_params, state),
+                operand=None,
+            )
 
-        torq = self.kp * (q_des - q) + self.kd * (dq_des - dq)  # PD control law
-        # Clip the torques to prevent excessive forces
-        torq = jnp.clip(torq, self.j_min, self.j_max)
+            # Use actuator-ordered joint states to match master low-level PD path.
+            q = state.qpos[self.joint_qpos_indices]
+            dq = state.qvel[self.joint_qvel_indices]
 
-        state = state.replace(ctrl=torq)
-        state = mjx.step(model, state)
-        tp = tp.replace(lowlevel_step_counter=tp.lowlevel_step_counter + 1)  # type: ignore
+            dq_des = jnp.zeros_like(dq)
 
-        return tp, state
+            torq = self.kp * (q_des - q) + self.kd * (dq_des - dq)  # PD control law
+            # Clip the torques to prevent excessive forces
+            torq = jnp.clip(torq, self.j_min, self.j_max)
+
+            # Step physics
+            state = state.replace(ctrl=torq)
+            state = mjx.step(model, state)
+            task_params = task_params.replace(lowlevel_step_counter=task_params.lowlevel_step_counter + 1)  # type: ignore
+
+        return task_params, state
 
     @partial(jax.jit, static_argnames=["self"])
     def constraint_check(self, state: mjx.Data) -> jax.Array:

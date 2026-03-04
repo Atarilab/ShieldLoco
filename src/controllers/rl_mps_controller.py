@@ -42,7 +42,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         ]
 
         # Contact command parameters
-        self.command_duration = 0.35  # Duration of each contact plan in seconds
+        self.command_duration = configs["controller_config"]["command_duration"]  # Duration of each contact plan in seconds
         self.pending_command_duration = self.command_duration  # Initialize pending command duration
         self.command_duration_change_pending = False  # Flag to indicate pending command duration change
         self.current_contact_plan = torch.ones((2, 4), dtype=torch.bool, device=self.device)  # Current contact pattern

@@ -93,7 +93,7 @@ class QuadSamplingBasedPlanner(ABC):
         num_randomizations: int,
         risk_strategy: RiskStrategy,
         seed: int,
-        plan_horizon: float,
+        plan_horizon: int,
         iterations: int = 1,
         gamma: float = 0.99,
         safety_weight: float = 1e3,
@@ -107,7 +107,7 @@ class QuadSamplingBasedPlanner(ABC):
             num_randomizations: The number of domain randomizations to use.
             risk_strategy: How to combining costs from different randomizations.
             seed: The random seed for domain randomization.
-            plan_horizon: The time horizon for the rollout in seconds.
+            plan_horizon: The timesteps of horizon for the rollout.
             iterations: The number of optimization iterations to perform.
             alpha_mean: The smoothing factor for the mean update.
             alpha_cov: The smoothing factor for the covariance update.
@@ -122,11 +122,10 @@ class QuadSamplingBasedPlanner(ABC):
 
         # time-related variables
         # NOTE: we always interpret self.task.model as the controller's
-        # internal model, not the model used for simulation. dt is the
-        # time between spline queries.
+        # internal model, not the model used for simulation.
+        # self.plan_horizon = plan_horizon
+        self.dt = self.task.dt * self.task.rollout_decimation
         self.plan_horizon = plan_horizon
-        self.dt = self.task.dt
-        self.plan_steps = int(round(self.plan_horizon / self.dt))
 
 
         # Use a single model (no domain randomization) by default
@@ -176,18 +175,18 @@ class QuadSamplingBasedPlanner(ABC):
         mean = (
             initial_mean
             if initial_mean is not None
-            else jnp.zeros((self.plan_steps, self.task.plan_dim))
+            else jnp.zeros((self.plan_horizon, self.task.plan_dim))
         )
-        assert mean.shape == (self.plan_steps, self.task.plan_dim), (
+        assert mean.shape == (self.plan_horizon, self.task.plan_dim), (
             f"Initial mean must have shape (plan_steps, plan_dim), got {mean.shape}"
         )
 
         ref = (
             ref_traj
             if ref_traj is not None
-            else jnp.zeros((self.plan_steps, self.task.plan_dim))
+            else jnp.zeros((self.plan_horizon, self.task.plan_dim))
         )
-        assert ref.shape == (self.plan_steps, self.task.plan_dim), (
+        assert ref.shape == (self.plan_horizon, self.task.plan_dim), (
             f"Initial reference trajectory must have shape (plan_steps, plan_dim), got {ref.shape}"
         )
 
@@ -379,8 +378,8 @@ class QuadSamplingBasedPlanner(ABC):
     ) -> Tuple[mjx.Data, mjx.Data, jax.Array, jax.Array, jax.Array]:
         """Rollout control sequences (in parallel) with optional value bootstrap."""
 
-        task_costs = jnp.zeros(self.plan_steps, dtype=jnp.float32)
-        constraint_flags = jnp.zeros(self.plan_steps, dtype=jnp.float32)
+        task_costs = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
+        constraint_flags = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
         states_list = []
         
         x = state
@@ -388,16 +387,18 @@ class QuadSamplingBasedPlanner(ABC):
         discount = jnp.asarray(1.0)
         initial_goal_idx = params.task_params.goal_idx
         
-        for i in range(self.plan_steps - 1):
+        for i in range(self.plan_horizon - 1):
             # Index by goal advancement (changes only at command-resample
             # boundaries inside dynamics()) instead of the loop counter, so
             # the contact target stays fixed within each command period —
             # matching the main pipeline behaviour.
+            # Not having a mechanism like this will make the rollout predictions collapse
             relative_goal = tp.goal_idx - initial_goal_idx
             safe_idx = jnp.clip(relative_goal, 0, plans.shape[0] - 2)
             a = jax.lax.dynamic_slice(plans, (safe_idx, 0), (2, plans.shape[1]))
             a_ref = jax.lax.dynamic_slice(params.ref, (safe_idx, 0), (2, params.ref.shape[1]))
             
+            # this is propogate the system by dt
             tp, x_next = self.task.dynamics(model, tp, x, a, a_ref)
 
             task_cost = self.dt * self.task.running_cost(tp, x_next, a, a_ref) * discount
@@ -431,7 +432,7 @@ class QuadSamplingBasedPlanner(ABC):
     def _empty_train_data(self, N: int) -> QuadAlgTrainData:
         R = self.num_randomizations
 
-        H = self.plan_steps
+        H = self.plan_horizon
         B = max(1, int((R * N) * self.top_fraction))
 
         def make_leaf(x):

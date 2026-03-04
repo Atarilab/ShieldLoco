@@ -34,7 +34,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         num_randomizations: int = 1,
         risk_strategy: Optional[RiskStrategy] = None,
         seed: int = 0,
-        plan_horizon: float = 1.0,
+        plan_horizon: int = 10,
         iterations: int = 1,
         gamma: float = 0.99,
         safety_weight: float = 1e3,
@@ -53,7 +53,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             risk_strategy: How to combining costs from different randomizations.
                            Defaults to average cost.
             seed: The random seed for domain randomization.
-            plan_horizon: The time horizon for the rollout in seconds.
+            plan_horizon: The timesteps of horizon for the rollout.
             spline_type: The type of spline used for control interpolation.
                          Defaults to "zero" (zero-order hold).
             num_knots: The number of knots in the control spline.
@@ -166,7 +166,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             sample_rng,
             (
                 self.num_samples,
-                self.plan_steps,
+                self.plan_horizon,
                 self.task.plan_dim,
             ),
         )

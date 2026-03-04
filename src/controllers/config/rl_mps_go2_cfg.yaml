@@ -15,12 +15,12 @@ use_threading: false
 use_buffer: false
 device: 'cpu' # "cuda:0"  
 feet_step_size: 0.0
-horizon_length: 10
+horizon_length: &horizon_length 10 # footstep horizon
 action_filter_alpha: 0.5
 transition_duration: 0
 visualize: 
   future_feet_positions: false
-  current_contact_locations: true
+  current_contact_locations: false
   opt_contact_locations: true
   feet_error: false
   contact_plan: false
@@ -80,8 +80,8 @@ mps_alg_name: "MIMPS"
 mps_num_samples: 64
 mps_noise_level: 0.3
 mps_temperature: 0.1
-mps_plan_horizon: 0.0125 # timestep * horizon_length = 0.00125 * 10
-mps_iterations: 3
+mps_plan_horizon: *horizon_length
+mps_iterations: 1
 mps_gamma: 0.99
 mps_safety_weight: 1000
 mps_collect_data: true
