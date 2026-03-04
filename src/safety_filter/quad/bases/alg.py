@@ -386,10 +386,17 @@ class QuadSamplingBasedPlanner(ABC):
         x = state
         tp = params.task_params
         discount = jnp.asarray(1.0)
+        initial_goal_idx = params.task_params.goal_idx
         
         for i in range(self.plan_steps - 1):
-            a = plans[i:i+2] # shape (2, plan_dim)
-            a_ref = params.ref[i:i+2] # shape (2, plan_dim)
+            # Index by goal advancement (changes only at command-resample
+            # boundaries inside dynamics()) instead of the loop counter, so
+            # the contact target stays fixed within each command period —
+            # matching the main pipeline behaviour.
+            relative_goal = tp.goal_idx - initial_goal_idx
+            safe_idx = jnp.clip(relative_goal, 0, plans.shape[0] - 2)
+            a = jax.lax.dynamic_slice(plans, (safe_idx, 0), (2, plans.shape[1]))
+            a_ref = jax.lax.dynamic_slice(params.ref, (safe_idx, 0), (2, params.ref.shape[1]))
             
             tp, x_next = self.task.dynamics(model, tp, x, a, a_ref)
 
