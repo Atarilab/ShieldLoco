@@ -393,11 +393,14 @@ class QuadSamplingBasedPlanner(ABC):
             # the contact target stays fixed within each command period —
             # matching the main pipeline behaviour.
             # Not having a mechanism like this will make the rollout predictions collapse
-            relative_goal = tp.goal_idx - initial_goal_idx
-            safe_idx = jnp.clip(relative_goal, 0, plans.shape[0] - 2)
-            a = jax.lax.dynamic_slice(plans, (safe_idx, 0), (2, plans.shape[1]))
-            a_ref = jax.lax.dynamic_slice(params.ref, (safe_idx, 0), (2, params.ref.shape[1]))
+            # relative_goal = tp.goal_idx - initial_goal_idx
+            # safe_idx = jnp.clip(relative_goal, 0, plans.shape[0] - 2)
+            # a = jax.lax.dynamic_slice(plans, (safe_idx, 0), (2, plans.shape[1]))
+            # a_ref = jax.lax.dynamic_slice(params.ref, (safe_idx, 0), (2, params.ref.shape[1]))
             
+            a = plans[i:i+2]  # shape (2, plan_dim)
+            a_ref = params.ref[i:i+2]  # shape (2, plan_dim
+
             # this is propogate the system by dt
             tp, x_next = self.task.dynamics(model, tp, x, a, a_ref)
 

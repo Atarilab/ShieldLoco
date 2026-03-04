@@ -237,7 +237,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             mj_model=mj_model,
             rl_policy=self.policy,
             rl_config=configs["controller_config"],
-            rate=20,
+            rate=50,
             logger=self.logger,
         )
 
@@ -447,7 +447,6 @@ class RLQuadrupedMPSController(RLControllerBase):
                     # # self._update_desired_ee_positions()
                     # self._update_action_scale()
 
-            # TODO: prolly add in separate thread cuz its blocking the call
             # update state
             if self.safety_manager.is_running():
                 safety_gait_id = {

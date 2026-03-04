@@ -9,6 +9,10 @@ os.environ["XLA_FLAGS"] = (
     "--xla_gpu_deterministic_ops=true "
     "--xla_gpu_autotune_level=0"
 )
+    # Kills the code for some reason
+    # "--xla_gpu_enable_async_all_gather=true "
+    # "--xla_gpu_enable_async_collectives=true "
+
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 

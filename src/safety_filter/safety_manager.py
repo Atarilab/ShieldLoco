@@ -40,7 +40,7 @@ class SafetyManager:
         mj_model: mujoco.MjModel, # type: ignore
         rl_policy: Any,
         rl_config: Dict[str, Any],
-        rate: float = 20.0,
+        rate: float = 50.0,
         logger=None,
     ):
         """Initialize the safety manager.
