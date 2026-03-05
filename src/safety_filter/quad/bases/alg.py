@@ -385,21 +385,15 @@ class QuadSamplingBasedPlanner(ABC):
         x = state
         tp = params.task_params
         discount = jnp.asarray(1.0)
-        initial_goal_idx = params.task_params.goal_idx
         
-        for i in range(self.plan_horizon - 1):
-            # Index by goal advancement (changes only at command-resample
-            # boundaries inside dynamics()) instead of the loop counter, so
-            # the contact target stays fixed within each command period —
-            # matching the main pipeline behaviour.
-            # Not having a mechanism like this will make the rollout predictions collapse
-            # relative_goal = tp.goal_idx - initial_goal_idx
-            # safe_idx = jnp.clip(relative_goal, 0, plans.shape[0] - 2)
-            # a = jax.lax.dynamic_slice(plans, (safe_idx, 0), (2, plans.shape[1]))
-            # a_ref = jax.lax.dynamic_slice(params.ref, (safe_idx, 0), (2, params.ref.shape[1]))
-            
-            a = plans[i:i+2]  # shape (2, plan_dim)
-            a_ref = params.ref[i:i+2]  # shape (2, plan_dim
+        for i in range(self.plan_horizon):
+            # Advance through the plan using the loop counter directly so that
+            # every footstep row is visited and goal_idx wrap-around cannot
+            # corrupt the index. plans[0:2] → footstep 0+1, plans[1:3] → 1+2 …
+            # clips at the last valid window (plan_horizon-2 : plan_horizon).
+            idx = min(i, self.plan_horizon - 2)
+            a = plans[idx : idx + 2]      # shape (2, plan_dim)
+            a_ref = params.ref[idx : idx + 2]
 
             # this is propogate the system by dt
             tp, x_next = self.task.dynamics(model, tp, x, a, a_ref)
@@ -439,7 +433,8 @@ class QuadSamplingBasedPlanner(ABC):
         B = max(1, int((R * N) * self.top_fraction))
 
         def make_leaf(x):
-            return jnp.zeros((B, H) + x.shape, dtype=x.dtype)
+            # H+1 to match the rollout output: initial state + H stepped states
+            return jnp.zeros((B, H + 1) + x.shape, dtype=x.dtype)
 
         state = QuadAlgState(
             qpos=jnp.zeros(self.task.data.qpos.shape),  # type: ignore

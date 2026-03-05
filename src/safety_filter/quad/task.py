@@ -41,7 +41,6 @@ def get_torch_policy():
 class QuadRLTaskParams(TaskParams):
     """Task parameters specific to the MPSQuadRL task."""
 
-    command_start_time: float = 0.0
     goal_idx: int = 0
     contact_plan: jax.Array = jnp.zeros(8)
     last_action: jax.Array = jnp.zeros(12)  # Assuming 12-dimensional action space
@@ -307,28 +306,46 @@ class QuadRLTask(Task):
 
     @partial(jax.jit, static_argnames=["self"])
     def update_params(self, task_params: QuadRLTaskParams, kwargs):
-        command_start_time = kwargs.get("command_start_time")
-        goal_idx = kwargs.get("goal_idx")
-        contact_plan = kwargs.get("contact_plan")
         current_gait = kwargs.get("current_gait")
-        goal_completion_counter = kwargs.get("goal_completion_counter")
         in_transition = kwargs.get("in_transition")
+
+        gait = jnp.asarray(current_gait, dtype=jnp.int32)
+
+        # Prime contact_plan from the gait pattern so plan step 0 sees the
+        # correct phase immediately (update_goal() won't fire for i=0 since
+        # lowlevel_step_counter is reset to 0 and should_resample needs counter>0).
+        counter = jnp.asarray(task_params.goal_completion_counter, dtype=jnp.int32)
+        primed_contact_plan = self._build_contact_plan(gait, counter)
+        # For stance/transition (gait<=1) keep the existing contact_plan.
+        primed_contact_plan = jnp.where(
+            gait <= 1, task_params.contact_plan, primed_contact_plan
+        )
 
         return update_params(
             task_params,
-            command_start_time=jnp.asarray(command_start_time),
-            goal_idx=jnp.asarray(goal_idx, dtype=jnp.int32),
-            contact_plan=jnp.asarray(contact_plan, dtype=jnp.float32),
-            current_gait=jnp.asarray(current_gait, dtype=jnp.int32),
-            goal_completion_counter=jnp.asarray(
-                goal_completion_counter, dtype=jnp.int32
-            ),
+            contact_plan=primed_contact_plan,
+            current_gait=gait,
             in_transition=jnp.asarray(in_transition, dtype=jnp.bool_),
-            # Start each planner cycle from a consistent low-level phase so the
-            # first rollout step always refreshes policy action for current state.
             lowlevel_step_counter=jnp.asarray(0, dtype=jnp.int32),
             last_q_des=task_params.last_q_des,
         )
+
+    def _build_contact_plan(
+        self, gait: jax.Array, counter: jax.Array
+    ) -> jax.Array:
+        """Construct an 8-element contact_plan for the given gait and phase counter."""
+        gait_pattern = jax.lax.dynamic_index_in_dim(
+            self.gait_patterns, gait, axis=0, keepdims=False
+        )
+        phase_idx = jnp.mod(counter, 2)
+        next_phase_idx = 1 - phase_idx
+        current_phase = jax.lax.dynamic_index_in_dim(
+            gait_pattern, phase_idx, axis=0, keepdims=False
+        )
+        next_phase = jax.lax.dynamic_index_in_dim(
+            gait_pattern, next_phase_idx, axis=0, keepdims=False
+        )
+        return jnp.concatenate([current_phase, next_phase]).astype(jnp.float32)
 
     def plan_seg_to_contact_locations(self, plan_segment: jax.Array) -> jax.Array:
         # plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
@@ -343,34 +360,14 @@ class QuadRLTask(Task):
 
         def _update_goal(params):
             new_counter = counter + 1
-
-            # Current planner gait table is 2-phase for all non-stance/non-transition gaits.
-            should_advance_goal = (jnp.mod(new_counter, 2) != 0) & (new_counter > 0)
-            new_goal_idx = goal_idx + should_advance_goal.astype(jnp.int32)
+            new_goal_idx = goal_idx + 1
 
             # Safety reset if exceeds horizon
-            new_goal_idx = jnp.where(
-                new_goal_idx >= self.horizon_length, 0, new_goal_idx
-            )
-            new_counter = jnp.where(new_goal_idx >= self.horizon_length, 0, new_counter)
+            reset = new_goal_idx >= self.horizon_length
+            new_goal_idx = jnp.where(reset, 0, new_goal_idx)
+            new_counter = jnp.where(reset, 0, new_counter)
 
-            # Update contact_plan
-            phase_idx = jnp.mod(new_counter, 2)
-            next_phase_idx = jnp.mod(new_counter + 1, 2)
-
-            gait_pattern = jax.lax.dynamic_index_in_dim(
-                self.gait_patterns, gait, axis=0, keepdims=False
-            )
-            current_phase = jax.lax.dynamic_index_in_dim(
-                gait_pattern, phase_idx, axis=0, keepdims=False
-            )
-            next_phase = jax.lax.dynamic_index_in_dim(
-                gait_pattern, next_phase_idx, axis=0, keepdims=False
-            )
-
-            new_contact_plan = jnp.concatenate([current_phase, next_phase]).astype(
-                jnp.float32
-            )
+            new_contact_plan = self._build_contact_plan(gait, new_counter)
 
             return params.replace(  # type: ignore
                 goal_completion_counter=new_counter,
@@ -422,8 +419,16 @@ class QuadRLTask(Task):
         contact_locations_b = feet_b_flat.reshape(4, self.obs_horizon, 3)
 
         # 5. contact_time_left = 1
-        elapsed = state.time - task_params.command_start_time
-        time_left = jnp.maximum(0.0, self.command_duration - elapsed)
+        # Use the step counter to compute time remaining in the current command
+        # period.  Avoids float32 precision loss when state.time holds a large
+        # Unix timestamp (ULP ~200 s >> command_duration = 0.3 s).
+        steps_since_resample = jnp.asarray(
+            jnp.mod(task_params.lowlevel_step_counter, self.rollout_decimation),
+            dtype=jnp.float32,
+        )
+        time_left = jnp.maximum(
+            0.0, self.command_duration - steps_since_resample * self.dt
+        )
         time_left = jnp.expand_dims(time_left, axis=-1)
 
         # 6. contact_plan = 8
@@ -523,13 +528,18 @@ class QuadRLTask(Task):
             return tp, tp.last_q_des
 
         for _ in range(self.rollout_decimation):
-            # Match controller semantics: update phase/goal only on command resample events.
-            elapsed = state.time - task_params.command_start_time
-            should_resample = elapsed > self.command_duration
-            new_start_time = jnp.where(
-                should_resample, state.time, task_params.command_start_time
+            # Use the integer step counter to detect command-period boundaries.
+            # Wall-clock timestamps passed as state.time are Unix epoch values
+            # (~1.7e9 s); in float32 their ULP is ~200 s, so sub-second elapsed
+            # time comparisons always round to zero and should_resample never fires
+            # after the first reset.  The integer counter has no precision issue.
+            # Fire at the very first sub-step of every plan step EXCEPT step 0
+            # (counter==0) so that goal_idx starts at 0 for the first plan step.
+            counter = task_params.lowlevel_step_counter
+            should_resample = jnp.logical_and(
+                jnp.equal(jnp.mod(counter, self.rollout_decimation), 0),
+                counter > 0,
             )
-            task_params = task_params.replace(command_start_time=new_start_time)  # type: ignore
             task_params = jax.lax.cond(
                 should_resample,
                 lambda p: self.update_goal(p),

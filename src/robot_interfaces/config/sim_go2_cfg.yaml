@@ -8,7 +8,8 @@ VIEWER_DT: 0.02  # 50 fps for viewer
 VISER_BACKEND: "viser"  # "none" | "viser"
 VISER_HOST: "0.0.0.0"
 VISER_PORT: 8080
-VISER_DT: 0.3  # 33 fps for web updates
+# 33 fps for web updates
+VISER_DT: 0.03
 VISER_SHARE_URL: False
 VISER_SHOW_COLLISION_GEOMS: True
 VISER_COLLISION_GEOM_GROUP: null  # Show all collidable geoms, including world obstacles

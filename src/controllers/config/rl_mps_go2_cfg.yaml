@@ -49,7 +49,7 @@ mps_task_name: "QuadRLTask"
 timestep: 0.03
 
 obs_horizon: 2 # specific to RL policy
-command_duration: 0.03
+command_duration: 0.3
 
 # Use the correct mapping from the existing config
 # JOINT_OBSERVATION_UNITREE_TO_ISAAC_LAB_MAPPING: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
@@ -76,7 +76,7 @@ kp: *stiffness
 kd: *damping
 
 mps_alg_name: "MIMPS"
-mps_num_samples: 64
+mps_num_samples: 16
 mps_noise_level: 0.3
 mps_temperature: 0.1
 mps_plan_horizon: *horizon_length

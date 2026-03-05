@@ -465,11 +465,7 @@ class RLQuadrupedMPSController(RLControllerBase):
                     xquat=self.robot.mj_model.data.xquat,
                     time=current_time,
 
-                    command_start_time=self.command_start_time,
-                    goal_idx=self.current_goal_idx,
-                    contact_plan=self.current_contact_plan.detach().cpu().numpy().reshape(-1),
                     current_gait=safety_gait_id,
-                    goal_completion_counter=self.goal_completion_counter,
                     in_transition=self.in_transition,
                 )
 
@@ -757,10 +753,13 @@ class RLQuadrupedMPSController(RLControllerBase):
 
         self.future_feet_positions_w[:] = (pos + rotated_offset).unsqueeze(1)
 
-        # Apply heading ONLY to stride direction (forward movement)
+        # Apply heading ONLY to stride direction (forward movement).
+        # feet_step_size is interpreted as m/s (desired walking speed); multiply by
+        # command_duration to get meters-per-plan-step.  This ensures the ghost robot
+        # reaches the last footstep regardless of how command_duration is configured.
         stride_offsets = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).unsqueeze(
             0
-        ) * torch.tensor(self.feet_step_size, dtype=torch.float32, device=self.device).unsqueeze(-1)
+        ) * torch.tensor(self.feet_step_size * self.command_duration, dtype=torch.float32, device=self.device).unsqueeze(-1)
         direction_x = cos_yaw
         direction_y = sin_yaw
         self.future_feet_positions_w[:, :, 0] += stride_offsets.squeeze(-1) * direction_x
@@ -768,7 +767,7 @@ class RLQuadrupedMPSController(RLControllerBase):
 
         lateral_stride_offsets = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).unsqueeze(
             0
-        ) * torch.tensor(self.lateral_step_size, dtype=torch.float32, device=self.device).unsqueeze(-1)
+        ) * torch.tensor(self.lateral_step_size * self.command_duration, dtype=torch.float32, device=self.device).unsqueeze(-1)
         lateral_direction_x = -sin_yaw
         lateral_direction_y = cos_yaw
         self.future_feet_positions_w[:, :, 0] += lateral_stride_offsets.squeeze(-1) * lateral_direction_x
@@ -911,7 +910,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         new_step_size = self._compute_discrete_step(
             current_value=self.feet_step_size,
             direction=direction,
-            step=0.1,
+            step=0.2,
             minimum=-0.3,
             maximum=0.3,
         )
@@ -947,7 +946,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.pending_lateral_step_size = self._compute_discrete_step(
                 current_value=self.lateral_step_size,
                 direction=direction,
-                step=0.1,
+                step=0.2,
                 minimum=-0.3,
                 maximum=0.3,
             )
@@ -992,8 +991,8 @@ class RLQuadrupedMPSController(RLControllerBase):
 
     def _handle_stance_width_change(self, side: str, direction: str):
         """Handle offset changes."""
-        # Define offset change amount in meters
-        stance_width_change = 0.4  # 2cm change
+        # Define offset change amount
+        stance_width_change = 0.2 
 
         with self._gait_lock:
             if direction == "increase":
@@ -1018,8 +1017,8 @@ class RLQuadrupedMPSController(RLControllerBase):
                     )  # Modify y-coordinate (stance width)
 
             # Set bounds for stance width (0.1m to 0.3m)
-            self.pending_stance_width_front = max(0.02, min(0.3, self.pending_stance_width_front))
-            self.pending_stance_width_rear = max(0.02, min(0.3, self.pending_stance_width_rear))
+            self.pending_stance_width_front = max(0.05, min(0.3, self.pending_stance_width_front))
+            self.pending_stance_width_rear = max(0.05, min(0.3, self.pending_stance_width_rear))
 
             # Set the pending flag
             self.stance_width_change_pending = True

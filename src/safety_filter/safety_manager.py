@@ -287,11 +287,7 @@ class SafetyManager:
             "xquat": kwargs.get("xquat"),
             
             "ref": kwargs.get("ref"),
-            "command_start_time": kwargs.get("command_start_time"),
-            "goal_idx": kwargs.get("goal_idx"),
-            "contact_plan": kwargs.get("contact_plan"),
             "current_gait": kwargs.get("current_gait"),
-            "goal_completion_counter": kwargs.get("goal_completion_counter"),
             "in_transition": kwargs.get("in_transition"),
         }
         current_seq = int(self._shared_state.get("seq", 0)) + 1
