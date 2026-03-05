@@ -49,7 +49,7 @@ mps_task_name: "QuadRLTask"
 timestep: 0.03
 
 obs_horizon: 2 # specific to RL policy
-command_duration: 0.3
+command_duration: 0.2
 
 # Use the correct mapping from the existing config
 # JOINT_OBSERVATION_UNITREE_TO_ISAAC_LAB_MAPPING: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
@@ -64,7 +64,7 @@ action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
 # DoomMPC/src/robots/go2/go2.py
 foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
-plan_lim: 0.01
+plan_lim: 0.05  # world-space normalization (m); noise_level * plan_lim = actual foot-position noise std = 0.015 m
 act_rl_clip: 100 # there is no clip on actions actually
 action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
 
@@ -76,7 +76,7 @@ kp: *stiffness
 kd: *damping
 
 mps_alg_name: "MIMPS"
-mps_num_samples: 16
+mps_num_samples: 64
 mps_noise_level: 0.3
 mps_temperature: 0.1
 mps_plan_horizon: *horizon_length

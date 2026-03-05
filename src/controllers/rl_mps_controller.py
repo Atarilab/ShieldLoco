@@ -485,6 +485,10 @@ class RLQuadrupedMPSController(RLControllerBase):
                     if train_data is not None and "qpos" in train_data:
                         self.pub_qpos_trajectory(train_data["qpos"])
 
+                    # if train_data is not None and "constraint_flags" in train_data:
+                    #     violated = train_data["constraint_flags"].any()
+                    #     self.logger.debug(f"Constraint Violated: {violated}")
+
             if self.visualize["current_contact_locations"]:
                 self.pub_current_contact_locations()
 
@@ -910,9 +914,9 @@ class RLQuadrupedMPSController(RLControllerBase):
         new_step_size = self._compute_discrete_step(
             current_value=self.feet_step_size,
             direction=direction,
-            step=0.2,
-            minimum=-0.3,
-            maximum=0.3,
+            step=0.3,
+            minimum=-0.6,
+            maximum=0.6,
         )
 
         # Set the pending step size change instead of applying it immediately
@@ -946,9 +950,9 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.pending_lateral_step_size = self._compute_discrete_step(
                 current_value=self.lateral_step_size,
                 direction=direction,
-                step=0.2,
-                minimum=-0.3,
-                maximum=0.3,
+                step=0.3,
+                minimum=-0.6,
+                maximum=0.6,
             )
             self.lateral_step_size_change_pending = True
 
