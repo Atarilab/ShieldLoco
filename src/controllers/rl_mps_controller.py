@@ -464,7 +464,9 @@ class RLQuadrupedMPSController(RLControllerBase):
                     xpos=self.robot.mj_model.data.xpos,
                     xquat=self.robot.mj_model.data.xquat,
                     time=current_time,
-
+                    goal_idx=self.current_goal_idx,
+                    goal_completion_counter=self.goal_completion_counter,
+                    contact_plan=self.current_contact_plan.detach().cpu().numpy(),
                     current_gait=safety_gait_id,
                     in_transition=self.in_transition,
                 )
@@ -666,11 +668,12 @@ class RLQuadrupedMPSController(RLControllerBase):
                 # Normal gait progression (only if not in transition phase)
                 if not self.in_transition and self.current_gait not in ["stance", "transition"]:
                     self.goal_completion_counter += 1
+                    should_advance_reference = False
 
                     # Handle different gait phases
                     if "crawl" in self.current_gait:
                         # For crawl gait or trot fly, cycle through 4 phases
-                        self.current_goal_idx += 1 if (self.goal_completion_counter) % 4 == 0 else 0
+                        should_advance_reference = self.goal_completion_counter % 4 == 0
                         self.current_contact_plan = torch.stack(
                             [
                                 self.gait_patterns[self.current_gait][(self.goal_completion_counter) % 4],
@@ -688,8 +691,8 @@ class RLQuadrupedMPSController(RLControllerBase):
 
                     else:
                         # For other gaits (2 phases), alternate between phases
-                        self.current_goal_idx += (
-                            1 if self.goal_completion_counter % 2 != 0 and self.goal_completion_counter > 0 else 0
+                        should_advance_reference = (
+                            self.goal_completion_counter % 2 != 0 and self.goal_completion_counter > 0
                         )
                         self.current_contact_plan = torch.stack(
                             [
@@ -698,20 +701,57 @@ class RLQuadrupedMPSController(RLControllerBase):
                             ]
                         )
 
-                # Safety mechanism, if the goal index exceeds the horizon length, reset the goal index and replan feet sequences
-                if self.current_goal_idx >= self.horizon_length:
-                    base_pos_w = torch.tensor(
-                        self.robot.mj_model.get_body_position_world("base_link"),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    self.generate_future_feet_positions(pos=base_pos_w)
+                    if should_advance_reference:
+                        self._advance_future_feet_positions()
 
         except Exception as e:
             if hasattr(self, "command_manager") and self.command_manager and hasattr(self.command_manager, "logger"):
                 self.logger.error(f"Error resampling commands: {e}")
             else:
                 print(f"Error resampling commands: {e}")
+
+    def _get_reference_motion_terms(self):
+        offset = self.current_offset.clone()
+
+        with self.heading_command_lock:
+            target_yaw = torch.tensor(self.heading_command, dtype=torch.float32, device=self.device)
+
+        cos_yaw = torch.cos(target_yaw)
+        sin_yaw = torch.sin(target_yaw)
+        rotation_matrix = torch.tensor(
+            [[cos_yaw.item(), -sin_yaw.item(), 0], [sin_yaw.item(), cos_yaw.item(), 0], [0, 0, 1]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        rotated_offset = torch.matmul(rotation_matrix, offset.T).T
+
+        stride_delta = self.feet_step_size * self.command_duration
+        lateral_delta = self.lateral_step_size * self.command_duration
+        step_delta = torch.stack(
+            [
+                stride_delta * cos_yaw - lateral_delta * sin_yaw,
+                stride_delta * sin_yaw + lateral_delta * cos_yaw,
+                torch.tensor(0.0, dtype=torch.float32, device=self.device),
+            ]
+        )
+
+        return rotated_offset, step_delta
+
+    def _append_future_step(self):
+        _, step_delta = self._get_reference_motion_terms()
+        next_step = self.future_feet_positions_w[:, -1, :] + step_delta.unsqueeze(0)
+        next_step[:, 2] = 0.01
+        self.future_feet_positions_w[:, -1, :] = next_step
+
+    def _advance_future_feet_positions(self):
+        if self.horizon_length <= 0:
+            return
+
+        if self.horizon_length > 1:
+            self.future_feet_positions_w[:, :-1, :] = self.future_feet_positions_w[:, 1:, :].clone()
+
+        self._append_future_step()
+        self.current_goal_idx = 0
 
     def generate_future_feet_positions(self, pos=None):
         """
@@ -733,49 +773,12 @@ class RLQuadrupedMPSController(RLControllerBase):
             # Use robot's actual current X and Y positions
             pos = torch.tensor([robot_pos[0], robot_pos[1], 0.0], dtype=torch.float32, device=self.device)
 
-        # Use current offset values
-        offset = self.current_offset.clone()
+        pos = torch.as_tensor(pos, dtype=torch.float32, device=self.device)
+        rotated_offset, step_delta = self._get_reference_motion_terms()
 
-        # Use the heading command as desired turn angle
-        with self.heading_command_lock:
-            # Convert heading command to tensor for calculations
-            heading_command_tensor = torch.tensor(self.heading_command, dtype=torch.float32, device=self.device)
-            # Target yaw is the heading command value
-            target_yaw = heading_command_tensor
-
-        # Create rotation matrix for the target yaw
-        cos_yaw = torch.cos(target_yaw)
-        sin_yaw = torch.sin(target_yaw)
-        rotation_matrix = torch.tensor(
-            [[cos_yaw.item(), -sin_yaw.item(), 0], [sin_yaw.item(), cos_yaw.item(), 0], [0, 0, 1]],
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-        # Rotate the offset positions
-        rotated_offset = torch.matmul(rotation_matrix, offset.T).T
-
-        self.future_feet_positions_w[:] = (pos + rotated_offset).unsqueeze(1)
-
-        # Apply heading ONLY to stride direction (forward movement).
-        # feet_step_size is interpreted as m/s (desired walking speed); multiply by
-        # command_duration to get meters-per-plan-step.  This ensures the ghost robot
-        # reaches the last footstep regardless of how command_duration is configured.
-        stride_offsets = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).unsqueeze(
-            0
-        ) * torch.tensor(self.feet_step_size * self.command_duration, dtype=torch.float32, device=self.device).unsqueeze(-1)
-        direction_x = cos_yaw
-        direction_y = sin_yaw
-        self.future_feet_positions_w[:, :, 0] += stride_offsets.squeeze(-1) * direction_x
-        self.future_feet_positions_w[:, :, 1] += stride_offsets.squeeze(-1) * direction_y
-
-        lateral_stride_offsets = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).unsqueeze(
-            0
-        ) * torch.tensor(self.lateral_step_size * self.command_duration, dtype=torch.float32, device=self.device).unsqueeze(-1)
-        lateral_direction_x = -sin_yaw
-        lateral_direction_y = cos_yaw
-        self.future_feet_positions_w[:, :, 0] += lateral_stride_offsets.squeeze(-1) * lateral_direction_x
-        self.future_feet_positions_w[:, :, 1] += lateral_stride_offsets.squeeze(-1) * lateral_direction_y
+        step_indices = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).view(1, -1, 1)
+        self.future_feet_positions_w[:] = pos.view(1, 1, 3) + rotated_offset.unsqueeze(1)
+        self.future_feet_positions_w[:] += step_indices * step_delta.view(1, 1, 3)
 
         # self.future_feet_positions_w[:, :, 2] = -0.02 if self.interface == "real" else 0.08
 
