@@ -74,6 +74,7 @@ class SafetyManager:
         self._health_log_interval = 5.0
         self._first_plan_logged = False
         self._worker_error_logged = False
+        self._latest_plan_info = None
 
         self.thread_initialized = False
         self.updated_state = False
@@ -201,7 +202,16 @@ class SafetyManager:
 
         self._manager = self._ctx.Manager()
         self._shared_state = self._manager.dict({"payload": None, "seq": 0})
-        self._shared_result = self._manager.dict({"plan": None, "override": False, "seq": -1, "error": None})
+        self._shared_result = self._manager.dict(
+            {
+                "plan": None,
+                "override": False,
+                "seq": -1,
+                "error": None,
+                "reference_generation_id": None,
+                "reference_step_seq": None,
+            }
+        )
         self._state_event = self._ctx.Event()
         self._stop_event = self._ctx.Event()
         self._process = self._ctx.Process(
@@ -264,6 +274,7 @@ class SafetyManager:
         self._plan_count = 0
         self._first_plan_logged = False
         self._worker_error_logged = False
+        self._latest_plan_info = None
         self.thread_initialized = False
         self._log_info("Safety worker stopped")
 
@@ -287,6 +298,8 @@ class SafetyManager:
             "xquat": kwargs.get("xquat"),
 
             "ref": kwargs.get("ref"),
+            "reference_generation_id": kwargs.get("reference_generation_id"),
+            "reference_step_seq": kwargs.get("reference_step_seq"),
             "goal_idx": kwargs.get("goal_idx"),
             "goal_completion_counter": kwargs.get("goal_completion_counter"),
             "contact_plan": kwargs.get("contact_plan"),
@@ -365,6 +378,13 @@ class SafetyManager:
         self._last_result_seq = result_seq
         self.exec_plan = self._shared_result.get("plan")
         self.override = bool(self._shared_result.get("override", False))
+        self._latest_plan_info = {
+            "plan": self.exec_plan,
+            "override": self.override,
+            "result_seq": result_seq,
+            "reference_generation_id": self._shared_result.get("reference_generation_id"),
+            "reference_step_seq": self._shared_result.get("reference_step_seq"),
+        }
         
         # Fetch train_data COM trajectory
         train_data_dict = self._shared_result.get("train_data")
@@ -391,10 +411,17 @@ class SafetyManager:
 
     @guard_errors("getting latest safety plan", stop_on_error=False)
     def get_latest_plan(self):
+        plan_info = self.get_latest_plan_info()
+        if plan_info is None:
+            return None
+        return plan_info.get("plan")
+
+    @guard_errors("getting latest safety plan metadata", stop_on_error=False)
+    def get_latest_plan_info(self):
         self._poll_results()
         if self.updated_plan and self.override:
             self.updated_plan = False
-            return self.exec_plan
+            return self._latest_plan_info
         return None
 
     @guard_errors("getting train data", stop_on_error=False)
@@ -593,6 +620,8 @@ def _safety_worker_main(
             shared_result["plan"] = exec_plan
             shared_result["override"] = override
             shared_result["seq"] = latest_seq
+            shared_result["reference_generation_id"] = latest_state.get("reference_generation_id")
+            shared_result["reference_step_seq"] = latest_state.get("reference_step_seq")
 
             elapsed = time.perf_counter() - loop_start
             sleep_time = max(0.0, period - elapsed)

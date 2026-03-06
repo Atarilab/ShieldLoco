@@ -174,6 +174,8 @@ class QuadRLTask(Task):
         self.act_rl_offset = jnp.asarray(rl_config["action_offset"])
         self.act_rl_scale = rl_config["action_scale"]
         self.act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
+        self.obstacle_clearance = float(rl_config.get("obstacle_clearance", 0.05))
+        self.obstacle_cost_weight = float(rl_config.get("obstacle_cost_weight", 100.0))
 
         # We optimize around absolute reference contact locations in normalized space.
         # Keep planner bounds unbounded to avoid saturating valid world-frame references.
@@ -264,6 +266,22 @@ class QuadRLTask(Task):
         # Convert to JAX arrays and store them
         self.geom_is_hazard = jnp.array(geom_is_hazard_np)
         self.geom_is_robot = jnp.array(geom_is_robot_np)
+
+        hazard_geom_ids = np.flatnonzero(geom_is_hazard_np).astype(np.int32)
+        hazard_geom_body_ids = np.asarray(mj_model.geom_bodyid[hazard_geom_ids], dtype=np.int32)
+        hazard_geom_pos_local = np.asarray(mj_model.geom_pos[hazard_geom_ids], dtype=np.float32)
+        if hasattr(mj_model, "geom_rbound"):
+            hazard_geom_radii = np.asarray(mj_model.geom_rbound[hazard_geom_ids], dtype=np.float32)
+        else:
+            hazard_geom_size = np.asarray(mj_model.geom_size[hazard_geom_ids], dtype=np.float32)
+            hazard_geom_radii = np.linalg.norm(hazard_geom_size, axis=1)
+
+        self.num_hazard_geoms = int(hazard_geom_ids.shape[0])
+        self.hazard_geom_body_ids = jnp.asarray(hazard_geom_body_ids, dtype=jnp.int32)
+        self.hazard_geom_pos_local = jnp.asarray(hazard_geom_pos_local, dtype=jnp.float32)
+        self.hazard_geom_radii = jnp.asarray(
+            np.maximum(hazard_geom_radii, 0.0), dtype=jnp.float32
+        )
 
     def normalize(self, plan: jax.Array) -> jax.Array:
         """Normalize plan values by plan_lim without saturating absolute references."""
@@ -367,6 +385,29 @@ class QuadRLTask(Task):
         # plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
         # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
         return jnp.transpose(plan_segment.reshape(2, 4, 3), (1, 0, 2))
+
+    def _hazard_geom_centers_world(self, state: mjx.Data) -> jax.Array:
+        body_pos = state.xpos[self.hazard_geom_body_ids]
+        body_quat = state.xquat[self.hazard_geom_body_ids]
+        geom_offset_world = jax.vmap(quat_rotate)(body_quat, self.hazard_geom_pos_local)
+        return body_pos + geom_offset_world
+
+    def _contact_obstacle_cost(
+        self, task_params: QuadRLTaskParams, state: mjx.Data, contact_locations_w: jax.Array
+    ) -> jax.Array:
+        if self.num_hazard_geoms == 0:
+            return jnp.array(0.0, dtype=jnp.float32)
+
+        contact_points = contact_locations_w.reshape(-1, 3)
+        hazard_centers = self._hazard_geom_centers_world(state)
+
+        offsets = contact_points[:, None, :] - hazard_centers[None, :, :]
+        center_distances = jnp.linalg.norm(offsets, axis=-1)
+        signed_clearance = center_distances - self.hazard_geom_radii[None, :]
+        nearest_clearance = jnp.min(signed_clearance, axis=1)
+
+        clearance_violation = jnp.maximum(0.0, self.obstacle_clearance - nearest_clearance)
+        return self.obstacle_cost_weight * jnp.sum(clearance_violation**2)
 
     def update_goal(self, task_params: QuadRLTaskParams) -> QuadRLTaskParams:
         """Update goal_idx and contact_plan based on gait phase progression."""
@@ -649,4 +690,11 @@ class QuadRLTask(Task):
 
         # Penalize deviation from reference contact locations.
         # Avoid absolute-plan magnitude penalties that bias contacts toward origin.
-        return jnp.sum((plan_segment - plan_segment_ref) ** 2)
+        tracking_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
+        contact_locations_w = self.plan_seg_to_contact_locations(
+            self.denormalize(plan_segment)
+        )
+        obstacle_cost = self._contact_obstacle_cost(
+            task_params, state, contact_locations_w
+        )
+        return tracking_cost + obstacle_cost

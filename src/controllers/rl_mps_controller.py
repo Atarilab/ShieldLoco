@@ -80,7 +80,11 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.pending_step_size = 0.0
 
         self.future_feet_positions_w = torch.zeros(4, self.horizon_length, 3, device=self.device)
+        self.reference_feet_positions_w = torch.zeros(4, self.horizon_length, 3, device=self.device)
         self.future_feet_positions_b = torch.zeros(4, self.horizon_length, 3, device=self.device)
+        self.apply_mpc_contact_plan = configs["controller_config"].get("apply_mpc_contact_plan", True)
+        self.reference_generation_id = 0
+        self.reference_step_seq = 0
 
         # Heading command for feet positions
         self.heading_command = 0.0  # Default heading (in radians)
@@ -356,6 +360,12 @@ class RLQuadrupedMPSController(RLControllerBase):
             options=["up", "down", "left", "center", "right", "turn-left", "turn-right"],
             default_value="center",
         )
+        self.command_manager.register_button_command(
+            name="mpc",
+            description="MPC Contact Plan",
+            options=["off", "on"],
+            default_value="on" if self.apply_mpc_contact_plan else "off",
+        )
 
     def set_mode(self):
         """Runs when the mode is changed in the UI.
@@ -458,12 +468,14 @@ class RLQuadrupedMPSController(RLControllerBase):
                     "jump": 5,
                 }.get(self.current_gait, 0)
                 self.safety_manager.update_state(
-                    ref=self.future_feet_positions_w.detach().cpu().numpy(),
+                    ref=self.reference_feet_positions_w.detach().cpu().numpy(),
                     qpos=self.robot.mj_model.data.qpos,
                     qvel=self.robot.mj_model.data.qvel,
                     xpos=self.robot.mj_model.data.xpos,
                     xquat=self.robot.mj_model.data.xquat,
                     time=current_time,
+                    reference_generation_id=self.reference_generation_id,
+                    reference_step_seq=self.reference_step_seq,
                     goal_idx=self.current_goal_idx,
                     goal_completion_counter=self.goal_completion_counter,
                     contact_plan=self.current_contact_plan.detach().cpu().numpy(),
@@ -471,11 +483,29 @@ class RLQuadrupedMPSController(RLControllerBase):
                     in_transition=self.in_transition,
                 )
 
-                new_plan = self.safety_manager.get_latest_plan()
-                if new_plan is not None:
-                    opt_future_feet_positions_w = torch.tensor(new_plan, dtype=torch.float32, device=self.device)
+                plan_info = self.safety_manager.get_latest_plan_info()
+                if plan_info is not None:
+                    opt_future_feet_positions_w = torch.tensor(
+                        plan_info["plan"], dtype=torch.float32, device=self.device
+                    )
+                    plan_generation_id = plan_info.get("reference_generation_id")
+                    plan_step_seq = plan_info.get("reference_step_seq")
+
                     if self.visualize["opt_contact_locations"]:
                         self.pub_opt_contact_locations(opt_future_feet_positions_w)
+
+                    if plan_generation_id == self.reference_generation_id:
+                        with self._gait_lock:
+                            aligned_plan = self._align_optimized_contact_plan(
+                                opt_future_feet_positions_w, plan_step_seq
+                            )
+                            if aligned_plan is not None:
+                                self._apply_optimized_contact_plan(aligned_plan)
+                    elif self.logger is not None:
+                        self.logger.debug(
+                            "Discarded obsolete MPC contact plan generation: "
+                            f"plan_generation_id={plan_generation_id}, current_generation_id={self.reference_generation_id}"
+                        )
 
                 # Publish COM trajectory from train_data
                 if self.visualize["opt_contact_locations"]:
@@ -739,19 +769,92 @@ class RLQuadrupedMPSController(RLControllerBase):
 
     def _append_future_step(self):
         _, step_delta = self._get_reference_motion_terms()
-        next_step = self.future_feet_positions_w[:, -1, :] + step_delta.unsqueeze(0)
+        next_step = self.reference_feet_positions_w[:, -1, :] + step_delta.unsqueeze(0)
         next_step[:, 2] = 0.01
-        self.future_feet_positions_w[:, -1, :] = next_step
+        self.reference_feet_positions_w[:, -1, :] = next_step
 
-    def _advance_future_feet_positions(self):
+    def _copy_reference_to_active_horizon(self):
+        self.future_feet_positions_w[:] = self.reference_feet_positions_w
+
+    def _apply_optimized_contact_plan(self, optimized_plan: torch.Tensor):
+        if not self.apply_mpc_contact_plan:
+            return
+
+        if tuple(optimized_plan.shape) != tuple(self.future_feet_positions_w.shape):
+            if self.logger is not None:
+                self.logger.error(
+                    "Ignoring optimized contact plan with unexpected shape: "
+                    f"got {tuple(optimized_plan.shape)}, expected {tuple(self.future_feet_positions_w.shape)}"
+                )
+            return
+
+        self.future_feet_positions_w[:] = optimized_plan
+
+    def _align_optimized_contact_plan(
+        self, optimized_plan: torch.Tensor, plan_step_seq: int | None
+    ) -> torch.Tensor | None:
+        if plan_step_seq is None:
+            return optimized_plan
+
+        stale_steps = int(self.reference_step_seq) - int(plan_step_seq)
+        if stale_steps < 0:
+            stale_steps = 0
+
+        if stale_steps == 0:
+            return optimized_plan
+
+        if stale_steps >= self.horizon_length:
+            if self.logger is not None:
+                self.logger.debug(
+                    "Discarded stale MPC contact plan beyond horizon: "
+                    f"plan_step_seq={plan_step_seq}, current_step_seq={self.reference_step_seq}"
+                )
+            return None
+
+        aligned_plan = optimized_plan.clone()
+        aligned_plan[:, :-stale_steps, :] = optimized_plan[:, stale_steps:, :]
+        aligned_plan[:, -stale_steps:, :] = self.reference_feet_positions_w[:, -stale_steps:, :]
+
+        if self.logger is not None:
+            self.logger.debug(
+                "Applied delayed MPC contact plan with horizon shift: "
+                f"plan_step_seq={plan_step_seq}, current_step_seq={self.reference_step_seq}, stale_steps={stale_steps}"
+            )
+
+        return aligned_plan
+
+    def _bump_reference_generation(self):
+        self.reference_generation_id += 1
+        self.reference_step_seq = 0
+
+    def _bump_reference_step_seq(self):
+        self.reference_step_seq += 1
+
+    def _advance_horizon_buffer(
+        self, buffer: torch.Tensor, tail_value: torch.Tensor | None = None
+    ):
         if self.horizon_length <= 0:
             return
 
         if self.horizon_length > 1:
-            self.future_feet_positions_w[:, :-1, :] = self.future_feet_positions_w[:, 1:, :].clone()
+            buffer[:, :-1, :] = buffer[:, 1:, :].clone()
 
-        self._append_future_step()
+        if tail_value is None:
+            _, step_delta = self._get_reference_motion_terms()
+            next_step = buffer[:, -1, :] + step_delta.unsqueeze(0)
+            next_step[:, 2] = 0.01
+            buffer[:, -1, :] = next_step
+        else:
+            buffer[:, -1, :] = tail_value
+
+    def _advance_future_feet_positions(self):
+        self._advance_horizon_buffer(self.reference_feet_positions_w)
+        self._advance_horizon_buffer(
+            self.future_feet_positions_w,
+            tail_value=self.reference_feet_positions_w[:, -1, :].clone(),
+        )
         self.current_goal_idx = 0
+        self._bump_reference_step_seq()
 
     def generate_future_feet_positions(self, pos=None):
         """
@@ -777,13 +880,15 @@ class RLQuadrupedMPSController(RLControllerBase):
         rotated_offset, step_delta = self._get_reference_motion_terms()
 
         step_indices = torch.arange(self.horizon_length, dtype=torch.float32, device=self.device).view(1, -1, 1)
-        self.future_feet_positions_w[:] = pos.view(1, 1, 3) + rotated_offset.unsqueeze(1)
-        self.future_feet_positions_w[:] += step_indices * step_delta.view(1, 1, 3)
+        self.reference_feet_positions_w[:] = pos.view(1, 1, 3) + rotated_offset.unsqueeze(1)
+        self.reference_feet_positions_w[:] += step_indices * step_delta.view(1, 1, 3)
 
         # self.future_feet_positions_w[:, :, 2] = -0.02 if self.interface == "real" else 0.08
 
         # TODO BUG: should be what the terrain height or something
-        self.future_feet_positions_w[:, :, 2] = 0.01
+        self.reference_feet_positions_w[:, :, 2] = 0.01
+        self._copy_reference_to_active_horizon()
+        self._bump_reference_generation()
 
         # if self.current_gait in ["trot", "pace"]:
         #     self.future_feet_positions_w[[1, 2], :, 0] -= (self.feet_step_size / 2) * direction_x
@@ -870,6 +975,20 @@ class RLQuadrupedMPSController(RLControllerBase):
             ValueError: If an invalid gait pattern is specified
         """
         try:
+            if "mpc" in new_commands:
+                mpc_mode = str(new_commands["mpc"]).lower()
+                if mpc_mode in ["off", "on"]:
+                    with self._gait_lock:
+                        self.apply_mpc_contact_plan = mpc_mode == "on"
+                        if not self.apply_mpc_contact_plan:
+                            self._copy_reference_to_active_horizon()
+
+                    if self.logger is not None:
+                        self.logger.info(
+                            "MPC contact plan "
+                            f"{'enabled' if self.apply_mpc_contact_plan else 'disabled'}"
+                        )
+
             if "gait" in new_commands:
                 new_gait = new_commands["gait"].lower()
                 if new_gait in self.gait_patterns and new_gait != self.current_gait:

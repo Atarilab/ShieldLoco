@@ -52,6 +52,7 @@ class RobotControlUI(App):
             border: round $background;
             padding: 1;
             display: none;  /* Hidden by default */
+            overflow-y: auto;
         }
 
         #command-container.visible {
@@ -190,6 +191,7 @@ class RobotControlUI(App):
             width: 100%;
             display: block;
             align: center middle;
+            height: auto;
         }
         
 
@@ -224,6 +226,19 @@ class RobotControlUI(App):
             background: $accent;
             color: $text;
             border: tall $background;
+        }
+
+        .toggle-buttons-container {
+            width: 100%;
+            layout: horizontal;
+            align: center middle;
+            margin: 1 1;
+            height: auto;
+        }
+
+        .toggle-button {
+            width: 1fr;
+            margin: 0 1;
         }
 
         .move-buttons-layout {
@@ -598,6 +613,7 @@ class CommandWidget(Vertical):
 
             for spec in widget_specs:
                 yield Label(spec["description"], classes="command-label")
+                current_value = self._get_current_value(spec)
 
                 if spec["widget_type"] == "input":
                     # Create numeric input field
@@ -641,14 +657,30 @@ class CommandWidget(Vertical):
                                     classes="gait-button move-button",
                                     id="button-move-turn-right",
                                 )
+                    elif spec["name"] == "mpc":
+                        with Horizontal(classes="toggle-buttons-container"):
+                            for option in spec["options"]:
+                                button = Button(
+                                    option.replace("-", " ").title(),
+                                    classes="gait-button toggle-button",
+                                    id=f"button-{spec['name']}-{option}",
+                                )
+                                if option == current_value:
+                                    button.add_class("selected")
+                                    button.styles.background = BUTTON_ACTIVE_COLOR
+                                yield button
                     else:
                         with Horizontal(classes="gait-buttons-container"):
                             for option in spec["options"]:
-                                yield Button(
+                                button = Button(
                                     option.replace("-", " ").title(),
                                     classes="gait-button",
                                     id=f"button-{spec['name']}-{option}",
                                 )
+                                if option == current_value:
+                                    button.add_class("selected")
+                                    button.styles.background = BUTTON_ACTIVE_COLOR
+                                yield button
 
                 elif spec["widget_type"] == "dropdown":
                     # Create dropdown for multiple choices
@@ -698,7 +730,16 @@ class CommandWidget(Vertical):
                     for btn in self.query(".gait-button"):
                         if btn.id and btn.id.startswith(group_prefix):
                             btn.styles.background = BUTTON_DEFAULT_COLOR
+                            btn.remove_class("selected")
                     event.button.styles.background = BUTTON_ACTIVE_COLOR
+                    event.button.add_class("selected")
+
+    @staticmethod
+    def _get_current_value(spec: dict) -> Any:
+        current_value = spec.get("current_value")
+        if current_value is not None:
+            return current_value
+        return spec.get("default_value")
 
     def on_select_changed(self, event: Select.Changed):
         """Handle dropdown selection changes."""
