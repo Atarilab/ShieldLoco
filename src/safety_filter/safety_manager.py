@@ -285,8 +285,11 @@ class SafetyManager:
             "time": kwargs.get("time"),
             "xpos": kwargs.get("xpos"),
             "xquat": kwargs.get("xquat"),
-            
+
             "ref": kwargs.get("ref"),
+            "goal_idx": kwargs.get("goal_idx"),
+            "goal_completion_counter": kwargs.get("goal_completion_counter"),
+            "contact_plan": kwargs.get("contact_plan"),
             "current_gait": kwargs.get("current_gait"),
             "in_transition": kwargs.get("in_transition"),
         }

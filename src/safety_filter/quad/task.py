@@ -308,21 +308,37 @@ class QuadRLTask(Task):
     def update_params(self, task_params: QuadRLTaskParams, kwargs):
         current_gait = kwargs.get("current_gait")
         in_transition = kwargs.get("in_transition")
+        goal_idx = kwargs.get("goal_idx")
+        goal_completion_counter = kwargs.get("goal_completion_counter")
+        contact_plan = kwargs.get("contact_plan")
 
         gait = jnp.asarray(current_gait, dtype=jnp.int32)
+        synced_goal_idx = jnp.asarray(
+            task_params.goal_idx if goal_idx is None else goal_idx, dtype=jnp.int32
+        )
+        synced_counter = jnp.asarray(
+            task_params.goal_completion_counter
+            if goal_completion_counter is None
+            else goal_completion_counter,
+            dtype=jnp.int32,
+        )
 
         # Prime contact_plan from the gait pattern so plan step 0 sees the
         # correct phase immediately (update_goal() won't fire for i=0 since
         # lowlevel_step_counter is reset to 0 and should_resample needs counter>0).
-        counter = jnp.asarray(task_params.goal_completion_counter, dtype=jnp.int32)
-        primed_contact_plan = self._build_contact_plan(gait, counter)
-        # For stance/transition (gait<=1) keep the existing contact_plan.
-        primed_contact_plan = jnp.where(
-            gait <= 1, task_params.contact_plan, primed_contact_plan
-        )
+        if contact_plan is None:
+            primed_contact_plan = self._build_contact_plan(gait, synced_counter)
+            # For stance/transition (gait<=1) keep the existing contact_plan.
+            primed_contact_plan = jnp.where(
+                gait <= 1, task_params.contact_plan, primed_contact_plan
+            )
+        else:
+            primed_contact_plan = jnp.asarray(contact_plan, dtype=jnp.float32).reshape(-1)
 
         return update_params(
             task_params,
+            goal_idx=synced_goal_idx,
+            goal_completion_counter=synced_counter,
             contact_plan=primed_contact_plan,
             current_gait=gait,
             in_transition=jnp.asarray(in_transition, dtype=jnp.bool_),
