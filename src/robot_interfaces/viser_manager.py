@@ -1,4 +1,7 @@
 import time
+import os
+import io
+import shutil
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, Optional
@@ -65,6 +68,8 @@ class ViserState:
     qpos_ghost_steps: int = 0
     qpos_ghost_last_update: float = 0.0
     ghost_mj_data: Any = None
+    follow_enabled: bool = False
+    follow_target_pos: Optional[np.ndarray] = None
 
 
 class ViserManager:
@@ -114,6 +119,7 @@ class ViserManager:
         self._initialize_web_viewer()
         self._initialize_web_opt_contact_locations()
         self._initialize_opt_contact_subscriber()
+        self._setup_client_callbacks()
 
     def _initialize_web_viewer(self):
         if viser is None:
@@ -141,6 +147,13 @@ class ViserManager:
             self.state.reset_button.on_click(lambda _: self.request_reset_callback())
         except Exception:
             self.state.reset_button = None
+
+        try:
+            self.state.server.gui.add_button("Follow Robot").on_click(
+                lambda _: self._toggle_follow()
+            )
+        except Exception as e:
+            print(f"Failed to add follow button: {e}", flush=True)
 
         if self.cfg.show_collision_geoms:
             self._initialize_web_collision_geometries()
@@ -616,6 +629,13 @@ class ViserManager:
                         else:
                             handle.visible = False
 
+                # Store robot position for follow-camera clients
+                if self.state.follow_enabled and self.state.collision_body_ids:
+                    target_id = self.state.collision_body_ids[0]
+                    if target_id in tracked_body_poses:
+                        body_pos, _body_quat = tracked_body_poses[target_id]
+                        self.state.follow_target_pos = np.array(body_pos)
+
             time.sleep(self.cfg.dt)
 
     def get_viewer_url(self):
@@ -623,6 +643,41 @@ class ViserManager:
 
     def get_share_url(self):
         return self.state.share_link
+
+    def _toggle_follow(self):
+        self.state.follow_enabled = not self.state.follow_enabled
+        print(f"Follow enabled: {self.state.follow_enabled}", flush=True)
+
+    def _setup_client_callbacks(self):
+        """Start background thread to update all clients' cameras for follow mode."""
+        if self.state.server is None:
+            return
+        
+        def update_all_clients():
+            while not self.stop_event.is_set():
+                if self.state.follow_enabled and self.state.follow_target_pos is not None:
+                    try:
+                        # Get all connected clients and update their cameras
+                        clients = self.state.server.get_clients()
+                        for client in clients.values():
+                            try:
+                                body_pos = self.state.follow_target_pos
+                                cam_offset = np.array([-0.8, -0.8, 0.8])
+                                cam_pos = body_pos + cam_offset
+                                
+                                with client.atomic():
+                                    client.camera.position = tuple(cam_pos)
+                                    client.camera.look_at = tuple(body_pos)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                
+                time.sleep(self.cfg.dt)
+        
+        # Start single update thread for all clients
+        t = Thread(target=update_all_clients, daemon=True)
+        t.start()
 
     def stop(self):
         if self.state.server is not None:
