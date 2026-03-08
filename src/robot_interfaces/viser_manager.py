@@ -1,7 +1,5 @@
 import time
 import os
-import io
-import shutil
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, Optional
@@ -561,10 +559,10 @@ class ViserManager:
         tracked_ids = set(self.state.collision_body_ids)
 
         for body_id in tracked_ids:
-            tracked_body_poses[body_id] = (
-                np.array(self.mj_data.xpos[body_id], copy=True),
-                np.array(self.mj_data.xquat[body_id], copy=True),
-            )
+            pos = np.array(self.mj_data.xpos[body_id], copy=True)
+            quat = np.array(self.mj_data.xquat[body_id], copy=True)
+            tracked_body_poses[body_id] = (pos, quat)
+        
         return tracked_body_poses
 
     def run(self):
@@ -631,7 +629,8 @@ class ViserManager:
 
                 # Store robot position for follow-camera clients
                 if self.state.follow_enabled and self.state.collision_body_ids:
-                    target_id = self.state.collision_body_ids[0]
+                    # Use body_id=1 (the robot's main body), not 0 (world frame)
+                    target_id = 1 if 1 in self.state.collision_body_ids else self.state.collision_body_ids[0]
                     if target_id in tracked_body_poses:
                         body_pos, _body_quat = tracked_body_poses[target_id]
                         self.state.follow_target_pos = np.array(body_pos)
@@ -646,7 +645,6 @@ class ViserManager:
 
     def _toggle_follow(self):
         self.state.follow_enabled = not self.state.follow_enabled
-        print(f"Follow enabled: {self.state.follow_enabled}", flush=True)
 
     def _setup_client_callbacks(self):
         """Start background thread to update all clients' cameras for follow mode."""
@@ -657,13 +655,13 @@ class ViserManager:
             while not self.stop_event.is_set():
                 if self.state.follow_enabled and self.state.follow_target_pos is not None:
                     try:
-                        # Get all connected clients and update their cameras
                         clients = self.state.server.get_clients()
                         for client in clients.values():
                             try:
                                 body_pos = self.state.follow_target_pos
                                 cam_offset = np.array([-0.8, -0.8, 0.8])
                                 cam_pos = body_pos + cam_offset
+                                cam_pos[2] = 0.8
                                 
                                 with client.atomic():
                                     client.camera.position = tuple(cam_pos)
@@ -675,11 +673,16 @@ class ViserManager:
                 
                 time.sleep(self.cfg.dt)
         
-        # Start single update thread for all clients
         t = Thread(target=update_all_clients, daemon=True)
         t.start()
 
     def stop(self):
+        # Stop recording if active
+        try:
+            self._stop_recording()
+        except Exception:
+            pass
+
         if self.state.server is not None:
             self.state.server.stop()
 
