@@ -1,8 +1,8 @@
 import time
-import os
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, Optional
+ 
 
 import mujoco
 import numpy as np
@@ -11,6 +11,11 @@ try:
     import viser
 except ImportError:
     viser = None
+
+try:
+    import trimesh
+except ImportError:
+    trimesh = None
 
 
 @dataclass
@@ -22,13 +27,11 @@ class ViserConfig:
     share_url: bool
     show_collision_geoms: bool
     collision_geom_group: Optional[int]
-    collision_opacity: float
     collision_wireframe: bool
-    collision_color_rgb: tuple[int, int, int]
     show_planned_contact_locations: bool
     planned_contact_topic: str
     planned_contact_radius: float
-    planned_contact_color_rgb: tuple[int, int, int]
+    
     show_qpos_ghost: bool
     qpos_trajectory_topic: str
     qpos_ghost_stride: int
@@ -43,8 +46,7 @@ class ViserState:
     server: Any = None
     viewer_url: Optional[str] = None
     share_link: Optional[str] = None
-    collision_body_ids: list[int] = field(default_factory=list)
-    collision_body_handles: dict[int, Any] = field(default_factory=dict)
+    mesh_handles: dict[int, Any] = field(default_factory=dict)  # geom_id -> mesh handle
     reset_button: Any = None
     opt_contact_handles: dict[int, Any] = field(default_factory=dict)
     opt_contact_positions: dict[int, tuple[float, float, float]] = field(default_factory=dict)
@@ -81,13 +83,11 @@ class ViserManager:
             share_url=bool(config.get("VISER_SHARE_URL", False)),
             show_collision_geoms=bool(config.get("VISER_SHOW_COLLISION_GEOMS", False)),
             collision_geom_group=None if collision_group is None else int(collision_group),
-            collision_opacity=float(config.get("VISER_COLLISION_OPACITY", 0.35)),
             collision_wireframe=bool(config.get("VISER_COLLISION_WIREFRAME", False)),
-            collision_color_rgb=tuple(config.get("VISER_COLLISION_COLOR_RGB", [255, 120, 80])),
             show_planned_contact_locations=bool(config.get("VISER_SHOW_PLANNED_CONTACT_LOCATIONS", True)),
             planned_contact_topic=str(config.get("VISER_PLANNED_CONTACT_TOPIC", "opt_contact_locations")),
             planned_contact_radius=float(config.get("VISER_PLANNED_CONTACT_RADIUS", 0.04)),
-            planned_contact_color_rgb=tuple(config.get("VISER_PLANNED_CONTACT_COLOR_RGB", [0, 255, 0])),
+            
             show_qpos_ghost=bool(config.get("VISER_SHOW_QPOS_GHOST", True)),
             qpos_trajectory_topic=str(config.get("VISER_QPOS_TRAJECTORY_TOPIC", "qpos_trajectory")),
             qpos_ghost_stride=max(1, int(config.get("VISER_QPOS_GHOST_STRIDE", 2))),
@@ -104,6 +104,59 @@ class ViserManager:
         self.locker = locker
         self.stop_event = stop_event
         self.request_reset_callback = request_reset_callback
+        self.mesh_cache = {}  # Cache loaded meshes to avoid reloading
+
+    def _load_mesh_from_mujoco(self, geom_id: int):
+        """Load mesh data from MuJoCo model and cache it as a trimesh object.
+        
+        Extracts vertex and face data from MuJoCo's internal mesh storage and converts
+        to trimesh format for rendering with viser.add_mesh_simple().
+        """
+        if trimesh is None:
+            return None
+        
+        if geom_id in self.mesh_cache:
+            return self.mesh_cache[geom_id]
+        
+        try:
+            mesh_id = int(self.mj_model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                return None
+            
+            mesh_vert_adr = int(self.mj_model.mesh_vertadr[mesh_id])
+            mesh_vert_num = int(self.mj_model.mesh_vertnum[mesh_id])
+            mesh_face_adr = int(self.mj_model.mesh_faceadr[mesh_id])
+            mesh_face_num = int(self.mj_model.mesh_facenum[mesh_id])
+            
+            if mesh_vert_num <= 0 or mesh_face_num <= 0:
+                return None
+            
+            vertices = np.asarray(
+                self.mj_model.mesh_vert[mesh_vert_adr : mesh_vert_adr + mesh_vert_num],
+                dtype=np.float64
+            )
+            
+            if vertices.size != mesh_vert_num * 3:
+                return None
+            
+            vertices = vertices.reshape(mesh_vert_num, 3)
+            
+            faces = np.asarray(
+                self.mj_model.mesh_face[mesh_face_adr : mesh_face_adr + mesh_face_num],
+                dtype=np.uint32
+            )
+            
+            if faces.size != mesh_face_num * 3:
+                return None
+                
+            faces = faces.reshape(mesh_face_num, 3)
+            
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+            self.mesh_cache[geom_id] = mesh
+            return mesh
+            
+        except Exception:
+            return None
 
     def is_enabled(self):
         return self.cfg.backend == "viser"
@@ -362,13 +415,21 @@ class ViserManager:
                 return False
 
         return True
+    
+    def _is_robot_geom(self, geom_id):
+        """Check if a geom belongs to the robot (not world/obstacles).
+        
+        Robot bodies have body_id > 0. World/global body is 0.
+        """
+        body_id = int(self.mj_model.geom_bodyid[geom_id])
+        return body_id > 0
 
     def _should_visualize_qpos_ghost_geom(self, geom_id):
         if not self._should_visualize_collision_geom(geom_id):
             return False
 
         geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
-        # Exclude world geoms from ghost overlay to avoid duplicate static scene visuals.
+        # Only visualize for robot bodies, not world geoms
         if geom_body_id <= 0:
             return False
 
@@ -383,44 +444,89 @@ class ViserManager:
 
         return True
 
+    def _add_mesh_visualization(self, geom_id: int):
+        """Add mesh visualization for a geometry mesh.
+        
+        Creates viser mesh handle at origin with identity rotation, then updates
+        position/rotation in animation loop from simulation data.
+        """
+        if self.state.server is None:
+            return
+        
+        try:
+            mesh = self._load_mesh_from_mujoco(geom_id)
+            if mesh is None:
+                return
+            
+            geom_rgba = self.mj_model.geom_rgba[geom_id]
+            geom_color = (float(geom_rgba[0]), float(geom_rgba[1]), float(geom_rgba[2]))
+            geom_opacity = float(geom_rgba[3])
+            
+            body_id = int(self.mj_model.geom_bodyid[geom_id])
+            body_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name is None:
+                body_name = f"body_{body_id}"
+            
+            geom_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+            if geom_name is None:
+                geom_name = f"geom_{geom_id}"
+            
+            geom_path = f"/robot/{body_name}/{geom_name}_{geom_id}"
+            
+            handle = self.state.server.scene.add_mesh_simple(
+                geom_path,
+                vertices=mesh.vertices,
+                faces=mesh.faces,
+                color=geom_color,
+                opacity=geom_opacity,
+                wxyz=(1.0, 0.0, 0.0, 0.0),
+                position=(0.0, 0.0, 0.0),
+            )
+            
+            self.state.mesh_handles[geom_id] = handle
+            
+        except Exception:
+            pass
+
     def _initialize_web_collision_geometries(self):
+        """Initialize visualization of robot meshes and scene collision primitives.
+        
+        - Robot meshes (all body_id > 0) rendered as detailed meshes
+        - Scene obstacles (body_id == 0) rendered as collision primitives
+        """
         if self.state.server is None:
             return
 
-        added_body_ids = set()
         for geom_id in range(self.mj_model.ngeom):
+            geom_type = int(self.mj_model.geom_type[geom_id])
+            
+            if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+                self._add_mesh_visualization(geom_id)
+                continue
+            
+            # Skip collision primitive rendering for robot geoms
+            if self._is_robot_geom(geom_id):
+                continue
+            
+            # Only visualize collidable obstacle geoms
             if not self._should_visualize_collision_geom(geom_id):
                 continue
-
-            geom_body_id = int(self.mj_model.geom_bodyid[geom_id])
-            if geom_body_id < 0:
-                continue
-
-            body_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, geom_body_id)
-            if body_name is None:
-                body_name = f"body_{geom_body_id}"
-
-            body_frame_path = f"/robot/collisions/bodies/{body_name}"
-            if geom_body_id not in self.state.collision_body_handles:
-                self.state.collision_body_handles[geom_body_id] = self.state.server.scene.add_frame(
-                    body_frame_path,
-                    show_axes=False,
-                )
-
-            if geom_body_id not in added_body_ids:
-                self.state.collision_body_ids.append(geom_body_id)
-                added_body_ids.add(geom_body_id)
 
             geom_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
             if geom_name is None:
                 geom_name = f"geom_{geom_id}"
 
-            geom_path = f"{body_frame_path}/{geom_name}_{geom_id}"
+            geom_path = f"/robot/collision_geoms/{geom_name}_{geom_id}"
+            
+            geom_rgba = self.mj_model.geom_rgba[geom_id]
+            geom_color = (geom_rgba[0], geom_rgba[1], geom_rgba[2])
+            geom_opacity = geom_rgba[3]
+            
             self._add_collision_geom_visual(
                 geom_id=geom_id,
                 geom_path=geom_path,
-                color=self.cfg.collision_color_rgb,
-                opacity=self.cfg.collision_opacity,
+                color=geom_color,
+                opacity=geom_opacity,
                 wireframe=self.cfg.collision_wireframe,
             )
 
@@ -554,86 +660,120 @@ class ViserManager:
 
         return body_poses
 
-    def _snapshot_collision_body_poses(self):
-        tracked_body_poses = {}
-        tracked_ids = set(self.state.collision_body_ids)
-
-        for body_id in tracked_ids:
-            pos = np.array(self.mj_data.xpos[body_id], copy=True)
-            quat = np.array(self.mj_data.xquat[body_id], copy=True)
-            tracked_body_poses[body_id] = (pos, quat)
+    def _snapshot_mesh_geom_poses(self):
+        """Get current poses of all mesh geometries from simulation data.
         
-        return tracked_body_poses
+        Extracts world-frame position and rotation for each mesh geometry.
+        
+        Returns:
+            dict: Mapping geom_id -> (position_array, quaternion_tuple)
+        """
+        mesh_poses = {}
+        
+        handle_ids = list(self.state.mesh_handles.keys())
+        if not handle_ids:
+            return mesh_poses
+        
+        for geom_id in handle_ids:
+            try:
+                # Check array bounds
+                if geom_id >= len(self.mj_data.geom_xpos):
+                    continue
+                
+                # Get world pose directly from MuJoCo (already composed with body transform)
+                geom_pos = np.array(self.mj_data.geom_xpos[geom_id], copy=True)
+                
+                # Get rotation matrix and flatten to 9-element vector for mju_mat2Quat
+                geom_mat = np.array(self.mj_data.geom_xmat[geom_id], copy=True)
+                geom_mat_flat = geom_mat.flatten()  # Convert 3x3 to flat 9-element array
+                
+                # Convert rotation matrix to quaternion
+                quat = np.zeros(4)
+                mujoco.mju_mat2Quat(quat, geom_mat_flat)
+                quat_wxyz = tuple(quat.tolist())
+                
+                mesh_poses[geom_id] = (geom_pos, quat_wxyz)
+            except Exception:
+                pass
+        
+        return mesh_poses
+
 
     def run(self):
+        """Main visualization animation loop.
+        
+        Thread-safe updates to mesh positions/rotations and other visualization
+        elements (contact markers, trajectories, etc.) at each simulation frame.
+        Uses server.atomic() for batched scene updates.
+        """
         if self.state.server is None:
             return
 
         while not self.stop_event.is_set():
-            with self.locker:
-                tracked_body_poses = self._snapshot_collision_body_poses()
+            try:
+                with self.locker:
+                    mesh_poses = self._snapshot_mesh_geom_poses()
+                    # Update follow target to robot's base position (body 1)
+                    if self.mj_model.nbody > 1:
+                        self.state.follow_target_pos = np.array(self.mj_data.xpos[1], copy=True)
 
-            with self.state.server.atomic():
-                for body_id, (body_pos, body_quat) in tracked_body_poses.items():
-                    collision_body_handle = self.state.collision_body_handles.get(body_id)
-                    if collision_body_handle is not None:
-                        collision_body_handle.position = tuple(body_pos.tolist())
-                        collision_body_handle.wxyz = tuple(body_quat.tolist())
+                with self.state.server.atomic():
+                    # Update mesh poses from simulation data
+                    for geom_id, (geom_pos, geom_quat) in mesh_poses.items():
+                        mesh_handle = self.state.mesh_handles.get(geom_id)
+                        if mesh_handle is not None:
+                            mesh_handle.position = tuple(geom_pos.tolist())
+                            mesh_handle.wxyz = geom_quat
 
-                if self.cfg.show_planned_contact_locations and self.state.opt_contact_handles:
-                    with self.locker:
-                        opt_positions = dict(self.state.opt_contact_positions)
-                        has_recent_update = (time.time() - self.state.opt_contact_last_update) < 1.0
+                    if self.cfg.show_planned_contact_locations and self.state.opt_contact_handles:
+                        with self.locker:
+                            opt_positions = dict(self.state.opt_contact_positions)
+                            has_recent_update = (time.time() - self.state.opt_contact_last_update) < 1.0
 
-                    if has_recent_update:
-                        for marker_id, pos in opt_positions.items():
-                            handle = self.state.opt_contact_handles.get(marker_id)
-                            if handle is not None:
-                                handle.position = pos
-                                handle.visible = True
-                    else:
-                        for handle in self.state.opt_contact_handles.values():
-                            handle.visible = False
-
-                # Update COM trajectory visualization
-                if self.state.com_trajectory_handles:
-                    with self.locker:
-                        com_positions = dict(self.state.com_trajectory_positions)
-                        has_com_update = (time.time() - self.state.com_trajectory_last_update) < 1.0
-
-                    if has_com_update:
-                        for marker_id, pos in com_positions.items():
-                            handle = self.state.com_trajectory_handles.get(marker_id)
-                            if handle is not None:
-                                handle.position = pos
-                                handle.visible = True
-                    else:
-                        for handle in self.state.com_trajectory_handles.values():
-                            handle.visible = False
-
-                if self.cfg.show_qpos_ghost and self.state.qpos_ghost_body_handles:
-                    with self.locker:
-                        ghost_poses = dict(self.state.qpos_ghost_body_poses)
-                        ghost_steps = int(self.state.qpos_ghost_steps)
-                        has_ghost_update = (time.time() - self.state.qpos_ghost_last_update) < 1.0
-
-                    for (step, body_id), handle in self.state.qpos_ghost_body_handles.items():
-                        pose = ghost_poses.get((step, body_id))
-                        if has_ghost_update and step < ghost_steps and pose is not None:
-                            body_pos, body_quat = pose
-                            handle.position = body_pos
-                            handle.wxyz = body_quat
-                            handle.visible = True
+                        if has_recent_update:
+                            for marker_id, pos in opt_positions.items():
+                                handle = self.state.opt_contact_handles.get(marker_id)
+                                if handle is not None:
+                                    handle.position = pos
+                                    handle.visible = True
                         else:
-                            handle.visible = False
+                            for handle in self.state.opt_contact_handles.values():
+                                handle.visible = False
 
-                # Store robot position for follow-camera clients
-                if self.state.follow_enabled and self.state.collision_body_ids:
-                    # Use body_id=1 (the robot's main body), not 0 (world frame)
-                    target_id = 1 if 1 in self.state.collision_body_ids else self.state.collision_body_ids[0]
-                    if target_id in tracked_body_poses:
-                        body_pos, _body_quat = tracked_body_poses[target_id]
-                        self.state.follow_target_pos = np.array(body_pos)
+                    # Update COM trajectory visualization
+                    if self.state.com_trajectory_handles:
+                        with self.locker:
+                            com_positions = dict(self.state.com_trajectory_positions)
+                            has_com_update = (time.time() - self.state.com_trajectory_last_update) < 1.0
+
+                        if has_com_update:
+                            for marker_id, pos in com_positions.items():
+                                handle = self.state.com_trajectory_handles.get(marker_id)
+                                if handle is not None:
+                                    handle.position = pos
+                                    handle.visible = True
+                        else:
+                            for handle in self.state.com_trajectory_handles.values():
+                                handle.visible = False
+
+                    if self.cfg.show_qpos_ghost and self.state.qpos_ghost_body_handles:
+                        with self.locker:
+                            ghost_poses = dict(self.state.qpos_ghost_body_poses)
+                            ghost_steps = int(self.state.qpos_ghost_steps)
+                            has_ghost_update = (time.time() - self.state.qpos_ghost_last_update) < 1.0
+
+                        for (step, body_id), handle in self.state.qpos_ghost_body_handles.items():
+                            pose = ghost_poses.get((step, body_id))
+                            if has_ghost_update and step < ghost_steps and pose is not None:
+                                body_pos, body_quat = pose
+                                handle.position = body_pos
+                                handle.wxyz = body_quat
+                                handle.visible = True
+                            else:
+                                handle.visible = False
+
+            except Exception as e:
+                pass
 
             time.sleep(self.cfg.dt)
 
