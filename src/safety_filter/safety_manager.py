@@ -572,7 +572,7 @@ def _safety_worker_main(
 
             override = True
             policy_params = jit_optimize(task.data, policy_params, override)
-            exec_plan = np.asarray(policy_params.best_plan)
+            exec_plan = np.asarray(policy_params.exec_plan)
 
             # Share train_data COM trajectory if available
             if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:

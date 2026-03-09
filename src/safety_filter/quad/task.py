@@ -283,6 +283,8 @@ class QuadRLTask(Task):
             np.maximum(hazard_geom_radii, 0.0), dtype=jnp.float32
         )
 
+        self.robot_radius = float(rl_config.get("robot_radius", 0.3))
+
     def normalize(self, plan: jax.Array) -> jax.Array:
         """Normalize plan values by plan_lim without saturating absolute references."""
         return plan / self.plan_lim
@@ -385,29 +387,6 @@ class QuadRLTask(Task):
         # plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
         # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
         return jnp.transpose(plan_segment.reshape(2, 4, 3), (1, 0, 2))
-
-    def _hazard_geom_centers_world(self, state: mjx.Data) -> jax.Array:
-        body_pos = state.xpos[self.hazard_geom_body_ids]
-        body_quat = state.xquat[self.hazard_geom_body_ids]
-        geom_offset_world = jax.vmap(quat_rotate)(body_quat, self.hazard_geom_pos_local)
-        return body_pos + geom_offset_world
-
-    def _contact_obstacle_cost(
-        self, task_params: QuadRLTaskParams, state: mjx.Data, contact_locations_w: jax.Array
-    ) -> jax.Array:
-        if self.num_hazard_geoms == 0:
-            return jnp.array(0.0, dtype=jnp.float32)
-
-        contact_points = contact_locations_w.reshape(-1, 3)
-        hazard_centers = self._hazard_geom_centers_world(state)
-
-        offsets = contact_points[:, None, :] - hazard_centers[None, :, :]
-        center_distances = jnp.linalg.norm(offsets, axis=-1)
-        signed_clearance = center_distances - self.hazard_geom_radii[None, :]
-        nearest_clearance = jnp.min(signed_clearance, axis=1)
-
-        clearance_violation = jnp.maximum(0.0, self.obstacle_clearance - nearest_clearance)
-        return self.obstacle_cost_weight * jnp.sum(clearance_violation**2)
 
     def update_goal(self, task_params: QuadRLTaskParams) -> QuadRLTaskParams:
         """Update goal_idx and contact_plan based on gait phase progression."""
@@ -672,6 +651,42 @@ class QuadRLTask(Task):
         collision_check = jnp.where(collides | fall_down, 1.0, 0.0)
 
         return collision_check
+
+    def _hazard_geom_centers_world(self, state: mjx.Data) -> jax.Array:
+        body_pos = state.xpos[self.hazard_geom_body_ids]
+        body_quat = state.xquat[self.hazard_geom_body_ids]
+        geom_offset_world = jax.vmap(quat_rotate)(body_quat, self.hazard_geom_pos_local)
+        return body_pos + geom_offset_world
+
+    def _contact_obstacle_cost(
+        self, task_params: QuadRLTaskParams, state: mjx.Data, contact_locations_w: jax.Array
+    ) -> jax.Array:
+        if self.num_hazard_geoms == 0:
+            return jnp.array(0.0, dtype=jnp.float32)
+        
+        hazard_centers = self._hazard_geom_centers_world(state) # (num_hazards, 3)
+
+        body_pos = state.xpos[self.base_body_id]  # (3,)
+        contact_points = contact_locations_w.reshape(-1, 3)
+
+        body_dist_offsets = body_pos - hazard_centers  # (num_hazards, 3)
+        body_center_distances = jnp.linalg.norm(body_dist_offsets, axis=-1)
+        body_signed_clearance = body_center_distances - self.hazard_geom_radii - self.robot_radius # (num_hazards,)
+
+        # body_violations = jnp.maximum(0.0, self.obstacle_clearance - body_signed_clearance)
+        # body_contact_cost = self.obstacle_cost_weight * jnp.sum(body_violations**2)
+        body_contact_cost = self.obstacle_cost_weight * jnp.sum(jnp.exp(-body_signed_clearance / 0.15))
+
+        foot_dist_offsets = contact_points[:, None, :] - hazard_centers[None, :, :] # (num_foot, num_hazards, 3)
+        foot_center_distances = jnp.linalg.norm(foot_dist_offsets, axis=-1) # (num_foot, num_hazards)
+        foot_signed_clearance = foot_center_distances - self.hazard_geom_radii[None, :] # (num_foot, num_hazards)
+        all_foot_signed_clearance = jnp.sum(foot_signed_clearance)
+
+        # foot_clearance_violation = jnp.maximum(0.0, self.obstacle_clearance - all_foot_signed_clearance)
+        # foot_contact_cost = self.obstacle_cost_weight * jnp.sum(foot_clearance_violation**2)
+        foot_contact_cost = self.obstacle_cost_weight * jnp.sum(jnp.exp(-all_foot_signed_clearance / 0.15))
+
+        return body_contact_cost + foot_contact_cost
 
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data

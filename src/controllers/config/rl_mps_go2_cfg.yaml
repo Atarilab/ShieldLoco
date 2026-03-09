@@ -82,7 +82,7 @@ mps_temperature: 0.1
 mps_plan_horizon: *horizon_length
 mps_iterations: 1
 mps_gamma: 0.99
-mps_safety_weight: 1000
+mps_safety_weight: 10
 mps_collect_data: true
 mps_top_fraction: 0.01
 apply_mpc_contact_plan: false
