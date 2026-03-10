@@ -116,7 +116,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # Shape: (num_samples, H, plan_dim)
         plans_mean = rollouts.plans[: self.num_samples]
 
-
         # Update mean (around ref)
         # Shape: (num_samples, H, plan_dim)
         increments_mean = plans_mean - params.ref
@@ -124,7 +123,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         weights_mean = jax.nn.softmax(-costs_mean / self.temperature, axis=0)
         # Shape: (num_plans, plan_dim)
         new_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
-
 
         # TODO: sample from the mean
         # Get best knots (lowest cost among all)
@@ -163,6 +161,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
     def sample_plans(self, params: MIMPSParams) -> Tuple[jax.Array, MIMPSParams]:
         """Sample a control sequence."""
         rng, sample_rng = jax.random.split(params.rng)
+
+        # Isotropic noise over plan_dim
         noise = jax.random.normal(
             sample_rng,
             (
@@ -171,8 +171,28 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
                 self.task.plan_dim,
             ),
         )
+
+        # plan_dim = 12 = [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]
+        # Scale xy large for avoidance, z tiny so feet stay on ground
+        noise_contact_locations = jax.vmap(self.task.plan_seg_to_contact_locations, in_axes=(0, None))(noise, self.plan_horizon)
+        # noise_contact_locations shape: (num_samples, 4, H, 3) -> (ns, H, 4, 3)
+        # Scale xy large for avoidance, z tiny so feet stay on ground
+        # xy_scale = 0.05
+        z_scale = 0.01
+        # noise_contact_locations = noise_contact_locations.at[..., :2].set(
+        #     noise_contact_locations[..., :2] * xy_scale
+        # )
+        noise_contact_locations = noise_contact_locations.at[..., 2].set(
+            noise_contact_locations[..., 2] * z_scale
+        )
+
+        # Reorder to (num_samples, H, 4, 3) and flatten feet+coords -> plan_dim
+        noise_noniso = noise_contact_locations.transpose(0, 2, 1, 3).reshape(
+            self.num_samples, self.plan_horizon, self.task.plan_dim
+        )
+
         # Shape: (num_samples, H, plan_dim)
-        mean = params.mean + params.ref + self.noise_level * noise
+        mean = params.mean + params.ref + self.noise_level * noise_noniso
 
         return mean, params.replace(rng=rng)  # type: ignore
 

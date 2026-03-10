@@ -64,7 +64,9 @@ action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
 # DoomMPC/src/robots/go2/go2.py
 foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
-plan_lim: 0.05  # world-space normalization (m); noise_level * plan_lim = actual foot-position noise std = 0.015 m
+# 0.3 noise for [-1, 1] normalized
+# plan_lim in meters would be 0.3 * 0.35 (action scale) = 0.105 m
+plan_lim: 0.35
 act_rl_clip: 100 # there is no clip on actions actually
 action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
 
@@ -78,7 +80,7 @@ kd: *damping
 mps_alg_name: "MIMPS"
 mps_num_samples: 256
 mps_noise_level: 0.3
-mps_temperature: 0.1
+mps_temperature: 1.0
 mps_plan_horizon: *horizon_length
 mps_iterations: 1
 mps_gamma: 0.99
@@ -86,3 +88,7 @@ mps_safety_weight: 10
 mps_collect_data: true
 mps_top_fraction: 0.01
 apply_mpc_contact_plan: false
+
+# Obstacle avoidance cost parameters
+obstacle_cost_weight: 100.0
+obstacle_cost_scale: 0.3   # Exponential decay length scale (meters). Larger = feel obstacles from further.

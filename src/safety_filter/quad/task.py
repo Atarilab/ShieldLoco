@@ -176,6 +176,7 @@ class QuadRLTask(Task):
         self.act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
         self.obstacle_clearance = float(rl_config.get("obstacle_clearance", 0.05))
         self.obstacle_cost_weight = float(rl_config.get("obstacle_cost_weight", 100.0))
+        self.obstacle_cost_scale = float(rl_config.get("obstacle_cost_scale", 0.3))
 
         # We optimize around absolute reference contact locations in normalized space.
         # Keep planner bounds unbounded to avoid saturating valid world-frame references.
@@ -383,10 +384,10 @@ class QuadRLTask(Task):
         )
         return jnp.concatenate([current_phase, next_phase]).astype(jnp.float32)
 
-    def plan_seg_to_contact_locations(self, plan_segment: jax.Array) -> jax.Array:
-        # plan_segment shape is (2, plan_dim) and not (4, 2, 3), where plan_dim is 4*3
-        # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2], [x, y, z]) = (4, 2, 3)
-        return jnp.transpose(plan_segment.reshape(2, 4, 3), (1, 0, 2))
+    def plan_seg_to_contact_locations(self, plan_segment: jax.Array, H: int = 2) -> jax.Array:
+        # plan_segment shape is (H, plan_dim) and not (4, H, 3), where plan_dim is 4*3
+        # contact_locations_w = ([FL, FR, RL, RR], [ref1, ref2, ..., refH], [x, y, z]) = (4, H, 3)
+        return jnp.transpose(plan_segment.reshape(H, 4, 3), (1, 0, 2))
 
     def update_goal(self, task_params: QuadRLTaskParams) -> QuadRLTaskParams:
         """Update goal_idx and contact_plan based on gait phase progression."""
@@ -669,22 +670,23 @@ class QuadRLTask(Task):
         body_pos = state.xpos[self.base_body_id]  # (3,)
         contact_points = contact_locations_w.reshape(-1, 3)
 
+        scale = self.obstacle_cost_scale
+
+        # --- Body cost (exponential, long-range) ---
         body_dist_offsets = body_pos - hazard_centers  # (num_hazards, 3)
         body_center_distances = jnp.linalg.norm(body_dist_offsets, axis=-1)
-        body_signed_clearance = body_center_distances - self.hazard_geom_radii - self.robot_radius # (num_hazards,)
+        body_signed_clearance = body_center_distances - self.hazard_geom_radii - self.robot_radius  # (num_hazards,)
+        body_contact_cost = self.obstacle_cost_weight * jnp.sum(
+            jnp.exp(-body_signed_clearance / scale)
+        )
 
-        # body_violations = jnp.maximum(0.0, self.obstacle_clearance - body_signed_clearance)
-        # body_contact_cost = self.obstacle_cost_weight * jnp.sum(body_violations**2)
-        body_contact_cost = self.obstacle_cost_weight * jnp.sum(jnp.exp(-body_signed_clearance / 0.15))
-
-        foot_dist_offsets = contact_points[:, None, :] - hazard_centers[None, :, :] # (num_foot, num_hazards, 3)
-        foot_center_distances = jnp.linalg.norm(foot_dist_offsets, axis=-1) # (num_foot, num_hazards)
-        foot_signed_clearance = foot_center_distances - self.hazard_geom_radii[None, :] # (num_foot, num_hazards)
-        all_foot_signed_clearance = jnp.sum(foot_signed_clearance)
-
-        # foot_clearance_violation = jnp.maximum(0.0, self.obstacle_clearance - all_foot_signed_clearance)
-        # foot_contact_cost = self.obstacle_cost_weight * jnp.sum(foot_clearance_violation**2)
-        foot_contact_cost = self.obstacle_cost_weight * jnp.sum(jnp.exp(-all_foot_signed_clearance / 0.15))
+        # --- Foot cost (exponential, per foot-hazard pair) ---
+        foot_dist_offsets = contact_points[:, None, :] - hazard_centers[None, :, :]  # (num_foot, num_hazards, 3)
+        foot_center_distances = jnp.linalg.norm(foot_dist_offsets, axis=-1)  # (num_foot, num_hazards)
+        foot_signed_clearance = foot_center_distances - self.hazard_geom_radii[None, :]  # (num_foot, num_hazards)
+        foot_contact_cost = self.obstacle_cost_weight * jnp.sum(
+            jnp.exp(-foot_signed_clearance / scale)
+        )
 
         return body_contact_cost + foot_contact_cost
 

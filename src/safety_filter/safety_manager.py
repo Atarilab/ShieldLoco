@@ -119,7 +119,7 @@ class SafetyManager:
             from .quad.task import QuadRLTask, QuadRLTaskParams
             self.task = QuadRLTask(self.mj_model, self.rl_policy_jax, self.rl_config)
 
-            self.task.data = mjx.make_data(self.task.mj_model, impl="warp", nconmax=20000, njmax=1000)
+            self.task.data = mjx.make_data(self.task.mj_model, impl="warp", nconmax=50000, njmax=2000)
 
             self.task_params = QuadRLTaskParams()
 
