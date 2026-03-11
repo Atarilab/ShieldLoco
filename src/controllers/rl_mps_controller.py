@@ -1036,7 +1036,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         new_step_size = self._compute_discrete_step(
             current_value=self.feet_step_size,
             direction=direction,
-            step=0.3,
+            step=0.2,
             minimum=-0.6,
             maximum=0.6,
         )
@@ -1072,7 +1072,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.pending_lateral_step_size = self._compute_discrete_step(
                 current_value=self.lateral_step_size,
                 direction=direction,
-                step=0.3,
+                step=0.2,
                 minimum=-0.6,
                 maximum=0.6,
             )

@@ -159,44 +159,54 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         )
 
     def sample_plans(self, params: MIMPSParams) -> Tuple[jax.Array, MIMPSParams]:
-        """Sample a control sequence."""
-        rng, sample_rng = jax.random.split(params.rng)
+        """Sample morphologically and temporally coherent plans.
 
-        # Isotropic noise over plan_dim
-        noise = jax.random.normal(
-            sample_rng,
-            (
-                self.num_samples,
-                self.plan_horizon,
-                self.task.plan_dim,
-            ),
-        )
+        Body-level xy noise shifts all 4 feet together — the dominant mode for
+        obstacle avoidance.  A constant + linear-trend basis keeps the body
+        shift smooth across horizon steps.  Per-foot residuals allow small
+        individual adjustments within the morphological constraint.
+        """
+        rng, body_const_rng, body_slope_rng, foot_rng = jax.random.split(params.rng, 4)
 
-        # plan_dim = 12 = [FLx, FLy, FLz, FRx, FRy, FRz, RLx, RLy, RLz, RRx, RRy, RRz]
-        # Scale xy large for avoidance, z tiny so feet stay on ground
-        noise_contact_locations = jax.vmap(self.task.plan_seg_to_contact_locations, in_axes=(0, None))(noise, self.plan_horizon)
-        # noise_contact_locations shape: (num_samples, 4, H, 3) -> (ns, H, 4, 3)
-        # Scale xy large for avoidance, z tiny so feet stay on ground
-        # xy_scale = 0.05
-        z_scale = 0.01
-        # noise_contact_locations = noise_contact_locations.at[..., :2].set(
-        #     noise_contact_locations[..., :2] * xy_scale
-        # )
-        noise_contact_locations = noise_contact_locations.at[..., 2].set(
-            noise_contact_locations[..., 2] * z_scale
-        )
+        N = self.num_samples
+        H = self.plan_horizon
 
-        # Reorder to (num_samples, H, 4, 3) and flatten feet+coords -> plan_dim
-        noise_noniso = noise_contact_locations.transpose(0, 2, 1, 3).reshape(
-            self.num_samples, self.plan_horizon, self.task.plan_dim
-        )
+        # --- Body-level xy noise (all 4 feet shift together) ---
+        # Constant + gentle linear trend → temporally coherent across horizon.
+        body_const = jax.random.normal(body_const_rng, (N, 1, 2))          # (N, 1, 2)
+        body_slope = jax.random.normal(body_slope_rng, (N, 1, 2)) * 0.3   # (N, 1, 2)
+        t = jnp.linspace(0.0, 1.0, H).reshape(1, H, 1)                   # (1, H, 1)
+        body_xy = body_const + body_slope * t                              # (N, H, 2)
+
+        # Tile to all 4 feet: (N, H, 4, 2)
+        body_xy_4feet = jnp.broadcast_to(body_xy[:, :, None, :], (N, H, 4, 2))
+
+        # --- Per-foot residual noise (small individual adjustment) ---
+        foot_noise = jax.random.normal(foot_rng, (N, H, 4, 3))
+        foot_xy = foot_noise[..., :2] * 0.1
+        foot_z  = foot_noise[..., 2:] * 0.01  # z stays near ground
+
+        # --- Combine: body dominates xy, foot residuals are small ---
+        combined_xy = 0.7 * body_xy_4feet + 0.3 * foot_xy   # (N, H, 4, 2)
+        combined = jnp.concatenate([combined_xy, foot_z], axis=-1)  # (N, H, 4, 3)
+
+        # Flatten to plan_dim: (N, H, 12)
+        noise = combined.reshape(N, H, self.task.plan_dim)
 
         # Shape: (num_samples, H, plan_dim)
-        mean = params.mean + params.ref + self.noise_level * noise_noniso
+        mean = params.mean + params.ref + self.noise_level * noise
 
         return mean, params.replace(rng=rng)  # type: ignore
 
     def prepare_optimize(self, state: mjx.Data, params: MIMPSParams) -> MIMPSParams:
+        # # Use best_plan (stored in absolute normalized coords) for warm-starting.
+        # # This is critical: mean is an offset from ref, but ref changes between
+        # # planning cycles (goal_idx advances, reference positions update).
+        # # Using ref + mean would corrupt the absolute plan by (new_ref - old_ref).
+        # # best_plan is ref-independent, so it survives ref changes correctly.
+        # abs_plan = params.best_plan
+        # abs_plan = jnp.concatenate([abs_plan[1:], params.ref[-1:]], axis=0)
+
         # Shift the previous best plan forward by one step to preserve corridor structure.
         # Append the last reference control to the end of the shifted plan to maintain the same length.
         abs_plan = params.ref + params.mean # Shape: (H, plan_dim)
@@ -231,5 +241,9 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         abs_plan = params.mean + params.ref
 
         exec_plan = self.task.get_exec_plan(abs_plan)
+
+        # # Store the MPPI weighted-mean absolute plan for warm-starting the next cycle.
+        # # This is smoother than the argmin best_plan from update_params.
+        # return params.replace(exec_plan=exec_plan, best_plan=abs_plan)  # type: ignore
 
         return params.replace(exec_plan=exec_plan)  # type: ignore

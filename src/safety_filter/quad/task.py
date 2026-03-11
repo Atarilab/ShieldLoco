@@ -284,6 +284,15 @@ class QuadRLTask(Task):
             np.maximum(hazard_geom_radii, 0.0), dtype=jnp.float32
         )
 
+        # 2D (xy) bounding radius for ground-plane obstacle cost.
+        # Avoids inflating obstacles by the z half-size (e.g. box 0.15×0.15×0.2
+        # has 3D rbound=0.29 but 2D footprint radius=0.21).
+        hazard_geom_size = np.asarray(mj_model.geom_size[hazard_geom_ids], dtype=np.float32)
+        hazard_geom_radii_2d = np.linalg.norm(hazard_geom_size[:, :2], axis=1)
+        self.hazard_geom_radii_2d = jnp.asarray(
+            np.maximum(hazard_geom_radii_2d, 0.0), dtype=jnp.float32
+        )
+
         self.robot_radius = float(rl_config.get("robot_radius", 0.3))
 
     def normalize(self, plan: jax.Array) -> jax.Array:
@@ -672,18 +681,22 @@ class QuadRLTask(Task):
 
         scale = self.obstacle_cost_scale
 
-        # --- Body cost (exponential, long-range) ---
-        body_dist_offsets = body_pos - hazard_centers  # (num_hazards, 3)
-        body_center_distances = jnp.linalg.norm(body_dist_offsets, axis=-1)
-        body_signed_clearance = body_center_distances - self.hazard_geom_radii - self.robot_radius  # (num_hazards,)
+        # Use 2D (xy) distances — obstacle avoidance is a ground-plane problem.
+        # 3D distance inflates clearance by the z-offset between robot/feet and
+        # obstacle centers, weakening the gradient where it matters.
+
+        # --- Body cost (exponential, 2D xy) ---
+        body_dist_xy = jnp.linalg.norm((body_pos - hazard_centers)[:, :2], axis=-1)
+        body_signed_clearance = body_dist_xy - self.hazard_geom_radii_2d - self.robot_radius
         body_contact_cost = self.obstacle_cost_weight * jnp.sum(
             jnp.exp(-body_signed_clearance / scale)
         )
 
-        # --- Foot cost (exponential, per foot-hazard pair) ---
-        foot_dist_offsets = contact_points[:, None, :] - hazard_centers[None, :, :]  # (num_foot, num_hazards, 3)
-        foot_center_distances = jnp.linalg.norm(foot_dist_offsets, axis=-1)  # (num_foot, num_hazards)
-        foot_signed_clearance = foot_center_distances - self.hazard_geom_radii[None, :]  # (num_foot, num_hazards)
+        # --- Foot cost (exponential, 2D xy, per foot-hazard pair) ---
+        foot_dist_xy = jnp.linalg.norm(
+            contact_points[:, None, :2] - hazard_centers[None, :, :2], axis=-1
+        )  # (num_foot, num_hazards)
+        foot_signed_clearance = foot_dist_xy - self.hazard_geom_radii_2d[None, :]
         foot_contact_cost = self.obstacle_cost_weight * jnp.sum(
             jnp.exp(-foot_signed_clearance / scale)
         )
