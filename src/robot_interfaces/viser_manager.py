@@ -406,7 +406,13 @@ class ViserManager:
     def _should_visualize_collision_geom(self, geom_id):
         geom_contype = int(self.mj_model.geom_contype[geom_id])
         geom_conaffinity = int(self.mj_model.geom_conaffinity[geom_id])
+        geom_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+        geom_name = (geom_name or "").lower()
+
+        # Show visual-only markers for known prefixes even if contype/conaffinity are zero
         if geom_contype == 0 and geom_conaffinity == 0:
+            if geom_name.startswith(("destination_", "finish_")):
+                return True
             return False
 
         if self.cfg.collision_geom_group is not None:

@@ -21,12 +21,12 @@
 
     <!-- DESTINATION MARKER at (6.5, 0.0, 0.2) -->
     <!-- Green X-shaped marker made of two thin crossed boxes -->
-    <geom name="destination_x_1" pos="6.5 0.0 0.05" type="box" size="0.3 0.02 0.05" rgba="0.0 1.0 0.0 1" quat="0.9239 0 0 0.3827"/>
-    <geom name="destination_x_2" pos="6.5 0.0 0.05" type="box" size="0.3 0.02 0.05" rgba="0.0 1.0 0.0 1" quat="0.9239 0 0 -0.3827"/>
+    <geom name="destination_x_1" pos="6.5 0.0 0.05" type="box" size="0.3 0.02 0.05" rgba="0.0 1.0 0.0 1" quat="0.9239 0 0 0.3827" contype="0" conaffinity="0"/>
+    <geom name="destination_x_2" pos="6.5 0.0 0.05" type="box" size="0.3 0.02 0.05" rgba="0.0 1.0 0.0 1" quat="0.9239 0 0 -0.3827" contype="0" conaffinity="0"/>
 
     <!-- Finish line - Two vertical poles with horizontal bar -->
-    <geom name="finish_pole_left" pos="6.5 -0.5 0.4" type="cylinder" size="0.03 0.4" rgba="1.0 1.0 1.0 1"/>
-    <geom name="finish_pole_right" pos="6.5 0.5 0.4" type="cylinder" size="0.03 0.4" rgba="1.0 1.0 1.0 1"/>
-    <geom name="finish_bar" pos="6.5 0.0 0.75" type="box" size="0.02 0.5 0.02" rgba="1.0 1.0 1.0 1"/>
+    <geom name="finish_pole_left" pos="6.5 -0.5 0.4" type="cylinder" size="0.03 0.4" rgba="1.0 1.0 1.0 1" contype="0" conaffinity="0"/>
+    <geom name="finish_pole_right" pos="6.5 0.5 0.4" type="cylinder" size="0.03 0.4" rgba="1.0 1.0 1.0 1" contype="0" conaffinity="0"/>
+    <geom name="finish_bar" pos="6.5 0.0 0.75" type="box" size="0.02 0.5 0.02" rgba="1.0 1.0 1.0 1" contype="0" conaffinity="0"/>
 
 </mujocoinclude>
