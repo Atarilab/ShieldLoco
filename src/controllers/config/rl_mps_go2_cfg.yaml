@@ -92,3 +92,14 @@ apply_mpc_contact_plan: false
 # Obstacle avoidance cost parameters
 obstacle_cost_weight: 300.0
 obstacle_cost_scale: 0.15   # Exponential decay length scale (meters). Larger = feel obstacles from further.
+
+# Dynamic obstacle (ball) parameters
+max_dynamic_obstacles: 5
+ball_radius: 0.05
+ball_mass: 0.5
+ball_lifetime: 3.0              # Seconds on ground before auto-deactivation
+ball_launch_distance: [4.0, 6.0]  # [min, max] meters from robot
+ball_launch_height: [2.0, 3.0]    # [min, max] meters
+ball_launch_speed: [2.0, 4.0]     # [min, max] m/s (lobbed arc)
+dynamic_obs_cost_weight: 500.0    # Exponential barrier weight for ball avoidance
+dynamic_obs_cost_scale: 0.15      # Exponential decay length scale (meters)

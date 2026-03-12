@@ -70,6 +70,9 @@ class ViserState:
     ghost_mj_data: Any = None
     follow_enabled: bool = False
     follow_target_pos: Optional[np.ndarray] = None
+    # Ball visualization
+    ball_handles: dict[int, Any] = field(default_factory=dict)  # slot_idx -> sphere handle
+    ball_geom_ids: list[int] = field(default_factory=list)  # geom IDs for each ball
 
 
 class ViserManager:
@@ -105,6 +108,8 @@ class ViserManager:
         self.stop_event = stop_event
         self.request_reset_callback = request_reset_callback
         self.mesh_cache = {}  # Cache loaded meshes to avoid reloading
+        self.ball_launcher = None
+        self.base_body_id = None
 
     def _load_mesh_from_mujoco(self, geom_id: int):
         """Load mesh data from MuJoCo model and cache it as a trimesh object.
@@ -214,6 +219,46 @@ class ViserManager:
 
         if self.cfg.share_url:
             self.state.share_link = self.state.server.request_share_url(verbose=False)
+
+    def set_ball_launcher(self, ball_launcher, base_body_id):
+        """Attach a BallLauncher and add a throw button to the web UI."""
+        self.ball_launcher = ball_launcher
+        self.base_body_id = base_body_id
+
+        # Create ball visualization spheres
+        self.state.ball_geom_ids = []
+        for i in range(ball_launcher.max_balls):
+            geom_name = f"ball_geom_{i}"
+            geom_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+            self.state.ball_geom_ids.append(geom_id)
+            if self.state.server is not None and geom_id >= 0:
+                try:
+                    handle = self.state.server.scene.add_icosphere(
+                        f"/robot/balls/{geom_name}",
+                        radius=float(ball_launcher.ball_radius),
+                        color=(255, 128, 0),
+                        position=(0.0, 0.0, -10.0),
+                        visible=False,
+                    )
+                    self.state.ball_handles[i] = handle
+                except Exception:
+                    pass
+
+        if self.state.server is None:
+            return
+        try:
+            btn = self.state.server.gui.add_button("Throw Ball")
+            btn.on_click(lambda _: self._handle_throw_ball())
+        except Exception as e:
+            print(f"Failed to add throw ball button: {e}", flush=True)
+
+    def _handle_throw_ball(self):
+        """Throw a ball at the robot's current position."""
+        if self.ball_launcher is None or self.base_body_id is None:
+            return
+        with self.locker:
+            robot_pos = self.mj_data.xpos[self.base_body_id].copy()
+            self.ball_launcher.launch(robot_pos, self.mj_data)
 
     def _initialize_web_opt_contact_locations(self):
         if self.state.server is None or not self.cfg.show_planned_contact_locations:
@@ -722,6 +767,11 @@ class ViserManager:
                     # Update follow target to robot's base position (body 1)
                     if self.mj_model.nbody > 1:
                         self.state.follow_target_pos = np.array(self.mj_data.xpos[1], copy=True)
+                    # Snapshot ball positions
+                    ball_positions = {}
+                    for i, geom_id in enumerate(self.state.ball_geom_ids):
+                        if geom_id >= 0 and i in self.state.ball_handles:
+                            ball_positions[i] = tuple(self.mj_data.geom_xpos[geom_id].tolist())
 
                 with self.state.server.atomic():
                     # Update mesh poses from simulation data
@@ -730,6 +780,17 @@ class ViserManager:
                         if mesh_handle is not None:
                             mesh_handle.position = tuple(geom_pos.tolist())
                             mesh_handle.wxyz = geom_quat
+
+                    # Update ball positions
+                    for i, pos in ball_positions.items():
+                        handle = self.state.ball_handles.get(i)
+                        if handle is not None:
+                            # Only show balls that are above ground (not hidden at z=-10 or far away)
+                            if pos[2] > -1.0 and abs(pos[0]) < 50.0:
+                                handle.position = pos
+                                handle.visible = True
+                            else:
+                                handle.visible = False
 
                     if self.cfg.show_planned_contact_locations and self.state.opt_contact_handles:
                         with self.locker:

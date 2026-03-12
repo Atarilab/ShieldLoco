@@ -21,5 +21,6 @@
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" friction="1.3"/>
 
     <include file="obstacles.xml"/>
+    <include file="balls.xml"/>
   </worldbody>
 </mujoco>

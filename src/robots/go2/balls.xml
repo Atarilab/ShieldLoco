@@ -1,0 +1,27 @@
+<mujocoinclude>
+
+    <!-- Dynamic projectile balls (pre-allocated, initially underground) -->
+    <!-- Activated on demand by BallLauncher; freejoint gives full 6-DOF flight -->
+    <!-- Only included by sim scene (scene.xml), NOT by planner scene (scene_mjx.xml) -->
+    <body name="ball_0" pos="100 0 0.1">
+        <freejoint name="ball_joint_0"/>
+        <geom name="ball_geom_0" type="sphere" size="0.05" mass="0.5" rgba="1.0 0.5 0.0 1" friction="0.8"/>
+    </body>
+    <body name="ball_1" pos="100 0 0.1">
+        <freejoint name="ball_joint_1"/>
+        <geom name="ball_geom_1" type="sphere" size="0.05" mass="0.5" rgba="1.0 0.5 0.0 1" friction="0.8"/>
+    </body>
+    <body name="ball_2" pos="100 0 0.1">
+        <freejoint name="ball_joint_2"/>
+        <geom name="ball_geom_2" type="sphere" size="0.05" mass="0.5" rgba="1.0 0.5 0.0 1" friction="0.8"/>
+    </body>
+    <body name="ball_3" pos="100 0 0.1">
+        <freejoint name="ball_joint_3"/>
+        <geom name="ball_geom_3" type="sphere" size="0.05" mass="0.5" rgba="1.0 0.5 0.0 1" friction="0.8"/>
+    </body>
+    <body name="ball_4" pos="100 0 0.1">
+        <freejoint name="ball_joint_4"/>
+        <geom name="ball_geom_4" type="sphere" size="0.05" mass="0.5" rgba="1.0 0.5 0.0 1" friction="0.8"/>
+    </body>
+
+</mujocoinclude>

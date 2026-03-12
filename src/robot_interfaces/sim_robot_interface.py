@@ -10,6 +10,7 @@ import numpy as np
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from robot_interfaces.viser_manager import ViserManager
+from utils.ball_launcher import BallLauncher
 from utils.unitree_sdk2py_bridge import UnitreeSdk2Bridge
 
 
@@ -79,6 +80,18 @@ class SimRobotInterface:
 
         self.print_scene_info = config.get("PRINT_SCENE_INFORMATION", False)
 
+        # Ball launcher for dynamic obstacle testing
+        self.ball_launcher = BallLauncher(
+            mj_model=self.mj_model,
+            max_balls=5,
+            ball_radius=0.05,
+            launch_distance_range=(4.0, 6.0),
+            launch_height_range=(2.0, 3.0),
+            launch_speed_range=(2.0, 4.0),
+            ball_lifetime=3.0,
+        )
+        self.viser_manager.set_ball_launcher(self.ball_launcher, self.base_body_id)
+
         # Start threads
         self.viewer_thread = Thread(target=self._physics_viewer_thread)
         self.sim_thread = Thread(target=self._simulation_thread)
@@ -115,6 +128,9 @@ class SimRobotInterface:
                         self.mj_data.xfrc_applied[self.band_link.id][:3] = force
 
                 mujoco.mj_step(self.mj_model, self.mj_data)
+
+                # Tick ball launcher to auto-deactivate grounded balls
+                self.ball_launcher.tick(self.mj_data, time.time())
 
             time_until_next_step = self.mj_model.opt.timestep - (time.perf_counter() - step_start)
             if time_until_next_step > 0:
@@ -177,6 +193,13 @@ class SimRobotInterface:
         glfw = mujoco.glfw.glfw
         if key == glfw.KEY_BACKSPACE:
             self.request_reset()
+            return
+
+        # Press 'T' to throw a ball at the robot
+        if key == glfw.KEY_T:
+            with self.locker:
+                robot_pos = self.mj_data.xpos[self.base_body_id].copy()
+                self.ball_launcher.launch(robot_pos, self.mj_data)
             return
 
         if self.elastic_band is not None:
