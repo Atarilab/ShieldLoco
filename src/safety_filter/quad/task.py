@@ -686,11 +686,13 @@ class QuadRLTask(Task):
         # 3D distance inflates clearance by the z-offset between robot/feet and
         # obstacle centers, weakening the gradient where it matters.
 
+        _EXP_MAX = 20.0  # exp(20) ≈ 5e8, safely below float32 overflow
+
         # --- Body cost (exponential, 2D xy) ---
         body_dist_xy = jnp.linalg.norm((body_pos - hazard_centers)[:, :2], axis=-1)
         body_signed_clearance = body_dist_xy - self.hazard_geom_radii_2d - self.robot_radius
         body_contact_cost = self.obstacle_cost_weight * jnp.sum(
-            jnp.exp(-body_signed_clearance / scale)
+            jnp.exp(jnp.clip(-body_signed_clearance / scale, a_max=_EXP_MAX))
         )
 
         # --- Foot cost (exponential, 2D xy, per foot-hazard pair) ---
@@ -699,7 +701,7 @@ class QuadRLTask(Task):
         )  # (num_foot, num_hazards)
         foot_signed_clearance = foot_dist_xy - self.hazard_geom_radii_2d[None, :]
         foot_contact_cost = self.obstacle_cost_weight * jnp.sum(
-            jnp.exp(-foot_signed_clearance / scale)
+            jnp.exp(jnp.clip(-foot_signed_clearance / scale, a_max=_EXP_MAX))
         )
 
         # --- Contact center cost (exponential, 2D xy) ---
@@ -708,7 +710,7 @@ class QuadRLTask(Task):
         )  # (num_contact_center, num_hazards)
         contact_center_signed_clearance = contact_center_dist_xy - self.hazard_geom_radii_2d[None, :] - self.robot_radius
         contact_center_cost = self.obstacle_cost_weight * jnp.sum(
-            jnp.exp(-contact_center_signed_clearance / scale)
+            jnp.exp(jnp.clip(-contact_center_signed_clearance / scale, a_max=_EXP_MAX))
         )
 
         return body_contact_cost + foot_contact_cost + contact_center_cost

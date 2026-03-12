@@ -90,5 +90,5 @@ mps_top_fraction: 0.01
 apply_mpc_contact_plan: false
 
 # Obstacle avoidance cost parameters
-obstacle_cost_weight: 200.0
-obstacle_cost_scale: 0.1   # Exponential decay length scale (meters). Larger = feel obstacles from further.
+obstacle_cost_weight: 300.0
+obstacle_cost_scale: 0.15   # Exponential decay length scale (meters). Larger = feel obstacles from further.
