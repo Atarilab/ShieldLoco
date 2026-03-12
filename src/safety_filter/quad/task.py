@@ -678,6 +678,7 @@ class QuadRLTask(Task):
 
         body_pos = state.xpos[self.base_body_id]  # (3,)
         contact_points = contact_locations_w.reshape(-1, 3)
+        contact_centers = jnp.mean(contact_locations_w, axis=0) # (2, 3)
 
         scale = self.obstacle_cost_scale
 
@@ -701,7 +702,16 @@ class QuadRLTask(Task):
             jnp.exp(-foot_signed_clearance / scale)
         )
 
-        return body_contact_cost + foot_contact_cost
+        # --- Contact center cost (exponential, 2D xy) ---
+        contact_center_dist_xy = jnp.linalg.norm(
+            contact_centers[:, None, :2] - hazard_centers[None, :, :2], axis=-1
+        )  # (num_contact_center, num_hazards)
+        contact_center_signed_clearance = contact_center_dist_xy - self.hazard_geom_radii_2d[None, :] - self.robot_radius
+        contact_center_cost = self.obstacle_cost_weight * jnp.sum(
+            jnp.exp(-contact_center_signed_clearance / scale)
+        )
+
+        return body_contact_cost + foot_contact_cost + contact_center_cost
 
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data

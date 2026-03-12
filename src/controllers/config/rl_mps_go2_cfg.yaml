@@ -65,8 +65,8 @@ action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
 foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
 # 0.3 noise for [-1, 1] normalized
-# plan_lim in meters would be 0.3 * 0.35 (action scale) = 0.105 m
-plan_lim: 0.35
+# plan_lim in meters would be 0.3 * 0.25 (action scale) = 0.075 m
+plan_lim: 0.25
 act_rl_clip: 100 # there is no clip on actions actually
 action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
 
@@ -90,5 +90,5 @@ mps_top_fraction: 0.01
 apply_mpc_contact_plan: false
 
 # Obstacle avoidance cost parameters
-obstacle_cost_weight: 100.0
-obstacle_cost_scale: 0.05   # Exponential decay length scale (meters). Larger = feel obstacles from further.
+obstacle_cost_weight: 200.0
+obstacle_cost_scale: 0.1   # Exponential decay length scale (meters). Larger = feel obstacles from further.
