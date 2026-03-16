@@ -121,7 +121,7 @@ class SafetyManager:
 
             self.task.data = mjx.make_data(self.task.mj_model, impl="warp", nconmax=50000, njmax=2000)
 
-            self.task_params = QuadRLTaskParams()
+            self.task_params = self.task.make_task_params()
 
             alg_name = self.rl_config.get("mps_alg_name", "MIMPS")
             if alg_name == "MIMPS":
@@ -305,6 +305,9 @@ class SafetyManager:
             "contact_plan": kwargs.get("contact_plan"),
             "current_gait": kwargs.get("current_gait"),
             "in_transition": kwargs.get("in_transition"),
+            "dynamic_obstacle_positions": kwargs.get("dynamic_obstacle_positions"),
+            "dynamic_obstacle_active": kwargs.get("dynamic_obstacle_active"),
+            "dynamic_obstacle_radii": kwargs.get("dynamic_obstacle_radii"),
         }
         current_seq = int(self._shared_state.get("seq", 0)) + 1
         self._shared_state["payload"] = payload
@@ -487,12 +490,12 @@ def _init_worker_objects(mj_model, rl_policy, rl_config):
     if task_name != "QuadRLTask":
         raise ValueError(f"Unsupported task name: {task_name}")
 
-    from .quad.task import QuadRLTask, QuadRLTaskParams
+    from .quad.task import QuadRLTask
     from .quad.mimps import QuadMIMPSPlanner
 
     task = QuadRLTask(mj_model, rl_policy_jax, rl_config)
     task.data = mjx.make_data(task.mj_model, impl="warp", nconmax=20000, njmax=1000)
-    task_params = QuadRLTaskParams()
+    task_params = task.make_task_params()
 
     planner = QuadMIMPSPlanner(
         task=task,
@@ -631,4 +634,3 @@ def _safety_worker_main(
     except Exception as e:
         tb = traceback.format_exc()
         shared_result["error"] = f"{e}\n{tb}"
-

@@ -1,6 +1,7 @@
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from state_manager.estimators import VelocityEstimator
@@ -545,4 +546,48 @@ def object_state_handler(
         "object/ang_vel_w": ang_vel_w,
         "object/lin_vel_b": lin_vel_b,
         "object/ang_vel_b": ang_vel_b,
+    }
+
+
+def dynamic_obstacle_state_handler(
+    msg: Dict[str, Any], logger: Optional[logging.Logger] = None, device: Optional[torch.device] = None
+) -> Dict[str, torch.Tensor]:
+    """Extract a dynamic obstacle snapshot from Float32MultiArray."""
+    if device is None:
+        device = torch.device("cuda:0")
+
+    data = np.asarray(msg.get("data", []), dtype=np.float32)
+    layout = msg.get("layout")
+    dims = getattr(layout, "dim", []) if layout is not None else []
+
+    rows = 0
+    cols = 8
+    if len(dims) >= 2:
+        rows = int(getattr(dims[0], "size", 0))
+        cols = int(getattr(dims[1], "size", cols))
+    elif data.size > 0:
+        rows = int(data.size // cols)
+
+    if rows <= 0:
+        snapshot = np.zeros((0, cols), dtype=np.float32)
+    else:
+        expected_size = rows * cols
+        if data.size < expected_size:
+            padded = np.zeros(expected_size, dtype=np.float32)
+            padded[: data.size] = data
+            data = padded
+        elif data.size > expected_size:
+            data = data[:expected_size]
+        snapshot = data.reshape(rows, cols)
+
+    positions = torch.as_tensor(snapshot[:, 0:3], dtype=torch.float32, device=device)
+    velocities = torch.as_tensor(snapshot[:, 3:6], dtype=torch.float32, device=device)
+    radii = torch.as_tensor(snapshot[:, 6], dtype=torch.float32, device=device)
+    active = torch.as_tensor(snapshot[:, 7] > 0.5, dtype=torch.bool, device=device)
+
+    return {
+        "dynamic_obstacles/positions": positions,
+        "dynamic_obstacles/velocities": velocities,
+        "dynamic_obstacles/radii": radii,
+        "dynamic_obstacles/active": active,
     }

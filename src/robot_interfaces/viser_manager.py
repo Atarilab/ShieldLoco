@@ -373,6 +373,9 @@ class ViserManager:
         max_horizon = self.state.opt_contact_horizon_length
         for foot_idx, foot_name in enumerate(foot_order):
             marker_list = sorted(foot_to_markers[foot_name], key=lambda x: x[0])
+            # Skip the first foothold marker: it typically sits under the robot
+            # and reads like a fake "ball" in Viser when the qpos ghost is also enabled.
+            marker_list = marker_list[1:]
             for step, (_, pos) in enumerate(marker_list[:max_horizon]):
                 handle_id = foot_idx * max_horizon + step
                 positions[handle_id] = pos
@@ -489,7 +492,10 @@ class ViserManager:
         if geom_name == "floor":
             return False
 
-        excluded_prefixes = ("obstacle_", "destination_", "finish_")
+        # The qpos ghost comes from the planner model, which does not include the
+        # sim-only projectile balls. Rendering ball geoms from the sim model here
+        # creates bogus ghost balls at the origin.
+        excluded_prefixes = ("obstacle_", "destination_", "finish_", "ball_")
         if any(geom_name.startswith(prefix) for prefix in excluded_prefixes):
             return False
 
@@ -694,12 +700,14 @@ class ViserManager:
         body_poses = {}
         max_nq = int(self.mj_model.nq)
         tracked_ids = list(self.state.qpos_ghost_body_ids)
+        with self.locker:
+            base_qpos = np.asarray(self.mj_data.qpos, dtype=np.float64).copy()
 
         for step_idx, qpos in enumerate(qpos_steps):
             step_qpos = np.asarray(qpos, dtype=np.float64).reshape(-1)
             nq = min(max_nq, step_qpos.shape[0])
 
-            self.state.ghost_mj_data.qpos[:] = 0.0
+            self.state.ghost_mj_data.qpos[:] = base_qpos
             self.state.ghost_mj_data.qpos[:nq] = step_qpos[:nq]
             mujoco.mj_forward(self.mj_model, self.state.ghost_mj_data)
 

@@ -11,6 +11,7 @@ from controllers.rl_controller_base import RLControllerBase
 from state_manager.obs_manager import ObsTerm
 
 from utils.frequency_tracker import FrequencyTracker
+from utils.dynamic_obstacle_tracker import DynamicObstacleTracker
 
 from safety_filter.safety_manager import SafetyManager
 
@@ -85,6 +86,18 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.apply_mpc_contact_plan = configs["controller_config"].get("apply_mpc_contact_plan", True)
         self.reference_generation_id = 0
         self.reference_step_seq = 0
+        self.max_dynamic_obstacles = int(configs["controller_config"].get("max_dynamic_obstacles", 0))
+        self.dynamic_obstacle_tracker = DynamicObstacleTracker(
+            max_obstacles=self.max_dynamic_obstacles,
+            horizon=self.horizon_length,
+            rollout_dt=self.command_duration,
+            ball_radius=float(configs["controller_config"].get("ball_radius", 0.05)),
+        )
+        self.dynamic_obstacle_positions_w = np.zeros(
+            (self.max_dynamic_obstacles, self.horizon_length, 3), dtype=np.float32
+        )
+        self.dynamic_obstacle_active = np.zeros(self.max_dynamic_obstacles, dtype=bool)
+        self.dynamic_obstacle_radii = np.zeros(self.max_dynamic_obstacles, dtype=np.float32)
 
         # Heading command for feet positions
         self.heading_command = 0.0  # Default heading (in radians)
@@ -403,6 +416,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.safety_manager.set_logger(self.logger)
 
         self.safety_manager.start()
+        self._clear_dynamic_obstacle_predictions()
 
         # TODO: see what can be done here
         # # update when manager starts running
@@ -457,6 +471,8 @@ class RLQuadrupedMPSController(RLControllerBase):
                     # # self._update_desired_ee_positions()
                     # self._update_action_scale()
 
+            self._update_dynamic_obstacle_predictions(state, current_time)
+
             # update state
             if self.safety_manager.is_running():
                 safety_gait_id = {
@@ -481,6 +497,9 @@ class RLQuadrupedMPSController(RLControllerBase):
                     contact_plan=self.current_contact_plan.detach().cpu().numpy(),
                     current_gait=safety_gait_id,
                     in_transition=self.in_transition,
+                    dynamic_obstacle_positions=self.dynamic_obstacle_positions_w,
+                    dynamic_obstacle_active=self.dynamic_obstacle_active,
+                    dynamic_obstacle_radii=self.dynamic_obstacle_radii,
                 )
 
                 plan_info = self.safety_manager.get_latest_plan_info()
@@ -576,6 +595,60 @@ class RLQuadrupedMPSController(RLControllerBase):
                 for i in range(self.robot.num_joints)
             }
             return self.cmd
+
+    def _clear_dynamic_obstacle_predictions(self):
+        self.dynamic_obstacle_positions_w.fill(0.0)
+        self.dynamic_obstacle_active.fill(False)
+        self.dynamic_obstacle_radii.fill(0.0)
+
+    def _update_dynamic_obstacle_predictions(self, state: Dict[str, Any], current_time: float):
+        if self.max_dynamic_obstacles <= 0:
+            return
+
+        positions = state.get("dynamic_obstacles/positions")
+        velocities = state.get("dynamic_obstacles/velocities")
+        radii = state.get("dynamic_obstacles/radii")
+        active = state.get("dynamic_obstacles/active")
+
+        if positions is None or velocities is None or radii is None or active is None:
+            self.dynamic_obstacle_tracker.update_from_observations({}, current_time=current_time)
+            self._clear_dynamic_obstacle_predictions()
+            return
+
+        positions_np = np.asarray(positions.detach().cpu(), dtype=np.float32)
+        velocities_np = np.asarray(velocities.detach().cpu(), dtype=np.float32)
+        radii_np = np.asarray(radii.detach().cpu(), dtype=np.float32)
+        active_np = np.asarray(active.detach().cpu(), dtype=bool)
+
+        num_obstacles = min(len(positions_np), self.max_dynamic_obstacles)
+        obs_positions = np.zeros((self.max_dynamic_obstacles, 3), dtype=np.float32)
+        obs_velocities = np.zeros((self.max_dynamic_obstacles, 3), dtype=np.float32)
+        obs_radii = np.zeros((self.max_dynamic_obstacles,), dtype=np.float32)
+        obs_active = np.zeros((self.max_dynamic_obstacles,), dtype=bool)
+
+        if num_obstacles > 0:
+            obs_positions[:num_obstacles] = positions_np[:num_obstacles]
+            obs_velocities[:num_obstacles] = velocities_np[:num_obstacles]
+            obs_radii[:num_obstacles] = radii_np[:num_obstacles]
+            obs_active[:num_obstacles] = active_np[:num_obstacles]
+
+        self.dynamic_obstacle_tracker.rollout_dt = self.command_duration
+        self.dynamic_obstacle_tracker.update_from_observations(
+            {
+                "positions": obs_positions,
+                "velocities": obs_velocities,
+                "radii": obs_radii,
+                "active": obs_active,
+            },
+            current_time=current_time,
+        )
+
+        predicted_positions, predicted_active, predicted_radii = self.dynamic_obstacle_tracker.get_predicted_positions(
+            current_time=current_time
+        )
+        self.dynamic_obstacle_positions_w = predicted_positions.astype(np.float32, copy=False)
+        self.dynamic_obstacle_active = predicted_active.astype(bool, copy=False)
+        self.dynamic_obstacle_radii = predicted_radii.astype(np.float32, copy=False)
 
     def _resample_commands(self):
         """Resample the commands for the controller with thread safety."""
@@ -1592,4 +1665,3 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.foot_forces_pub.publish(msg)
         except Exception as e:
             self.logger.error(f"Failed to publish foot forces: {e}")
-

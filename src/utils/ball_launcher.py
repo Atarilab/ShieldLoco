@@ -21,9 +21,11 @@ import numpy as np
 class BallSlot:
     """State for a single pre-allocated ball body."""
     body_id: int  # MuJoCo body id
+    geom_id: int  # MuJoCo geom id for contact filtering
     qpos_adr: int  # Start index into mj_data.qpos for freejoint (7 DOFs: pos + quat)
     qvel_adr: int  # Start index into mj_data.qvel for freejoint (6 DOFs: lin + ang)
     active: bool = False
+    avoidance_active: bool = False
     launch_time: float = 0.0
     landed_time: Optional[float] = None
     p0: np.ndarray = field(default_factory=lambda: np.zeros(3))
@@ -44,6 +46,7 @@ class BallLauncher:
         launch_speed_range: tuple = (2.0, 4.0),
         ball_lifetime: float = 3.0,
         ground_z_threshold: float = 0.1,
+        base_body_name: str = "base_link",
     ):
         self.max_balls = max_balls
         self.ball_radius = ball_radius
@@ -56,16 +59,19 @@ class BallLauncher:
 
         # Resolve ball body/joint IDs from the model
         self.slots: List[BallSlot] = []
+        self._ball_geom_to_slot_idx = {}
         for i in range(max_balls):
             body_name = f"ball_{i}"
             joint_name = f"ball_joint_{i}"
+            geom_name = f"ball_geom_{i}"
 
             body_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
             joint_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+            geom_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
 
-            if body_id < 0 or joint_id < 0:
+            if body_id < 0 or joint_id < 0 or geom_id < 0:
                 raise ValueError(
-                    f"Ball body/joint '{body_name}'/'{joint_name}' not found in model. "
+                    f"Ball body/joint/geom '{body_name}'/'{joint_name}'/'{geom_name}' not found in model. "
                     "Ensure obstacles.xml has the pre-allocated ball bodies."
                 )
 
@@ -74,10 +80,22 @@ class BallLauncher:
 
             self.slots.append(BallSlot(
                 body_id=body_id,
+                geom_id=geom_id,
                 qpos_adr=qpos_adr,
                 qvel_adr=qvel_adr,
                 radius=ball_radius,
             ))
+            self._ball_geom_to_slot_idx[geom_id] = i
+
+        base_body_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, base_body_name)
+        if base_body_id < 0:
+            raise ValueError(f"Base body '{base_body_name}' not found in model.")
+
+        self._robot_geom_ids = set()
+        for geom_id in range(mj_model.ngeom):
+            body_id = int(mj_model.geom_bodyid[geom_id])
+            if int(mj_model.body_rootid[body_id]) == int(base_body_id):
+                self._robot_geom_ids.add(int(geom_id))
 
     def launch(self, robot_pos: np.ndarray, mj_data: mujoco.MjData) -> Optional[int]:
         """Launch a ball toward the robot's current position.
@@ -141,6 +159,7 @@ class BallLauncher:
         slot.launch_time = time.time()
         slot.landed_time = None
         slot.active = True
+        slot.avoidance_active = True
 
         # Freejoint qpos: [x, y, z, qw, qx, qy, qz]
         mj_data.qpos[qa:qa + 3] = launch_pos
@@ -162,6 +181,8 @@ class BallLauncher:
             mj_data: Current MuJoCo data.
             current_time: Current wall-clock time (time.time()).
         """
+        self._disable_avoidance_on_robot_contact(mj_data)
+
         for slot in self.slots:
             if not slot.active:
                 continue
@@ -172,6 +193,7 @@ class BallLauncher:
             # Detect landing: ball is near ground level
             if ball_z < self.ground_z_threshold and slot.landed_time is None:
                 slot.landed_time = current_time
+                slot.avoidance_active = False
 
             # Auto-deactivate after ball_lifetime seconds on the ground
             if slot.landed_time is not None:
@@ -193,8 +215,49 @@ class BallLauncher:
                 "launch_time": slot.launch_time,
                 "radius": slot.radius,
                 "active": slot.active,
+                "avoidance_active": slot.avoidance_active,
             })
         return states
+
+    def get_obstacle_snapshot(self, mj_data: mujoco.MjData) -> np.ndarray:
+        """Return live obstacle state as a fixed-size snapshot tensor.
+
+        Each row is:
+            [px, py, pz, vx, vy, vz, radius, active]
+
+        Inactive slots are zero-filled except for radius, which is retained.
+        """
+        snapshot = np.zeros((self.max_balls, 8), dtype=np.float32)
+
+        for i, slot in enumerate(self.slots):
+            snapshot[i, 6] = float(slot.radius)
+            if not slot.active:
+                continue
+
+            qa = slot.qpos_adr
+            va = slot.qvel_adr
+            snapshot[i, 0:3] = mj_data.qpos[qa : qa + 3]
+            snapshot[i, 3:6] = mj_data.qvel[va : va + 3]
+            snapshot[i, 7] = 1.0 if slot.avoidance_active else 0.0
+
+        return snapshot
+
+    def _disable_avoidance_on_robot_contact(self, mj_data: mujoco.MjData):
+        for i in range(int(mj_data.ncon)):
+            contact = mj_data.contact[i]
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+
+            slot_idx = self._ball_geom_to_slot_idx.get(geom1)
+            other_geom = geom2
+            if slot_idx is None:
+                slot_idx = self._ball_geom_to_slot_idx.get(geom2)
+                other_geom = geom1
+
+            if slot_idx is None or other_geom not in self._robot_geom_ids:
+                continue
+
+            self.slots[slot_idx].avoidance_active = False
 
     def _deactivate_slot(self, slot: BallSlot, mj_data: mujoco.MjData):
         """Move a ball back underground and mark inactive."""
@@ -206,4 +269,5 @@ class BallLauncher:
         mj_data.qvel[va:va + 6] = 0.0
 
         slot.active = False
+        slot.avoidance_active = False
         slot.landed_time = None

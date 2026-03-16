@@ -6,17 +6,18 @@ The planner receives a fixed-size (max_obstacles, H, 3) tensor and evaluates
 cost — it never does any physics or prediction.
 
 Two update paths (same output format):
-  - update_from_sim(ball_launcher): reads BallLauncher state, uses ballistic eq
+  - update_from_sim(ball_launcher, mj_data): reads live sim state
   - update_from_mocap(observations): accepts observed positions+velocities from
     motion capture, fits trajectory (stub for hardware implementation)
 """
 
 import time
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
-from utils.ball_launcher import BallLauncher
+if TYPE_CHECKING:
+    from utils.ball_launcher import BallLauncher
 
 
 class DynamicObstacleTracker:
@@ -48,28 +49,74 @@ class DynamicObstacleTracker:
         self.rollout_dt = rollout_dt
         self.default_radius = ball_radius
 
-        # Internal state: per-obstacle launch params (for sim / ballistic model)
-        self._p0 = np.zeros((max_obstacles, 3))
-        self._v0 = np.zeros((max_obstacles, 3))
-        self._launch_time = np.zeros(max_obstacles)
+        # Internal state: current observed obstacle state.
+        self._position = np.zeros((max_obstacles, 3), dtype=np.float32)
+        self._velocity = np.zeros((max_obstacles, 3), dtype=np.float32)
+        self._observed_time = np.zeros(max_obstacles, dtype=np.float32)
         self._active = np.zeros(max_obstacles, dtype=bool)
-        self._radius = np.full(max_obstacles, ball_radius)
+        self._radius = np.full(max_obstacles, ball_radius, dtype=np.float32)
 
-    def update_from_sim(self, ball_launcher: BallLauncher):
-        """Sync internal state from BallLauncher (sim path).
+    def update_from_sim(
+        self,
+        ball_launcher: "BallLauncher",
+        mj_data,
+        current_time: Optional[float] = None,
+    ):
+        """Sync internal state from live sim state.
 
         Args:
             ball_launcher: The sim's BallLauncher instance.
+            mj_data: Live MuJoCo data holding the current ball state.
         """
-        states = ball_launcher.get_active_ball_states()
-        for i, s in enumerate(states):
-            if i >= self.max_obstacles:
-                break
-            self._p0[i] = s["p0"]
-            self._v0[i] = s["v0"]
-            self._launch_time[i] = s["launch_time"]
-            self._active[i] = s["active"]
-            self._radius[i] = s["radius"]
+        snapshot = ball_launcher.get_obstacle_snapshot(mj_data)
+        self.update_from_observations(
+            {
+                "positions": snapshot[:, 0:3],
+                "velocities": snapshot[:, 3:6],
+                "radii": snapshot[:, 6],
+                "active": snapshot[:, 7] > 0.5,
+            },
+            current_time=current_time,
+        )
+
+    def update_from_observations(
+        self,
+        observations: dict,
+        current_time: Optional[float] = None,
+    ):
+        """Update tracker from observed obstacle position and velocity."""
+        if current_time is None:
+            current_time = time.time()
+
+        positions = np.asarray(observations.get("positions", []), dtype=np.float32)
+        velocities = np.asarray(observations.get("velocities", []), dtype=np.float32)
+        radii = np.asarray(observations.get("radii", []), dtype=np.float32)
+        active = np.asarray(observations.get("active", []), dtype=bool)
+
+        self._position.fill(0.0)
+        self._velocity.fill(0.0)
+        self._observed_time.fill(0.0)
+        self._active[:] = False
+        self._radius.fill(self.default_radius)
+
+        num_obstacles = min(len(positions), self.max_obstacles)
+        if num_obstacles <= 0:
+            return
+
+        for i in range(num_obstacles):
+            radius = (
+                float(radii[i])
+                if radii.ndim > 0 and i < len(radii)
+                else float(self.default_radius)
+            )
+            self._radius[i] = radius
+            if not active[i]:
+                continue
+
+            self._position[i] = positions[i]
+            self._velocity[i] = velocities[i]
+            self._observed_time[i] = float(current_time)
+            self._active[i] = True
 
     def update_from_mocap(self, observations: dict):
         """Update from motion capture observations (hardware path).
@@ -86,57 +133,46 @@ class DynamicObstacleTracker:
         ballistic prediction from that point forward (constant gravity,
         no drag). A Kalman filter or polynomial fit could improve this.
         """
-        n = min(len(observations.get("positions", [])), self.max_obstacles)
-
-        # Reset all slots
-        self._active[:] = False
-
-        for i in range(n):
-            if not observations["active"][i]:
-                continue
-            self._p0[i] = observations["positions"][i]
-            self._v0[i] = observations["velocities"][i]
-            self._launch_time[i] = time.time()  # treat "now" as launch time
-            self._active[i] = True
-            if "radii" in observations:
-                self._radius[i] = observations["radii"][i]
+        self.update_from_observations(observations, current_time=time.time())
 
     def get_predicted_positions(
-        self, current_time: float
+        self,
+        current_time: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute predicted obstacle positions at each rollout timestep.
 
         For each active obstacle, predicts position at:
-            t_i = current_time + i * rollout_dt,  for i in 0..horizon-1
+            t_i = current_time + (i + 1) * rollout_dt,  for i in 0..horizon-1
 
         Uses ballistic equation:
-            p(t) = p0 + v0 * dt + 0.5 * g * dt^2
-        where dt = t_i - launch_time.
+            p(t) = p_obs + v_obs * dt + 0.5 * g * dt^2
+        where dt is measured from the latest observation time.
 
         Inactive obstacles get zero positions (masked out by active flags).
 
         Args:
-            current_time: Current wall-clock time (same clock as launch_time).
+            current_time: Current wall-clock time (same clock as observation time).
 
         Returns:
             positions: (max_obstacles, horizon, 3) predicted positions
             active: (max_obstacles,) boolean mask
             radii: (max_obstacles,) ball radii
         """
-        positions = np.zeros((self.max_obstacles, self.horizon, 3))
+        if current_time is None:
+            current_time = time.time()
+
+        positions = np.zeros((self.max_obstacles, self.horizon, 3), dtype=np.float32)
 
         for i in range(self.max_obstacles):
             if not self._active[i]:
                 continue
 
+            lag = max(float(current_time) - float(self._observed_time[i]), 0.0)
             for h in range(self.horizon):
-                t = current_time + h * self.rollout_dt
-                dt = t - self._launch_time[i]
-                if dt < 0:
-                    dt = 0.0
+                dt = lag + (h + 1) * self.rollout_dt
 
                 # Ballistic trajectory: p(t) = p0 + v0*dt + 0.5*g*dt^2
-                pos = self._p0[i] + self._v0[i] * dt + 0.5 * self.GRAVITY * dt**2
+                pos = self._position[i] + self._velocity[i] * dt + 0.5 * self.GRAVITY * dt**2
 
                 # Clamp to ground (ball doesn't go underground)
                 pos[2] = max(pos[2], self._radius[i])

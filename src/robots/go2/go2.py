@@ -14,12 +14,20 @@ from controllers.stand_controller import (
     Go2StayDownController,
 )
 from robots.robot_base import RobotBase
-from state_manager.msg_handlers import go2_low_state_handler, sport_mode_state_handler, vicon_handler
+from state_manager.msg_handlers import (
+    dynamic_obstacle_state_handler,
+    go2_low_state_handler,
+    sport_mode_state_handler,
+    vicon_handler,
+)
 from state_manager.state_manager import DDSStateSubscriber, ROS2StateSubscriber
 from utils.joint_mapping import JointMappingInterface
 
 if TYPE_CHECKING:
     from controllers.controller_base import ControllerBase
+
+
+DYNAMIC_OBSTACLE_TOPIC = "/dynamic_obstacles"
 
 
 class Go2(RobotBase):
@@ -332,6 +340,7 @@ class Go2(RobotBase):
         _subscribers["low_state"] = dds_low_state_sub
 
         if "sim" in self.task:
+            from std_msgs.msg import Float32MultiArray
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 
             dds_sportsmode_state_sub = DDSStateSubscriber(
@@ -342,6 +351,17 @@ class Go2(RobotBase):
                 logger=self.logger,
             )
             _subscribers["sports_mode_state"] = dds_sportsmode_state_sub
+
+            if "mps" in self.task:
+                dynamic_obstacle_sub = ROS2StateSubscriber(
+                    topic=DYNAMIC_OBSTACLE_TOPIC,
+                    node_name="dynamic_obstacle_state",
+                    msg_type=Float32MultiArray,
+                    handler_func=dynamic_obstacle_state_handler,
+                    handler_args={"device": self.device} if self.device else {},
+                    logger=self.logger,
+                )
+                _subscribers["dynamic_obstacles"] = dynamic_obstacle_sub
         else:
             from vicon_receiver.msg import Position
 

@@ -50,6 +50,9 @@ class QuadRLTaskParams(TaskParams):
     in_transition: bool = False
     lowlevel_step_counter: int = 0
     last_q_des: jax.Array = jnp.zeros(12)
+    dynamic_obstacle_positions: jax.Array = jnp.zeros((0, 0, 3))
+    dynamic_obstacle_radii: jax.Array = jnp.zeros((0,))
+    dynamic_obstacle_active: jax.Array = jnp.zeros((0,), dtype=jnp.bool_)
 
 
 class PhysicsMetaData:
@@ -177,6 +180,9 @@ class QuadRLTask(Task):
         self.obstacle_clearance = float(rl_config.get("obstacle_clearance", 0.05))
         self.obstacle_cost_weight = float(rl_config.get("obstacle_cost_weight", 100.0))
         self.obstacle_cost_scale = float(rl_config.get("obstacle_cost_scale", 0.3))
+        self.max_dynamic_obstacles = int(rl_config.get("max_dynamic_obstacles", 0))
+        self.dynamic_obstacle_cost_weight = float(rl_config.get("dynamic_obs_cost_weight", 0.0))
+        self.dynamic_obstacle_cost_scale = float(rl_config.get("dynamic_obs_cost_scale", 0.15))
 
         # We optimize around absolute reference contact locations in normalized space.
         # Keep planner bounds unbounded to avoid saturating valid world-frame references.
@@ -295,6 +301,22 @@ class QuadRLTask(Task):
 
         self.robot_radius = float(rl_config.get("robot_radius", 0.3))
 
+    def make_task_params(self) -> QuadRLTaskParams:
+        return QuadRLTaskParams(
+            dynamic_obstacle_positions=jnp.zeros(
+                (self.max_dynamic_obstacles, self.horizon_length, 3),
+                dtype=jnp.float32,
+            ),
+            dynamic_obstacle_radii=jnp.zeros(
+                (self.max_dynamic_obstacles,),
+                dtype=jnp.float32,
+            ),
+            dynamic_obstacle_active=jnp.zeros(
+                (self.max_dynamic_obstacles,),
+                dtype=jnp.bool_,
+            ),
+        )
+
     def normalize(self, plan: jax.Array) -> jax.Array:
         """Normalize plan values by plan_lim without saturating absolute references."""
         return plan / self.plan_lim
@@ -341,6 +363,9 @@ class QuadRLTask(Task):
         goal_idx = kwargs.get("goal_idx")
         goal_completion_counter = kwargs.get("goal_completion_counter")
         contact_plan = kwargs.get("contact_plan")
+        dynamic_obstacle_positions = kwargs.get("dynamic_obstacle_positions")
+        dynamic_obstacle_active = kwargs.get("dynamic_obstacle_active")
+        dynamic_obstacle_radii = kwargs.get("dynamic_obstacle_radii")
 
         gait = jnp.asarray(current_gait, dtype=jnp.int32)
         synced_goal_idx = jnp.asarray(
@@ -365,6 +390,22 @@ class QuadRLTask(Task):
         else:
             primed_contact_plan = jnp.asarray(contact_plan, dtype=jnp.float32).reshape(-1)
 
+        synced_dynamic_positions = (
+            task_params.dynamic_obstacle_positions
+            if dynamic_obstacle_positions is None
+            else jnp.asarray(dynamic_obstacle_positions, dtype=jnp.float32)
+        )
+        synced_dynamic_active = (
+            task_params.dynamic_obstacle_active
+            if dynamic_obstacle_active is None
+            else jnp.asarray(dynamic_obstacle_active, dtype=jnp.bool_)
+        )
+        synced_dynamic_radii = (
+            task_params.dynamic_obstacle_radii
+            if dynamic_obstacle_radii is None
+            else jnp.asarray(dynamic_obstacle_radii, dtype=jnp.float32)
+        )
+
         return update_params(
             task_params,
             goal_idx=synced_goal_idx,
@@ -374,6 +415,9 @@ class QuadRLTask(Task):
             in_transition=jnp.asarray(in_transition, dtype=jnp.bool_),
             lowlevel_step_counter=jnp.asarray(0, dtype=jnp.int32),
             last_q_des=task_params.last_q_des,
+            dynamic_obstacle_positions=synced_dynamic_positions,
+            dynamic_obstacle_active=synced_dynamic_active,
+            dynamic_obstacle_radii=synced_dynamic_radii,
         )
 
     def _build_contact_plan(
@@ -715,6 +759,62 @@ class QuadRLTask(Task):
 
         return body_contact_cost + foot_contact_cost + contact_center_cost
 
+    def _dynamic_obstacle_cost(
+        self, task_params: QuadRLTaskParams, state: mjx.Data, contact_locations_w: jax.Array
+    ) -> jax.Array:
+        if (
+            self.dynamic_obstacle_cost_weight <= 0.0
+            or task_params.dynamic_obstacle_positions.shape[0] == 0
+            or task_params.dynamic_obstacle_positions.shape[1] == 0
+        ):
+            return jnp.array(0.0, dtype=jnp.float32)
+
+        stage_idx = task_params.lowlevel_step_counter // self.rollout_decimation - 1
+        stage_idx = jnp.clip(stage_idx, 0, task_params.dynamic_obstacle_positions.shape[1] - 1)
+
+        obstacle_centers = task_params.dynamic_obstacle_positions[:, stage_idx, :]
+        obstacle_radii = task_params.dynamic_obstacle_radii
+        obstacle_active = task_params.dynamic_obstacle_active.astype(jnp.float32)
+
+        body_pos = state.xpos[self.base_body_id]
+        contact_points = contact_locations_w.reshape(-1, 3)
+        contact_centers = jnp.mean(contact_locations_w, axis=0)
+
+        scale = self.dynamic_obstacle_cost_scale
+        _EXP_MAX = 20.0
+
+        body_dist = jnp.linalg.norm(body_pos[None, :] - obstacle_centers, axis=-1)
+        body_clearance = body_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
+        body_cost = self.dynamic_obstacle_cost_weight * jnp.sum(
+            obstacle_active * jnp.exp(jnp.clip(-body_clearance / scale, a_max=_EXP_MAX))
+        )
+
+        foot_dist = jnp.linalg.norm(
+            contact_points[:, None, :] - obstacle_centers[None, :, :],
+            axis=-1,
+        )
+        foot_clearance = foot_dist - obstacle_radii[None, :] - self.obstacle_clearance
+        foot_cost = self.dynamic_obstacle_cost_weight * jnp.sum(
+            obstacle_active[None, :] * jnp.exp(jnp.clip(-foot_clearance / scale, a_max=_EXP_MAX))
+        )
+
+        contact_center_dist = jnp.linalg.norm(
+            contact_centers[:, None, :] - obstacle_centers[None, :, :],
+            axis=-1,
+        )
+        contact_center_clearance = (
+            contact_center_dist
+            - obstacle_radii[None, :]
+            - self.robot_radius
+            - self.obstacle_clearance
+        )
+        contact_center_cost = self.dynamic_obstacle_cost_weight * jnp.sum(
+            obstacle_active[None, :]
+            * jnp.exp(jnp.clip(-contact_center_clearance / scale, a_max=_EXP_MAX))
+        )
+
+        return body_cost + foot_cost + contact_center_cost
+
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data
     ) -> jax.Array:
@@ -736,7 +836,10 @@ class QuadRLTask(Task):
         contact_locations_w = self.plan_seg_to_contact_locations(
             self.denormalize(plan_segment)
         )
-        obstacle_cost = self._contact_obstacle_cost(
+        static_obstacle_cost = self._contact_obstacle_cost(
             task_params, state, contact_locations_w
         )
-        return tracking_cost + obstacle_cost
+        dynamic_obstacle_cost = self._dynamic_obstacle_cost(
+            task_params, state, contact_locations_w
+        )
+        return tracking_cost + static_obstacle_cost + dynamic_obstacle_cost

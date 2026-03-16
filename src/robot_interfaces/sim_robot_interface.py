@@ -7,6 +7,8 @@ import time
 import mujoco
 import mujoco.viewer
 import numpy as np
+import rclpy
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from robot_interfaces.viser_manager import ViserManager
@@ -14,10 +16,16 @@ from utils.ball_launcher import BallLauncher
 from utils.unitree_sdk2py_bridge import UnitreeSdk2Bridge
 
 
+DYNAMIC_OBSTACLE_TOPIC = "/dynamic_obstacles"
+
+
 class SimRobotInterface:
     def __init__(self, config, headless=False):
         self.stop_event = threading.Event()
         self.reset_requested = threading.Event()
+        self._rclpy_initialized_here = False
+        self.dynamic_obstacle_node = None
+        self.dynamic_obstacle_pub = None
 
         self.robot_name = config["ROBOT"]
         self.robot_scene = os.path.join(os.getcwd(), "robots", self.robot_name, config["SCENE"])
@@ -89,8 +97,10 @@ class SimRobotInterface:
             launch_height_range=(2.0, 3.0),
             launch_speed_range=(2.0, 4.0),
             ball_lifetime=3.0,
+            base_body_name=self.base_link_name,
         )
         self.viser_manager.set_ball_launcher(self.ball_launcher, self.base_body_id)
+        self._init_dynamic_obstacle_publisher()
 
         # Start threads
         self.viewer_thread = Thread(target=self._physics_viewer_thread)
@@ -131,6 +141,7 @@ class SimRobotInterface:
 
                 # Tick ball launcher to auto-deactivate grounded balls
                 self.ball_launcher.tick(self.mj_data, time.time())
+                self._publish_dynamic_obstacles()
 
             time_until_next_step = self.mj_model.opt.timestep - (time.perf_counter() - step_start)
             if time_until_next_step > 0:
@@ -165,6 +176,35 @@ class SimRobotInterface:
     def request_reset(self):
         """Request a simulation reset on the simulation thread."""
         self.reset_requested.set()
+
+    def _init_dynamic_obstacle_publisher(self):
+        if not rclpy.ok():
+            rclpy.init(args=None)
+            self._rclpy_initialized_here = True
+
+        self.dynamic_obstacle_node = rclpy.create_node("sim_dynamic_obstacle_publisher")
+        self.dynamic_obstacle_pub = self.dynamic_obstacle_node.create_publisher(
+            Float32MultiArray,
+            DYNAMIC_OBSTACLE_TOPIC,
+            1,
+        )
+
+    def _publish_dynamic_obstacles(self):
+        if self.dynamic_obstacle_pub is None:
+            return
+
+        snapshot = self.ball_launcher.get_obstacle_snapshot(self.mj_data)
+
+        msg = Float32MultiArray()
+        msg.layout.dim = [MultiArrayDimension(), MultiArrayDimension()]
+        msg.layout.dim[0].label = "obstacle"
+        msg.layout.dim[0].size = int(snapshot.shape[0])
+        msg.layout.dim[0].stride = int(snapshot.size)
+        msg.layout.dim[1].label = "state"
+        msg.layout.dim[1].size = int(snapshot.shape[1])
+        msg.layout.dim[1].stride = int(snapshot.shape[1])
+        msg.data = snapshot.reshape(-1).tolist()
+        self.dynamic_obstacle_pub.publish(msg)
 
     def _apply_fixed_base_pose(self):
         """Apply fixed base pose constraints if configured."""
@@ -211,6 +251,20 @@ class SimRobotInterface:
 
         if self.viewer is not None and self.viewer.is_running():
             self.viewer.close()
+
+        if self.dynamic_obstacle_node is not None:
+            try:
+                self.dynamic_obstacle_node.destroy_node()
+            except Exception:
+                pass
+            self.dynamic_obstacle_node = None
+            self.dynamic_obstacle_pub = None
+
+        if self._rclpy_initialized_here and rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
         self.viser_manager.stop()
 
