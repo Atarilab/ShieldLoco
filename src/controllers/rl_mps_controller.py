@@ -89,15 +89,15 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.max_dynamic_obstacles = int(configs["controller_config"].get("max_dynamic_obstacles", 0))
         self.dynamic_obstacle_tracker = DynamicObstacleTracker(
             max_obstacles=self.max_dynamic_obstacles,
-            horizon=self.horizon_length,
-            rollout_dt=self.command_duration,
             ball_radius=float(configs["controller_config"].get("ball_radius", 0.05)),
         )
-        self.dynamic_obstacle_positions_w = np.zeros(
-            (self.max_dynamic_obstacles, self.horizon_length, 3), dtype=np.float32
-        )
-        self.dynamic_obstacle_active = np.zeros(self.max_dynamic_obstacles, dtype=bool)
-        self.dynamic_obstacle_radii = np.zeros(self.max_dynamic_obstacles, dtype=np.float32)
+        n = self.max_dynamic_obstacles
+        self.dynamic_obstacle_p0 = np.zeros((n, 3), dtype=np.float32)
+        self.dynamic_obstacle_v0 = np.zeros((n, 3), dtype=np.float32)
+        self.dynamic_obstacle_t0 = np.zeros(n, dtype=np.float32)
+        self.dynamic_obstacle_active = np.zeros(n, dtype=bool)
+        self.dynamic_obstacle_radii = np.zeros(n, dtype=np.float32)
+        self._prev_dynamic_obstacles_any_active = False
 
         # Heading command for feet positions
         self.heading_command = 0.0  # Default heading (in radians)
@@ -497,7 +497,9 @@ class RLQuadrupedMPSController(RLControllerBase):
                     contact_plan=self.current_contact_plan.detach().cpu().numpy(),
                     current_gait=safety_gait_id,
                     in_transition=self.in_transition,
-                    dynamic_obstacle_positions=self.dynamic_obstacle_positions_w,
+                    dynamic_obstacle_p0=self.dynamic_obstacle_p0,
+                    dynamic_obstacle_v0=self.dynamic_obstacle_v0,
+                    dynamic_obstacle_t0=self.dynamic_obstacle_t0,
                     dynamic_obstacle_active=self.dynamic_obstacle_active,
                     dynamic_obstacle_radii=self.dynamic_obstacle_radii,
                 )
@@ -597,7 +599,9 @@ class RLQuadrupedMPSController(RLControllerBase):
             return self.cmd
 
     def _clear_dynamic_obstacle_predictions(self):
-        self.dynamic_obstacle_positions_w.fill(0.0)
+        self.dynamic_obstacle_p0.fill(0.0)
+        self.dynamic_obstacle_v0.fill(0.0)
+        self.dynamic_obstacle_t0.fill(0.0)
         self.dynamic_obstacle_active.fill(False)
         self.dynamic_obstacle_radii.fill(0.0)
 
@@ -615,40 +619,49 @@ class RLQuadrupedMPSController(RLControllerBase):
             self._clear_dynamic_obstacle_predictions()
             return
 
-        positions_np = np.asarray(positions.detach().cpu(), dtype=np.float32)
-        velocities_np = np.asarray(velocities.detach().cpu(), dtype=np.float32)
-        radii_np = np.asarray(radii.detach().cpu(), dtype=np.float32)
-        active_np = np.asarray(active.detach().cpu(), dtype=bool)
+        n = self.max_dynamic_obstacles
+        obs = {
+            "positions":  np.zeros((n, 3), dtype=np.float32),
+            "velocities": np.zeros((n, 3), dtype=np.float32),
+            "radii":      np.zeros(n, dtype=np.float32),
+            "active":     np.zeros(n, dtype=bool),
+        }
+        k = min(len(positions), n)
+        if k > 0:
+            obs["positions"][:k]  = np.asarray(positions.detach().cpu(),  dtype=np.float32)[:k]
+            obs["velocities"][:k] = np.asarray(velocities.detach().cpu(), dtype=np.float32)[:k]
+            obs["radii"][:k]      = np.asarray(radii.detach().cpu(),      dtype=np.float32)[:k]
+            obs["active"][:k]     = np.asarray(active.detach().cpu(),     dtype=bool)[:k]
 
-        num_obstacles = min(len(positions_np), self.max_dynamic_obstacles)
-        obs_positions = np.zeros((self.max_dynamic_obstacles, 3), dtype=np.float32)
-        obs_velocities = np.zeros((self.max_dynamic_obstacles, 3), dtype=np.float32)
-        obs_radii = np.zeros((self.max_dynamic_obstacles,), dtype=np.float32)
-        obs_active = np.zeros((self.max_dynamic_obstacles,), dtype=bool)
+        self.dynamic_obstacle_tracker.update_from_observations(obs, current_time=current_time)
 
-        if num_obstacles > 0:
-            obs_positions[:num_obstacles] = positions_np[:num_obstacles]
-            obs_velocities[:num_obstacles] = velocities_np[:num_obstacles]
-            obs_radii[:num_obstacles] = radii_np[:num_obstacles]
-            obs_active[:num_obstacles] = active_np[:num_obstacles]
-
-        self.dynamic_obstacle_tracker.rollout_dt = self.command_duration
-        self.dynamic_obstacle_tracker.update_from_observations(
-            {
-                "positions": obs_positions,
-                "velocities": obs_velocities,
-                "radii": obs_radii,
-                "active": obs_active,
-            },
-            current_time=current_time,
-        )
-
-        predicted_positions, predicted_active, predicted_radii = self.dynamic_obstacle_tracker.get_predicted_positions(
+        p0, v0, t0, radii_out, active_out = self.dynamic_obstacle_tracker.get_obstacle_state(
             current_time=current_time
         )
-        self.dynamic_obstacle_positions_w = predicted_positions.astype(np.float32, copy=False)
-        self.dynamic_obstacle_active = predicted_active.astype(bool, copy=False)
-        self.dynamic_obstacle_radii = predicted_radii.astype(np.float32, copy=False)
+        self.dynamic_obstacle_p0     = p0
+        self.dynamic_obstacle_v0     = v0
+        self.dynamic_obstacle_t0     = t0
+        self.dynamic_obstacle_active = active_out
+        self.dynamic_obstacle_radii  = radii_out
+
+        any_active = bool(np.any(active_out))
+        if not self._prev_dynamic_obstacles_any_active and any_active:
+            # Ball just became active — log to confirm data is reaching the MPC.
+            active_indices = np.where(active_out)[0]
+            for i in active_indices:
+                if self.logger is not None:
+                    self.logger.info(
+                        f"Dynamic obstacle {i} activated: "
+                        f"p0={p0[i]}, v0={v0[i]}, r={radii_out[i]:.3f}"
+                    )
+        if self._prev_dynamic_obstacles_any_active and not any_active:
+            # Ball just deactivated — re-anchor reference to current robot position
+            # to prevent growing ee_pos_rel_b discrepancy causing RL policy overreaction.
+            if self.logger is not None:
+                self.logger.info("Dynamic obstacle deactivated — re-anchoring reference trajectory.")
+            with self._gait_lock:
+                self.generate_future_feet_positions()
+        self._prev_dynamic_obstacles_any_active = any_active
 
     def _resample_commands(self):
         """Resample the commands for the controller with thread safety."""

@@ -185,6 +185,12 @@ class BallLauncher:
 
         for slot in self.slots:
             if not slot.active:
+                # Re-clamp every tick so ground contact forces can't accelerate the ball.
+                qa = slot.qpos_adr
+                va = slot.qvel_adr
+                mj_data.qpos[qa:qa + 3] = [100, 0, 0.1]
+                mj_data.qpos[qa + 3:qa + 7] = [1.0, 0.0, 0.0, 0.0]
+                mj_data.qvel[va:va + 6] = 0.0
                 continue
 
             # Read current ball position from mj_data
@@ -264,7 +270,7 @@ class BallLauncher:
         qa = slot.qpos_adr
         va = slot.qvel_adr
 
-        mj_data.qpos[qa:qa + 3] = [0.0, 0.0, -10.0]
+        mj_data.qpos[qa:qa + 3] = [100, 0, 0.1]
         mj_data.qpos[qa + 3:qa + 7] = [1.0, 0.0, 0.0, 0.0]
         mj_data.qvel[va:va + 6] = 0.0
 

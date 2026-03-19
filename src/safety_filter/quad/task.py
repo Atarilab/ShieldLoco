@@ -50,7 +50,10 @@ class QuadRLTaskParams(TaskParams):
     in_transition: bool = False
     lowlevel_step_counter: int = 0
     last_q_des: jax.Array = jnp.zeros(12)
-    dynamic_obstacle_positions: jax.Array = jnp.zeros((0, 0, 3))
+    # Ball state at last observation: MPC computes p(t) = p0 + v0*(t0+t) + 0.5*g*(t0+t)^2
+    dynamic_obstacle_p0: jax.Array = jnp.zeros((0, 3))      # position at obs time
+    dynamic_obstacle_v0: jax.Array = jnp.zeros((0, 3))      # velocity at obs time
+    dynamic_obstacle_t0: jax.Array = jnp.zeros((0,))        # lag since obs (seconds)
     dynamic_obstacle_radii: jax.Array = jnp.zeros((0,))
     dynamic_obstacle_active: jax.Array = jnp.zeros((0,), dtype=jnp.bool_)
 
@@ -183,6 +186,10 @@ class QuadRLTask(Task):
         self.max_dynamic_obstacles = int(rl_config.get("max_dynamic_obstacles", 0))
         self.dynamic_obstacle_cost_weight = float(rl_config.get("dynamic_obs_cost_weight", 0.0))
         self.dynamic_obstacle_cost_scale = float(rl_config.get("dynamic_obs_cost_scale", 0.15))
+        self.mpc_latency_compensation = float(rl_config.get("mpc_latency_compensation", 0.0))
+        # DPCBF parabolic safety: safe iff d_perp > sqrt(2 * k * ||v|| * approach_dist) + r_safe
+        # k=0 disables heading cost; increase k to react earlier to fast approaching balls.
+        self.dpcbf_k = float(rl_config.get("dpcbf_k", 0.0))
 
         # We optimize around absolute reference contact locations in normalized space.
         # Keep planner bounds unbounded to avoid saturating valid world-frame references.
@@ -302,19 +309,13 @@ class QuadRLTask(Task):
         self.robot_radius = float(rl_config.get("robot_radius", 0.3))
 
     def make_task_params(self) -> QuadRLTaskParams:
+        n = self.max_dynamic_obstacles
         return QuadRLTaskParams(
-            dynamic_obstacle_positions=jnp.zeros(
-                (self.max_dynamic_obstacles, self.horizon_length, 3),
-                dtype=jnp.float32,
-            ),
-            dynamic_obstacle_radii=jnp.zeros(
-                (self.max_dynamic_obstacles,),
-                dtype=jnp.float32,
-            ),
-            dynamic_obstacle_active=jnp.zeros(
-                (self.max_dynamic_obstacles,),
-                dtype=jnp.bool_,
-            ),
+            dynamic_obstacle_p0=jnp.zeros((n, 3), dtype=jnp.float32),
+            dynamic_obstacle_v0=jnp.zeros((n, 3), dtype=jnp.float32),
+            dynamic_obstacle_t0=jnp.zeros((n,), dtype=jnp.float32),
+            dynamic_obstacle_radii=jnp.zeros((n,), dtype=jnp.float32),
+            dynamic_obstacle_active=jnp.zeros((n,), dtype=jnp.bool_),
         )
 
     def normalize(self, plan: jax.Array) -> jax.Array:
@@ -363,7 +364,9 @@ class QuadRLTask(Task):
         goal_idx = kwargs.get("goal_idx")
         goal_completion_counter = kwargs.get("goal_completion_counter")
         contact_plan = kwargs.get("contact_plan")
-        dynamic_obstacle_positions = kwargs.get("dynamic_obstacle_positions")
+        dynamic_obstacle_p0 = kwargs.get("dynamic_obstacle_p0")
+        dynamic_obstacle_v0 = kwargs.get("dynamic_obstacle_v0")
+        dynamic_obstacle_t0 = kwargs.get("dynamic_obstacle_t0")
         dynamic_obstacle_active = kwargs.get("dynamic_obstacle_active")
         dynamic_obstacle_radii = kwargs.get("dynamic_obstacle_radii")
 
@@ -390,21 +393,8 @@ class QuadRLTask(Task):
         else:
             primed_contact_plan = jnp.asarray(contact_plan, dtype=jnp.float32).reshape(-1)
 
-        synced_dynamic_positions = (
-            task_params.dynamic_obstacle_positions
-            if dynamic_obstacle_positions is None
-            else jnp.asarray(dynamic_obstacle_positions, dtype=jnp.float32)
-        )
-        synced_dynamic_active = (
-            task_params.dynamic_obstacle_active
-            if dynamic_obstacle_active is None
-            else jnp.asarray(dynamic_obstacle_active, dtype=jnp.bool_)
-        )
-        synced_dynamic_radii = (
-            task_params.dynamic_obstacle_radii
-            if dynamic_obstacle_radii is None
-            else jnp.asarray(dynamic_obstacle_radii, dtype=jnp.float32)
-        )
+        def _sync(new_val, existing, dtype):
+            return existing if new_val is None else jnp.asarray(new_val, dtype=dtype)
 
         return update_params(
             task_params,
@@ -415,9 +405,11 @@ class QuadRLTask(Task):
             in_transition=jnp.asarray(in_transition, dtype=jnp.bool_),
             lowlevel_step_counter=jnp.asarray(0, dtype=jnp.int32),
             last_q_des=task_params.last_q_des,
-            dynamic_obstacle_positions=synced_dynamic_positions,
-            dynamic_obstacle_active=synced_dynamic_active,
-            dynamic_obstacle_radii=synced_dynamic_radii,
+            dynamic_obstacle_p0=_sync(dynamic_obstacle_p0, task_params.dynamic_obstacle_p0, jnp.float32),
+            dynamic_obstacle_v0=_sync(dynamic_obstacle_v0, task_params.dynamic_obstacle_v0, jnp.float32),
+            dynamic_obstacle_t0=_sync(dynamic_obstacle_t0, task_params.dynamic_obstacle_t0, jnp.float32),
+            dynamic_obstacle_active=_sync(dynamic_obstacle_active, task_params.dynamic_obstacle_active, jnp.bool_),
+            dynamic_obstacle_radii=_sync(dynamic_obstacle_radii, task_params.dynamic_obstacle_radii, jnp.float32),
         )
 
     def _build_contact_plan(
@@ -764,56 +756,128 @@ class QuadRLTask(Task):
     ) -> jax.Array:
         if (
             self.dynamic_obstacle_cost_weight <= 0.0
-            or task_params.dynamic_obstacle_positions.shape[0] == 0
-            or task_params.dynamic_obstacle_positions.shape[1] == 0
+            or task_params.dynamic_obstacle_p0.shape[0] == 0
         ):
             return jnp.array(0.0, dtype=jnp.float32)
 
-        stage_idx = task_params.lowlevel_step_counter // self.rollout_decimation - 1
-        stage_idx = jnp.clip(stage_idx, 0, task_params.dynamic_obstacle_positions.shape[1] - 1)
-
-        obstacle_centers = task_params.dynamic_obstacle_positions[:, stage_idx, :]
-        obstacle_radii = task_params.dynamic_obstacle_radii
-        obstacle_active = task_params.dynamic_obstacle_active.astype(jnp.float32)
-
-        body_pos = state.xpos[self.base_body_id]
-        contact_points = contact_locations_w.reshape(-1, 3)
-        contact_centers = jnp.mean(contact_locations_w, axis=0)
-
+        obstacle_radii = task_params.dynamic_obstacle_radii   # (N,)
+        obstacle_active = task_params.dynamic_obstacle_active.astype(jnp.float32)  # (N,)
+        W = self.dynamic_obstacle_cost_weight
         scale = self.dynamic_obstacle_cost_scale
         _EXP_MAX = 20.0
 
-        body_dist = jnp.linalg.norm(body_pos[None, :] - obstacle_centers, axis=-1)
+        body_pos = state.xpos[self.base_body_id]  # (3,)
+
+        # ── Stage-based cost ────────────────────────────────────────────────────
+        # Ball position at this rollout stage (ballistic projection).
+        # dt = lag-since-observation + MPS solve latency + time-into-horizon
+        stage_idx = task_params.lowlevel_step_counter // self.rollout_decimation - 1
+        stage_idx = jnp.clip(stage_idx, 0, self.horizon_length - 1)
+        stage_time = stage_idx.astype(jnp.float32) * self.command_duration
+        dt = task_params.dynamic_obstacle_t0 + self.mpc_latency_compensation + stage_time  # (N,)
+
+        g = jnp.array([0.0, 0.0, -9.81], dtype=jnp.float32)
+        ball_pos_stage = (
+            task_params.dynamic_obstacle_p0
+            + task_params.dynamic_obstacle_v0 * dt[:, None]
+            + 0.5 * g[None, :] * (dt[:, None] ** 2)
+        )
+        # Clamp ball z to ground so underground balls don't create phantom attraction.
+        ball_pos_stage = ball_pos_stage.at[:, 2].set(
+            jnp.maximum(ball_pos_stage[:, 2], obstacle_radii)
+        )
+
+        body_dist = jnp.linalg.norm(body_pos[None, :] - ball_pos_stage, axis=-1)  # (N,)
         body_clearance = body_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
-        body_cost = self.dynamic_obstacle_cost_weight * jnp.sum(
+        stage_cost = W * jnp.sum(
             obstacle_active * jnp.exp(jnp.clip(-body_clearance / scale, a_max=_EXP_MAX))
         )
 
+        contact_points = contact_locations_w.reshape(-1, 3)  # (8, 3)
         foot_dist = jnp.linalg.norm(
-            contact_points[:, None, :] - obstacle_centers[None, :, :],
-            axis=-1,
-        )
+            contact_points[:, None, :] - ball_pos_stage[None, :, :], axis=-1
+        )  # (8, N)
         foot_clearance = foot_dist - obstacle_radii[None, :] - self.obstacle_clearance
-        foot_cost = self.dynamic_obstacle_cost_weight * jnp.sum(
+        foot_cost = W * jnp.sum(
             obstacle_active[None, :] * jnp.exp(jnp.clip(-foot_clearance / scale, a_max=_EXP_MAX))
         )
 
-        contact_center_dist = jnp.linalg.norm(
-            contact_centers[:, None, :] - obstacle_centers[None, :, :],
-            axis=-1,
-        )
-        contact_center_clearance = (
-            contact_center_dist
-            - obstacle_radii[None, :]
-            - self.robot_radius
-            - self.obstacle_clearance
-        )
-        contact_center_cost = self.dynamic_obstacle_cost_weight * jnp.sum(
-            obstacle_active[None, :]
-            * jnp.exp(jnp.clip(-contact_center_clearance / scale, a_max=_EXP_MAX))
+        # ── Ballistic impact position cost ──────────────────────────────────────
+        # Computes WHERE the ball will be when it descends to the robot's body
+        # height (z = body_pos.z) using the full ballistic arc.  Measures the
+        # HORIZONTAL distance from that impact position to the robot body.
+        # This correctly handles lobbed throws (high v0_z) where the straight-
+        # line velocity direction points upward and misses the robot entirely.
+        #
+        # Works for any trajectory: line-drive, lob, drop — all correctly
+        # mapped to a 2D horizontal clearance check at robot height.
+        p0 = task_params.dynamic_obstacle_p0   # (N, 3)
+        v0 = task_params.dynamic_obstacle_v0   # (N, 3)
+        p0_z = p0[:, 2]                        # (N,)
+        v0_z = v0[:, 2]                        # (N,)
+        robot_z = body_pos[2]                  # scalar
+
+        # Discriminant: p0_z + v0_z*t - 4.905*t² = robot_z
+        #   4.905*t² - v0_z*t + (robot_z - p0_z) = 0
+        disc = v0_z ** 2 + 4.0 * 4.905 * (p0_z - robot_z)     # (N,)
+        disc_safe = jnp.maximum(disc, 0.0)
+        # Take the DESCENT root (larger t) so we catch balls on the way down.
+        t_impact = (v0_z + jnp.sqrt(disc_safe)) / (2.0 * 4.905)   # (N,)
+        t_impact = jnp.maximum(t_impact, 0.0)
+
+        # Impact position in x-y (z is exactly robot_z by construction).
+        impact_xy = (
+            p0[:, :2]
+            + v0[:, :2] * t_impact[:, None]
+            - 0.5 * 9.81 * 0.0 * t_impact[:, None] ** 2   # z handled above; xy unaffected by g
+        )  # (N, 2)
+        horiz_dist = jnp.linalg.norm(impact_xy - body_pos[None, :2], axis=-1)  # (N,)
+        horiz_clearance = (
+            horiz_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
         )
 
-        return body_cost + foot_cost + contact_center_cost
+        # Only fire when ball is actually incoming (disc > 0, t_impact > 0).
+        valid_arc = (disc > 0).astype(jnp.float32)
+        heading_cost = W * jnp.sum(
+            obstacle_active * valid_arc
+            * jnp.exp(jnp.clip(-horiz_clearance / scale, a_max=_EXP_MAX))
+        )
+
+        # ── Velocity-space DPCBF (paper eq. 16, adapted to 3D ballistic ball) ──
+        # h(x) = -v_rel_along - k_λ·(d/‖v_rel‖)·v_rel_perp² - k_μ·d ≥ 0  ⟺ safe
+        # v_rel = v_ball - v_robot; LoS frame: x-axis from robot→ball.
+        # Safe iff approach speed ≤ λ·(lateral speed)² + μ.
+        if self.dpcbf_k > 0.0:
+            v_ball_stage = (
+                task_params.dynamic_obstacle_v0 + g[None, :] * dt[:, None]
+            )  # (N, 3) ball velocity at stage time
+            v_robot = state.qvel[:3]  # (3,) robot base linear velocity (world frame)
+            v_rel = v_ball_stage - v_robot[None, :]  # (N, 3)
+
+            p_rel = ball_pos_stage - body_pos[None, :]  # (N, 3)
+            p_rel_norm = jnp.linalg.norm(p_rel, axis=-1, keepdims=True)
+            p_hat = p_rel / jnp.maximum(p_rel_norm, 1e-6)  # LoS unit vector
+
+            v_along = jnp.sum(v_rel * p_hat, axis=-1)          # (N,) <0 = approaching
+            v_perp_vec = v_rel - v_along[:, None] * p_hat       # (N, 3)
+            v_perp_sq = jnp.sum(v_perp_vec ** 2, axis=-1)       # (N,) squared lateral speed
+
+            d_clearance = jnp.squeeze(p_rel_norm, axis=-1) - obstacle_radii - self.robot_radius
+            v_rel_norm_sq = jnp.sum(v_rel ** 2, axis=-1)
+
+            k_lambda = self.dpcbf_k * d_clearance / jnp.sqrt(jnp.maximum(v_rel_norm_sq, 1e-6))
+            k_mu = self.dpcbf_k * d_clearance
+            # Paper eq.16: h = ṽ_rel,x - λ·ṽ²_rel,y - μ ≥ 0 is safe.
+            # ṽ_rel,x = v_along (positive = moving apart = safe).
+            # h < 0 when approaching fast without enough lateral speed → cost fires.
+            h_dpcbf = v_along - k_lambda * v_perp_sq - k_mu  # (N,)
+            velocity_dpcbf_cost = W * jnp.sum(
+                obstacle_active * jnp.exp(jnp.clip(-h_dpcbf / scale, a_max=_EXP_MAX))
+            )
+        else:
+            velocity_dpcbf_cost = jnp.array(0.0, dtype=jnp.float32)
+
+        return stage_cost + foot_cost + heading_cost + velocity_dpcbf_cost
 
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data

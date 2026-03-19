@@ -305,7 +305,9 @@ class SafetyManager:
             "contact_plan": kwargs.get("contact_plan"),
             "current_gait": kwargs.get("current_gait"),
             "in_transition": kwargs.get("in_transition"),
-            "dynamic_obstacle_positions": kwargs.get("dynamic_obstacle_positions"),
+            "dynamic_obstacle_p0": kwargs.get("dynamic_obstacle_p0"),
+            "dynamic_obstacle_v0": kwargs.get("dynamic_obstacle_v0"),
+            "dynamic_obstacle_t0": kwargs.get("dynamic_obstacle_t0"),
             "dynamic_obstacle_active": kwargs.get("dynamic_obstacle_active"),
             "dynamic_obstacle_radii": kwargs.get("dynamic_obstacle_radii"),
         }
