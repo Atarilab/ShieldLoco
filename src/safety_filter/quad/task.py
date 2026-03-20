@@ -308,6 +308,22 @@ class QuadRLTask(Task):
 
         self.robot_radius = float(rl_config.get("robot_radius", 0.3))
 
+        # Robot body IDs and per-body bounding radii for whole-body aerial obstacle checks.
+        # Uses all robot geoms (root = base_link) grouped by body.
+        robot_geom_ids = np.flatnonzero(geom_is_robot_np).astype(np.int32)
+        robot_body_ids_np = np.unique(mj_model.geom_bodyid[robot_geom_ids]).astype(np.int32)
+        robot_body_radii_np = []
+        for bid in robot_body_ids_np:
+            mask = mj_model.geom_bodyid[robot_geom_ids] == bid
+            geoms = robot_geom_ids[mask]
+            if hasattr(mj_model, "geom_rbound"):
+                r = float(np.maximum(mj_model.geom_rbound[geoms].max(), 0.05))
+            else:
+                r = float(np.maximum(np.linalg.norm(mj_model.geom_size[geoms], axis=1).max(), 0.05))
+            robot_body_radii_np.append(r)
+        self.robot_body_ids = jnp.asarray(robot_body_ids_np, dtype=jnp.int32)
+        self.robot_body_radii = jnp.asarray(robot_body_radii_np, dtype=jnp.float32)
+
     def make_task_params(self) -> QuadRLTaskParams:
         n = self.max_dynamic_obstacles
         return QuadRLTaskParams(
@@ -787,19 +803,19 @@ class QuadRLTask(Task):
             jnp.maximum(ball_pos_stage[:, 2], obstacle_radii)
         )
 
-        body_dist = jnp.linalg.norm(body_pos[None, :] - ball_pos_stage, axis=-1)  # (N,)
-        body_clearance = body_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
-        stage_cost = W * jnp.sum(
-            obstacle_active * jnp.exp(jnp.clip(-body_clearance / scale, a_max=_EXP_MAX))
+        # ── Whole-body check: all robot bodies vs predicted ball (3-D) ──────────
+        # robot_body_ids covers base, hips, thighs, calves, and feet — every
+        # body whose root is base_link.  Using 3-D distance is correct here
+        # because the ball flies through the air and can hit from any direction.
+        robot_body_pos = state.xpos[self.robot_body_ids]  # (B, 3)
+        robot_ball_dist = jnp.linalg.norm(
+            robot_body_pos[:, None, :] - ball_pos_stage[None, :, :], axis=-1
+        )  # (B, N)
+        robot_clearance = (
+            robot_ball_dist - obstacle_radii[None, :] - self.robot_body_radii[:, None] - self.obstacle_clearance
         )
-
-        contact_points = contact_locations_w.reshape(-1, 3)  # (8, 3)
-        foot_dist = jnp.linalg.norm(
-            contact_points[:, None, :] - ball_pos_stage[None, :, :], axis=-1
-        )  # (8, N)
-        foot_clearance = foot_dist - obstacle_radii[None, :] - self.obstacle_clearance
-        foot_cost = W * jnp.sum(
-            obstacle_active[None, :] * jnp.exp(jnp.clip(-foot_clearance / scale, a_max=_EXP_MAX))
+        stage_cost = W * jnp.sum(
+            obstacle_active[None, :] * jnp.exp(jnp.clip(-robot_clearance / scale, a_max=_EXP_MAX))
         )
 
         # ── Ballistic impact position cost ──────────────────────────────────────
@@ -811,73 +827,105 @@ class QuadRLTask(Task):
         #
         # Works for any trajectory: line-drive, lob, drop — all correctly
         # mapped to a 2D horizontal clearance check at robot height.
+        # Ballistic impact: where does the ball land at the robot's body height?
+        # Uses the full parabolic arc — correctly handles lobs (high v0_z) where
+        # the instantaneous velocity direction points skyward and doesn't predict
+        # where the ball will actually be at robot height.
         p0 = task_params.dynamic_obstacle_p0   # (N, 3)
         v0 = task_params.dynamic_obstacle_v0   # (N, 3)
-        p0_z = p0[:, 2]                        # (N,)
-        v0_z = v0[:, 2]                        # (N,)
-        robot_z = body_pos[2]                  # scalar
+        p0_z = p0[:, 2]
+        v0_z = v0[:, 2]
+        robot_z = body_pos[2]
 
-        # Discriminant: p0_z + v0_z*t - 4.905*t² = robot_z
-        #   4.905*t² - v0_z*t + (robot_z - p0_z) = 0
+        # Solve: p0_z + v0_z*t - 4.905*t² = robot_z  →  descent root (larger t)
         disc = v0_z ** 2 + 4.0 * 4.905 * (p0_z - robot_z)     # (N,)
-        disc_safe = jnp.maximum(disc, 0.0)
-        # Take the DESCENT root (larger t) so we catch balls on the way down.
-        t_impact = (v0_z + jnp.sqrt(disc_safe)) / (2.0 * 4.905)   # (N,)
-        t_impact = jnp.maximum(t_impact, 0.0)
+        t_impact = (v0_z + jnp.sqrt(jnp.maximum(disc, 0.0))) / (2.0 * 4.905)  # (N,)
 
-        # Impact position in x-y (z is exactly robot_z by construction).
-        impact_xy = (
-            p0[:, :2]
-            + v0[:, :2] * t_impact[:, None]
-            - 0.5 * 9.81 * 0.0 * t_impact[:, None] ** 2   # z handled above; xy unaffected by g
-        )  # (N, 2)
+        impact_xy = p0[:, :2] + v0[:, :2] * t_impact[:, None]  # (N, 2)  gravity only affects z
         horiz_dist = jnp.linalg.norm(impact_xy - body_pos[None, :2], axis=-1)  # (N,)
-        horiz_clearance = (
-            horiz_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
-        )
+        horiz_clearance = horiz_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
 
-        # Only fire when ball is actually incoming (disc > 0, t_impact > 0).
-        valid_arc = (disc > 0).astype(jnp.float32)
+        valid_arc = (disc > 0).astype(jnp.float32)  # ball actually reaches robot height
         heading_cost = W * jnp.sum(
             obstacle_active * valid_arc
             * jnp.exp(jnp.clip(-horiz_clearance / scale, a_max=_EXP_MAX))
         )
 
-        # ── Velocity-space DPCBF (paper eq. 16, adapted to 3D ballistic ball) ──
-        # h(x) = -v_rel_along - k_λ·(d/‖v_rel‖)·v_rel_perp² - k_μ·d ≥ 0  ⟺ safe
-        # v_rel = v_ball - v_robot; LoS frame: x-axis from robot→ball.
-        # Safe iff approach speed ≤ λ·(lateral speed)² + μ.
-        if self.dpcbf_k > 0.0:
-            v_ball_stage = (
-                task_params.dynamic_obstacle_v0 + g[None, :] * dt[:, None]
-            )  # (N, 3) ball velocity at stage time
-            v_robot = state.qvel[:3]  # (3,) robot base linear velocity (world frame)
-            v_rel = v_ball_stage - v_robot[None, :]  # (N, 3)
+        return stage_cost + heading_cost
 
-            p_rel = ball_pos_stage - body_pos[None, :]  # (N, 3)
-            p_rel_norm = jnp.linalg.norm(p_rel, axis=-1, keepdims=True)
-            p_hat = p_rel / jnp.maximum(p_rel_norm, 1e-6)  # LoS unit vector
+    def get_dynamic_safety_bias(
+        self, task_params: QuadRLTaskParams, ref: jax.Array
+    ) -> jax.Array:
+        """Returns (H, plan_dim) normalized plan-space mean bias to avoid
+        threatening ballistic obstacles.  Called from MIMPS.sample_plans so
+        that all samples are centred around the analytically-predicted dodge
+        rather than the nominal trajectory — enabling single-cycle whole-body
+        avoidance.  Returns zeros when no obstacle is active or threatening.
 
-            v_along = jnp.sum(v_rel * p_hat, axis=-1)          # (N,) <0 = approaching
-            v_perp_vec = v_rel - v_along[:, None] * p_hat       # (N, 3)
-            v_perp_sq = jnp.sum(v_perp_vec ** 2, axis=-1)       # (N,) squared lateral speed
+        Body position is estimated as the XY centroid of the reference feet at
+        horizon step 0.  The bias shifts ALL four feet by the same XY offset
+        (rigid-body translation), which is the dominant mode for body-level
+        obstacle avoidance.
+        """
+        if task_params.dynamic_obstacle_p0.shape[0] == 0:
+            return jnp.zeros((self.horizon_length, self.plan_dim), dtype=jnp.float32)
 
-            d_clearance = jnp.squeeze(p_rel_norm, axis=-1) - obstacle_radii - self.robot_radius
-            v_rel_norm_sq = jnp.sum(v_rel ** 2, axis=-1)
+        # ── Estimate robot body XY from reference foot centroid ──────────────
+        # ref: (H, plan_dim) normalized.  Step-0 feet → (4, 3) world coords.
+        step0_feet = (ref[0] * self.plan_lim).reshape(4, 3)   # (4, 3)
+        body_xy = step0_feet[:, :2].mean(axis=0)               # (2,)
+        body_z  = jnp.array(0.35, dtype=jnp.float32)          # nominal torso height
 
-            k_lambda = self.dpcbf_k * d_clearance / jnp.sqrt(jnp.maximum(v_rel_norm_sq, 1e-6))
-            k_mu = self.dpcbf_k * d_clearance
-            # Paper eq.16: h = ṽ_rel,x - λ·ṽ²_rel,y - μ ≥ 0 is safe.
-            # ṽ_rel,x = v_along (positive = moving apart = safe).
-            # h < 0 when approaching fast without enough lateral speed → cost fires.
-            h_dpcbf = v_along - k_lambda * v_perp_sq - k_mu  # (N,)
-            velocity_dpcbf_cost = W * jnp.sum(
-                obstacle_active * jnp.exp(jnp.clip(-h_dpcbf / scale, a_max=_EXP_MAX))
-            )
-        else:
-            velocity_dpcbf_cost = jnp.array(0.0, dtype=jnp.float32)
+        # ── Per-obstacle ballistic impact check ──────────────────────────────
+        p0  = task_params.dynamic_obstacle_p0    # (N, 3)
+        v0  = task_params.dynamic_obstacle_v0    # (N, 3)
+        radii = task_params.dynamic_obstacle_radii  # (N,)
+        active = task_params.dynamic_obstacle_active.astype(jnp.float32)  # (N,)
 
-        return stage_cost + foot_cost + heading_cost + velocity_dpcbf_cost
+        p0_z = p0[:, 2]
+        v0_z = v0[:, 2]
+
+        # Time for ball to descend to body_z (descent root of ballistic arc).
+        disc = v0_z ** 2 + 4.0 * 4.905 * (p0_z - body_z)          # (N,)
+        disc_safe = jnp.maximum(disc, 0.0)
+        t_imp = (v0_z + jnp.sqrt(disc_safe)) / (2.0 * 4.905)       # (N,)
+
+        # Impact XY position
+        impact_xy = p0[:, :2] + v0[:, :2] * t_imp[:, None]         # (N, 2)
+
+        # Vector and distance from body to impact
+        to_impact = impact_xy - body_xy[None, :]                    # (N, 2)
+        horiz_dist = jnp.linalg.norm(to_impact, axis=-1)            # (N,)
+        horiz_dist_safe = jnp.maximum(horiz_dist, 1e-6)
+
+        r_safe = radii + self.robot_radius + self.obstacle_clearance + 0.1  # (N,)
+        deficit = jnp.maximum(r_safe - horiz_dist, 0.0)             # (N,) >0 when threatening
+
+        # Dodge direction: directly away from impact point
+        dodge_dir = -to_impact / horiz_dist_safe[:, None]           # (N, 2)
+
+        # Mask: only fire for active obstacles with valid arc and actual threat
+        valid = active * (disc > 0).astype(jnp.float32) * (t_imp > 0).astype(jnp.float32)
+        per_obs_offset = valid[:, None] * deficit[:, None] * dodge_dir  # (N, 2)
+
+        # Aggregate: sum offsets (handles multiple balls)
+        total_xy = per_obs_offset.sum(axis=0)                       # (2,)
+
+        # Clamp to plan_lim so the bias stays within one normalized unit.
+        # Larger values are clipped by f() anyway but can corrupt warm-start mean.
+        total_xy_norm = total_xy / self.plan_lim
+        total_xy_norm = jnp.clip(total_xy_norm, -1.0, 1.0)
+
+        # ── Convert to normalized plan-space bias ────────────────────────────
+        # Shift all 4 feet by the same XY amount (rigid body translation).
+        # plan_dim layout: [foot0_x, foot0_y, foot0_z, foot1_x, …] × 4
+        foot_bias = jnp.zeros(self.plan_dim, dtype=jnp.float32)
+        for f in range(4):
+            foot_bias = foot_bias.at[f * 3    ].set(total_xy_norm[0])
+            foot_bias = foot_bias.at[f * 3 + 1].set(total_xy_norm[1])
+
+        # Constant across all horizon steps (simple and stable)
+        return jnp.broadcast_to(foot_bias[None, :], (self.horizon_length, self.plan_dim))
 
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data

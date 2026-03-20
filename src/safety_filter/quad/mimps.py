@@ -193,8 +193,16 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # Flatten to plan_dim: (N, H, 12)
         noise = combined.reshape(N, H, self.task.plan_dim)
 
+        # Analytically-guided mean bias: shift all samples toward the dodge
+        # position predicted from the dynamic obstacle trajectory.  This centres the
+        # MPPI sampling distribution around whole-body avoidance so the
+        # optimizer can find physics-feasible dodge plans in a single cycle.
+        dyna_safety_bias = self.task.get_dynamic_safety_bias(
+            params.task_params, params.ref
+        )  # (H, plan_dim)
+
         # Shape: (num_samples, H, plan_dim)
-        mean = params.mean + params.ref + self.noise_level * noise
+        mean = (params.mean + dyna_safety_bias) + params.ref + self.noise_level * noise
 
         return mean, params.replace(rng=rng)  # type: ignore
 
