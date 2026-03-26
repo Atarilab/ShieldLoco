@@ -1,0 +1,15 @@
+# Scenario A: Static obstacle navigation
+# Robot must trot forward and reach the goal at x~6.5m within max_time seconds.
+# Metrics: goal_reached, time_to_goal, constraint_violations, tracking_cost
+
+scenario: static_nav
+start_gait: trot
+start_move: up            # forward
+
+goal_position: [6.5, 0.0] # xy only
+goal_threshold: 0.5        # metres
+max_time: 120.0            # seconds
+
+sim_metric_file: logs/eval/sim_a.csv
+controller_metric_file: logs/eval/ctrl_a.csv
+done_file: logs/eval/eval_done_a.txt

@@ -6,6 +6,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as Go2LowState_
 
 from controllers.rl_contact_locomotion_controller import RLQuadrupedLocomotionContactController
 from controllers.rl_mps_controller import RLQuadrupedMPSController
+from controllers.rl_mps_eval_controller import RLQuadrupedMPSEvalController
 from controllers.rl_velocity_locomotion_controller import RLQuadrupedLocomotionVelocityController
 from controllers.stand_controller import (
     Go2StanceController,
@@ -285,6 +286,18 @@ class Go2(RobotBase):
                     "RL-CONTACT": RLQuadrupedLocomotionContactController,
                 },
             }
+        elif "mps" in self.task and "eval" in self.task:
+            controllers = {
+                "STAND": {
+                    "STAY_DOWN": Go2StayDownController,
+                    "STAND_UP": Go2StandUpController,
+                    "STAND_DOWN": Go2StandDownController,
+                    "STANCE": Go2StanceController,
+                },
+                "LOCOMOTION": {
+                    "RL-MPS": RLQuadrupedMPSEvalController,
+                },
+            }
         elif "mps" in self.task:
             controllers = {
                 "STAND": {
@@ -339,7 +352,7 @@ class Go2(RobotBase):
         )
         _subscribers["low_state"] = dds_low_state_sub
 
-        if "sim" in self.task:
+        if "sim" in self.task or "eval" in self.task:
             from std_msgs.msg import Float32MultiArray
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 

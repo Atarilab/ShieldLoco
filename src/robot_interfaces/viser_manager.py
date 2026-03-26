@@ -68,7 +68,7 @@ class ViserState:
     qpos_ghost_steps: int = 0
     qpos_ghost_last_update: float = 0.0
     ghost_mj_data: Any = None
-    follow_enabled: bool = False
+    follow_enabled: bool = True
     follow_target_pos: Optional[np.ndarray] = None
     # Ball visualization
     ball_handles: dict[int, Any] = field(default_factory=dict)  # slot_idx -> sphere handle

@@ -47,7 +47,9 @@ class BallLauncher:
         ball_lifetime: float = 3.0,
         ground_z_threshold: float = 0.1,
         base_body_name: str = "base_link",
+        seed: Optional[int] = None,
     ):
+        self._rng = np.random.default_rng(seed)
         self.max_balls = max_balls
         self.ball_radius = ball_radius
         self.launch_distance_range = launch_distance_range
@@ -119,7 +121,7 @@ class BallLauncher:
             self._deactivate_slot(slot, mj_data)
 
         # Random launch origin: random compass angle, configurable distance and height
-        rng = np.random.default_rng()
+        rng = self._rng
         angle = rng.uniform(0, 2 * np.pi)
         distance = rng.uniform(*self.launch_distance_range)
         height = rng.uniform(*self.launch_height_range)

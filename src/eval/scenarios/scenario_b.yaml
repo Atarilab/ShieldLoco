@@ -1,0 +1,18 @@
+# Scenario B: Dynamic obstacle avoidance
+# Robot stays roughly in place; a ball is auto-thrown after ball_throw_delay s.
+# Metrics: survived (zero violations), min_ball_distance, tracking_cost
+
+scenario: dynamic_obs
+start_gait: trot
+start_move: center         # stay in place
+
+ball_throw_delay: 5.0      # seconds after eval auto-start
+max_time: 30.0             # seconds
+
+# goal_position unused for this scenario but kept so SimEvalConfig works
+goal_position: [0.0, 0.0]
+goal_threshold: 999.0      # never triggers
+
+sim_metric_file: logs/eval/sim_b.csv
+controller_metric_file: logs/eval/ctrl_b.csv
+done_file: logs/eval/eval_done_b.txt

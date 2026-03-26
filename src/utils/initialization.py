@@ -25,7 +25,7 @@ async def initialize_robot_controller(task: str, logger: logging.Logger) -> Dict
 
 async def initialize_channel(task: str, robot_interface_config: Dict, logger: logging.Logger):
     """Initialize communication channel based on task type."""
-    if "sim" in task:  # TODO: Might interfere with other text other than simulation
+    if "sim" in task or "eval" in task:  # eval tasks always run in sim
         logger.info(
             f"Initializing channel with Domain ID: {robot_interface_config['DOMAIN_ID']} "
             f"and network interface: {robot_interface_config['INTERFACE']}"

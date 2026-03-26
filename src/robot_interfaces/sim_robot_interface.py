@@ -20,7 +20,7 @@ DYNAMIC_OBSTACLE_TOPIC = "/dynamic_obstacles"
 
 
 class SimRobotInterface:
-    def __init__(self, config, headless=False):
+    def __init__(self, config, headless=False, eval_hooks=None):
         self.stop_event = threading.Event()
         self.reset_requested = threading.Event()
         self._rclpy_initialized_here = False
@@ -98,9 +98,15 @@ class SimRobotInterface:
             launch_speed_range=(2.0, 4.0),
             ball_lifetime=3.0,
             base_body_name=self.base_link_name,
+            seed=config.get("SEED", None),
         )
         self.viser_manager.set_ball_launcher(self.ball_launcher, self.base_body_id)
         self._init_dynamic_obstacle_publisher()
+
+        # Eval hook (optional) — set before threads start so on_step() is called from t=0
+        self.eval_hooks = eval_hooks
+        if eval_hooks is not None:
+            self.request_reset()  # put robot in XML default (standing) pose before eval begins
 
         # Start threads
         self.viewer_thread = Thread(target=self._physics_viewer_thread)
@@ -121,6 +127,18 @@ class SimRobotInterface:
         if self.print_scene_info:
             unitree.PrintSceneInformation()
 
+        # Absolute path to eval reset signal (anchored to src/ next to this file).
+        _eval_reset_sig = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs", "eval", "reset_signal.txt",
+        )
+        print(f"[Sim] Watching for eval reset signal at: {_eval_reset_sig}", flush=True)
+        # Remove any stale reset signal left over from a previous run.
+        try:
+            os.remove(_eval_reset_sig)
+        except FileNotFoundError:
+            pass
+
         while not self.stop_event.is_set():
             if self.viewer is not None and not self.viewer.is_running():
                 break
@@ -132,12 +150,25 @@ class SimRobotInterface:
                     self.reset_requested.clear()
                     self._reset_simulation_state()
 
+                # Eval controller writes this file when JIT is done and it is ready.
+                # Picking it up here means the sim resets without needing --eval-config.
+                if os.path.exists(_eval_reset_sig):
+                    try:
+                        os.remove(_eval_reset_sig)
+                    except OSError:
+                        pass
+                    print("[Sim] Eval reset signal detected — resetting robot.", flush=True)
+                    self._reset_simulation_state()
+
                 if self.elastic_band:
                     if self.elastic_band.enable:
                         force = self.elastic_band.Advance(self.mj_data.qpos[:3], self.mj_data.qvel[:3])
                         self.mj_data.xfrc_applied[self.band_link.id][:3] = force
 
                 mujoco.mj_step(self.mj_model, self.mj_data)
+
+                if self.eval_hooks is not None:
+                    self.eval_hooks.on_step()
 
                 # Tick ball launcher to auto-deactivate grounded balls
                 self.ball_launcher.tick(self.mj_data, time.time())

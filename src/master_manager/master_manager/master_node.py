@@ -60,8 +60,18 @@ async def main_async(args=None):
     parser.add_argument("--log", type=str, default="test", help="Experiment name to log information")
     parser.add_argument("--debug", action="store_true", help="Show debug logs")
     parser.add_argument("--ui", action="store_true", help="Enable the Robot Control UI")
+    parser.add_argument("--eval-config", type=str, default=None, help="Path to eval scenario YAML")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed (numpy, torch, python random)")
 
     args = parser.parse_args()
+
+    if args.seed is not None:
+        import random
+        import numpy as _np
+        import torch as _torch
+        random.seed(args.seed)
+        _np.random.seed(args.seed)
+        _torch.manual_seed(args.seed)
 
     # Setup logger
     log_file = os.path.join("logs", args.log, f"{args.task}_robot_controller.log")
@@ -75,6 +85,22 @@ async def main_async(args=None):
 
         # Add debug flag to configs
         configs["debug"] = args.debug
+
+        # In eval mode: embed the eval scenario config so the eval controller can read it
+        if args.eval_config is not None:
+            import yaml
+            with open(args.eval_config) as fh:
+                configs["eval_config"] = yaml.safe_load(fh)
+            # Seed can come from CLI (--seed) or from the scenario YAML (seed: 42)
+            _seed = args.seed if args.seed is not None else configs["eval_config"].get("seed")
+            if _seed is not None:
+                import random
+                import numpy as _np
+                import torch as _torch
+                random.seed(_seed)
+                _np.random.seed(_seed)
+                _torch.manual_seed(_seed)
+                logger.info(f"[Eval] Random seed set to {_seed}")
 
         # Initialize communication channel
         await initialize_channel(args.task, configs["robot_interface_config"], logger)
@@ -102,8 +128,14 @@ async def main_async(args=None):
             }
             mode_manager.register_mode(controller_type, controller_dict)
 
-        # Set ZERO mode by default
-        mode_manager.set_mode("ZERO")
+        # In eval mode start directly in LOCOMOTION so the safety manager's
+        # background thread begins JAX JIT compilation immediately.
+        # The sim will reset the robot once JIT is done (via SimEvalHooks).
+        # Otherwise use ZERO (safe default for manual operation).
+        if args.eval_config is not None:
+            mode_manager.set_mode("LOCOMOTION", "RL-MPS")
+        else:
+            mode_manager.set_mode("ZERO")
 
         # Create low level command publisher node
         node = LowLevelCmdPublisher(
@@ -133,6 +165,32 @@ async def main_async(args=None):
 
         # Run node in separate thread
         node_task = asyncio.create_task(asyncio.to_thread(spin_node))
+
+        # In eval mode: watch for the done_file written by the eval controller
+        # and cancel the node task (triggering clean DAMPING shutdown) when found.
+        if args.eval_config is not None:
+            _done_file = (configs.get("eval_config") or {}).get("done_file", "logs/eval/eval_done.txt")
+
+            async def _watch_eval_done():
+                while not os.path.exists(_done_file):
+                    await asyncio.sleep(0.2)
+                logger.info("[Eval] Episode complete — shutting down controller node")
+                mode_manager.set_mode("DAMPING")
+                await asyncio.sleep(2.0)  # brief DAMPING period
+                # Release GPU memory before exiting so the next run can allocate cleanly
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    import jax
+                    jax.clear_backends()
+                except Exception:
+                    pass
+                os._exit(0)
+
+            asyncio.create_task(_watch_eval_done())
 
         # Create robot control UI if not disabled (non-blocking)
         try:
@@ -171,6 +229,11 @@ async def main_async(args=None):
 
 
 def main():
+    import signal
+    # SIGTERM (from `kill PID` or process-group death) does a hard exit so orphaned
+    # processes don't linger and hold GPU memory.  DDS teardown is intentionally skipped —
+    # it can hang for minutes and is not needed for simulation safety.
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     asyncio.run(main_async())
 
 

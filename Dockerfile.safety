@@ -22,3 +22,9 @@ RUN pip install viser
 RUN echo "alias go2_mps_sim='cd /home/atari/workspace/DOOM/src && python3 simulate.py --task=rl-mps-sim-go2'" >> /home/atari/.bashrc
 
 RUN echo "alias go2_mps_ros='ros2 run master_manager master_node --task=rl-mps-sim-go2'" >> /home/atari/.bashrc
+
+RUN echo "alias go2_mps_eval_sim='cd /home/atari/workspace/DOOM/src && python3 simulate.py --task=rl-mps-eval-go2 --headless'" >> /home/atari/.bashrc
+
+RUN echo "alias go2_mps_eval_ros='cd /home/atari/workspace/DOOM/src && ros2 run master_manager master_node --task=rl-mps-eval-go2'" >> /home/atari/.bashrc
+
+RUN echo "alias kill_eval='pkill -SIGTERM -f master_node; pkill -SIGTERM -f simulate.py; sleep 1; pkill -9 -f master_node; pkill -9 -f simulate.py; echo Done'" >> /home/atari/.bashrc

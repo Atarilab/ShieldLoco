@@ -18,6 +18,10 @@ TASK_CONFIG = {
         "controller": "controllers/config/rl_mps_go2_cfg.yaml",
         "robot_interface": "robot_interfaces/config/sim_go2_cfg.yaml",
     },
+    "rl-mps-eval-go2": {
+        "controller": "controllers/config/rl_mps_go2_cfg.yaml",
+        "robot_interface": "robot_interfaces/config/sim_go2_cfg.yaml",
+    },
     "rl-contact-real-go2": {
         "controller": "controllers/config/rl_contact_go2_cfg.yaml",
         "robot_interface": "robot_interfaces/config/real_go2_cfg.yaml",
