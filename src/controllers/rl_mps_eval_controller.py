@@ -72,6 +72,17 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
         if not self.eval_m.started:
             self._eval_autostart()
 
+        if self.safety_manager._plan_count == self.eval_cfg.min_plans:
+            move_cmd = {}
+            if self.eval_cfg.start_move != "center":
+                move_cmd = {"move": self.eval_cfg.start_move}
+
+            self.change_commands({
+                "gait": self.eval_cfg.start_gait,
+                "mpc": "on",
+                **move_cmd,
+            })
+
         cmd = super().compute_lowlevelcmd(state)
 
         if self.eval_m.started:
@@ -103,31 +114,20 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
         if self.logger:
             self.logger.info(f"[EvalController] Reset signal written: {_reset_sig}")
 
-        if self.safety_manager._plan_count >= self.eval_cfg.min_plans:
-            move_cmd = {}
-            if self.eval_cfg.start_move != "center":
-                move_cmd = {"move": self.eval_cfg.start_move}
-
-            self.change_commands({
-                "gait": self.eval_cfg.start_gait,
-                "mpc": "on",
-                **move_cmd,
-            })
-
-            self.eval_m.started = True
-            self.eval_m.start_time = time.time()
-            self.eval_m.file = open(self.eval_cfg.controller_metric_file, "w", newline="")
-            self.eval_m.writer = csv.DictWriter(
-                self.eval_m.file,
-                fieldnames=["t", "vel_x", "vel_y", "height",
-                            "tracking_cost", "plan_seq", "mpc_active"],
+        self.eval_m.started = True
+        self.eval_m.start_time = time.time()
+        self.eval_m.file = open(self.eval_cfg.controller_metric_file, "w", newline="")
+        self.eval_m.writer = csv.DictWriter(
+            self.eval_m.file,
+            fieldnames=["t", "vel_x", "vel_y", "height",
+                        "tracking_cost", "plan_seq", "mpc_active"],
+        )
+        self.eval_m.writer.writeheader()
+        if self.logger:
+            self.logger.info(
+                f"[EvalController] Auto-started: gait={self.eval_cfg.start_gait}, "
+                f"move={self.eval_cfg.start_move}, mpc=on"
             )
-            self.eval_m.writer.writeheader()
-            if self.logger:
-                self.logger.info(
-                    f"[EvalController] Auto-started: gait={self.eval_cfg.start_gait}, "
-                    f"move={self.eval_cfg.start_move}, mpc=on"
-                )
 
     def _eval_log_step(self, state):
         """Write one row to the controller metric CSV. Writes done_file on timeout."""
