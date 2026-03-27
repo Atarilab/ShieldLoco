@@ -4,27 +4,167 @@
     <!-- Format: pos="x y z" where z is half-height, size="half_x half_y half_z" -->
     <!-- 5 boxes total, one per row, scattered at different y positions, avoiding y=0 (direct front) -->
 
-    <!-- Row 1: x=1.5m, offset to the left -->
-    <geom name="obstacle_0" pos="1.5 -0.3 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <!-- Navigation scene  -->
+    <!-- <geom name="obstacle_0" pos="1.5 -0.3 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/> -->
+    <!-- <geom name="obstacle_1" pos="3.0 0.5 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/> -->
+    <!-- <geom name="obstacle_2" pos="4.0 0.0 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/> -->
+    <!-- <geom name="obstacle_3" pos="4.7 -0.8 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/> -->
+    <!-- <geom name="obstacle_4" pos="5.5 0.0 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/> -->
 
-    <!-- Row 2: x=2.5m, offset to the right -->
-    <geom name="obstacle_1" pos="3.0 0.5 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/>
 
-    <!-- Row 3: x=3.5m, offset to the left -->
-    <geom name="obstacle_2" pos="4.0 0.0 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <!-- Cluttered scene  -->
+    <!-- <geom name="obstacle_0" pos="1.2 -0.3 0.02" type="box" size="0.01 0.5 0.01" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_00" pos="1.0 0.3 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_01" pos="1.5 0.3 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
 
-    <!-- Row 4: x=4.5m, offset slightly right -->
-    <geom name="obstacle_3" pos="4.7 -0.8 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_1" pos="3.0 0.5 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_10" pos="1.5 -0.5 0.02" type="box" size="0.05 0.05 0.03" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_11" pos="2.0 -0.5 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
 
-    <!-- Row 5: x=5.5m, offset to the left -->
-    <geom name="obstacle_4" pos="5.5 0.0 0.2" type="box" size="0.15 0.15 0.2" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_2" pos="4.0 0.0 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_20" pos="4.5 0.0 0.02" type="box" size="0.05 0.05 0.05" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_21" pos="3.0 0.0 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_22" pos="3.5 -0.1 0.02" type="box" size="0.05 0.05 0.03" rgba="0.8 0.2 0.2 1" friction="1.0"/>
 
-    <!-- DESTINATION MARKER at (6.5, 0.0, 0.2) -->
-    <!-- Green X-shaped marker made of two thin crossed boxes -->
+    <geom name="obstacle_3" pos="4.7 -0.8 0.02" type="box" size="0.05 0.05 0.05" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_30" pos="3.7 -0.8 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_31" pos="3.5 0.8 0.02" type="box" size="0.01 0.5 0.01" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_32" pos="4.7 0.8 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_33" pos="4.2 0.8 0.02" type="box" size="0.05 0.05 0.08" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+
+    <geom name="obstacle_4" pos="5.5 0.0 0.02" type="box" size="0.05 0.05 0.03" rgba="0.8 0.2 0.2 1" friction="1.0"/>
+    <geom name="obstacle_44" pos="5. 0.1 0.02" type="box" size="0.05 0.05 0.02" rgba="0.8 0.2 0.2 1" friction="1.0"/> -->
+
+
+
+    <!-- ================================================================== -->
+    <!-- CLUTTERED INDOOR SCENE —              foothold avoidance test     -->
+    <!-- Track: ~6.5m long, obstacles concentrated in y∈[-0.5, 0.5]        -->
+    <!-- Density: ~12-15 obstacles/m² in active zones                       -->
+    <!-- Object types:                                                       -->
+    <!--   Cable (long thin)     — blue    0.2 0.4 0.8 1                    -->
+    <!--   Phone/tablet (flat)   — dark red 0.6 0.15 0.15 1                 -->
+    <!--   Small box (cubic)     — orange  0.9 0.5 0.1 1                    -->
+    <!--   Pen/tool (thin stick) — yellow  0.85 0.75 0.1 1                  -->
+    <!--   Debris (tiny)         — grey    0.5 0.5 0.5 1                    -->
+    <!-- All z values = half_height so objects sit flush on the ground.      -->
+    <!-- ================================================================== -->
+
+    <!-- ======================== ZONE 1: Warmup (x=0.7–1.6) ============= -->
+    <!-- Light scatter — a few items to ease into the scene                 -->
+
+    <!-- Phone lying flat -->
+    <geom name="obstacle_z1_00" pos="0.8 0.15 0.004" type="box" size="0.075 0.035 0.004" rgba="0.6 0.15 0.15 1" friction="1.0"/>
+    <!-- Pen -->
+    <geom name="obstacle_z1_01" pos="1.0 -0.10 0.004" type="box" size="0.07 0.004 0.004" rgba="0.85 0.75 0.1 1" friction="1.0" quat="0.9659 0 0 0.2588"/>
+    <!-- Small debris -->
+    <geom name="obstacle_z1_02" pos="1.15 0.25 0.003" type="box" size="0.02 0.015 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <!-- Cable segment crossing path -->
+    <geom name="obstacle_z1_03" pos="1.35 0.0 0.004" type="box" size="0.005 0.35 0.004" rgba="0.2 0.4 0.8 1" friction="1.0"/>
+    <!-- Small box -->
+    <geom name="obstacle_z1_04" pos="1.5 -0.20 0.015" type="box" size="0.04 0.03 0.015" rgba="0.9 0.5 0.1 1" friction="1.0"/>
+    <!-- Debris near cable -->
+    <geom name="obstacle_z1_05" pos="1.30 0.18 0.003" type="box" size="0.015 0.01 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+
+    <!-- ======================== ZONE 2: Cable zone (x=1.8–3.0) ========== -->
+    <!-- Cables running across/along path with items tangled around them    -->
+
+    <!-- Long cable running diagonally across path -->
+    <geom name="obstacle_z2_00" pos="2.0 0.0 0.004" type="box" size="0.35 0.005 0.004" rgba="0.2 0.4 0.8 1" friction="1.0" quat="0.9239 0 0 0.3827"/>
+    <!-- Second cable, perpendicular -->
+    <geom name="obstacle_z2_01" pos="2.3 -0.05 0.004" type="box" size="0.005 0.40 0.004" rgba="0.15 0.35 0.75 1" friction="1.0"/>
+    <!-- Phone near cable intersection -->
+    <geom name="obstacle_z2_02" pos="2.15 0.12 0.004" type="box" size="0.075 0.035 0.004" rgba="0.6 0.15 0.15 1" friction="1.0" quat="0.9848 0 0 0.1736"/>
+    <!-- USB adapter -->
+    <geom name="obstacle_z2_03" pos="2.05 -0.22 0.005" type="box" size="0.02 0.01 0.005" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <!-- Pen across cable -->
+    <geom name="obstacle_z2_04" pos="2.25 0.20 0.004" type="box" size="0.065 0.004 0.004" rgba="0.85 0.75 0.1 1" friction="1.0" quat="0.9397 0 0 -0.342"/>
+    <!-- Cable stub sticking out -->
+    <geom name="obstacle_z2_05" pos="2.50 0.30 0.004" type="box" size="0.12 0.005 0.004" rgba="0.2 0.4 0.8 1" friction="1.0"/>
+    <!-- Small battery pack -->
+    <geom name="obstacle_z2_06" pos="2.55 -0.08 0.012" type="box" size="0.035 0.025 0.012" rgba="0.3 0.3 0.35 1" friction="1.0"/>
+    <!-- Earbuds case -->
+    <geom name="obstacle_z2_07" pos="2.70 0.05 0.008" type="box" size="0.025 0.025 0.008" rgba="0.9 0.9 0.9 1" friction="1.0"/>
+    <!-- Tape roll -->
+    <geom name="obstacle_z2_08" pos="2.80 -0.25 0.008" type="cylinder" size="0.025 0.008" rgba="0.7 0.7 0.2 1" friction="1.0"/>
+    <!-- Scattered cable end -->
+    <geom name="obstacle_z2_09" pos="2.90 0.15 0.004" type="box" size="0.15 0.005 0.004" rgba="0.2 0.4 0.8 1" friction="1.0" quat="0.9659 0 0 0.2588"/>
+    <!-- Debris cluster -->
+    <geom name="obstacle_z2_10" pos="2.40 -0.35 0.003" type="box" size="0.012 0.012 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <geom name="obstacle_z2_11" pos="2.45 -0.30 0.003" type="box" size="0.01 0.015 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <!-- Marker -->
+    <geom name="obstacle_z2_12" pos="2.65 -0.18 0.006" type="box" size="0.06 0.006 0.006" rgba="0.8 0.1 0.2 1" friction="1.0" quat="0.9848 0 0 -0.1736"/>
+
+    <!-- ======================== ZONE 3: Spilled toolbox (x=3.2–4.5) ===== -->
+    <!-- Dense cluster — like someone dropped a box of small items          -->
+
+    <!-- The box itself (tipped over, slightly larger) -->
+    <geom name="obstacle_z3_00" pos="3.6 -0.05 0.025" type="box" size="0.10 0.07 0.025" rgba="0.9 0.5 0.1 1" friction="1.0" quat="0.9962 0 0 0.0872"/>
+    <!-- Screwdriver -->
+    <geom name="obstacle_z3_01" pos="3.35 0.15 0.005" type="box" size="0.09 0.005 0.005" rgba="0.85 0.75 0.1 1" friction="1.0" quat="0.9659 0 0 0.2588"/>
+    <!-- Allen key -->
+    <geom name="obstacle_z3_02" pos="3.45 -0.20 0.003" type="box" size="0.05 0.003 0.003" rgba="0.4 0.4 0.4 1" friction="1.0" quat="0.9239 0 0 -0.3827"/>
+    <!-- Spare bolts / small parts cluster -->
+    <geom name="obstacle_z3_03" pos="3.50 0.08 0.004" type="cylinder" size="0.008 0.004" rgba="0.5 0.5 0.55 1" friction="1.0"/>
+    <geom name="obstacle_z3_04" pos="3.55 0.12 0.004" type="cylinder" size="0.008 0.004" rgba="0.5 0.5 0.55 1" friction="1.0"/>
+    <geom name="obstacle_z3_05" pos="3.48 0.14 0.004" type="cylinder" size="0.006 0.004" rgba="0.5 0.5 0.55 1" friction="1.0"/>
+    <geom name="obstacle_z3_06" pos="3.53 0.05 0.004" type="cylinder" size="0.007 0.004" rgba="0.5 0.5 0.55 1" friction="1.0"/>
+    <!-- Zip ties scattered -->
+    <geom name="obstacle_z3_07" pos="3.70 0.22 0.002" type="box" size="0.04 0.002 0.002" rgba="0.9 0.9 0.9 1" friction="1.0" quat="0.9397 0 0 0.342"/>
+    <geom name="obstacle_z3_08" pos="3.75 0.18 0.002" type="box" size="0.035 0.002 0.002" rgba="0.9 0.9 0.9 1" friction="1.0"/>
+    <!-- Tape measure -->
+    <geom name="obstacle_z3_09" pos="3.80 -0.10 0.015" type="box" size="0.035 0.035 0.015" rgba="0.85 0.75 0.1 1" friction="1.0"/>
+    <!-- Phone (dropped) -->
+    <geom name="obstacle_z3_10" pos="3.90 0.00 0.004" type="box" size="0.075 0.035 0.004" rgba="0.15 0.15 0.15 1" friction="1.0" quat="0.9848 0 0 0.1736"/>
+    <!-- Cable from toolbox -->
+    <geom name="obstacle_z3_11" pos="3.65 -0.30 0.004" type="box" size="0.20 0.005 0.004" rgba="0.7 0.3 0.1 1" friction="1.0" quat="0.9659 0 0 -0.2588"/>
+    <!-- Pliers -->
+    <geom name="obstacle_z3_12" pos="4.00 -0.18 0.008" type="box" size="0.06 0.012 0.008" rgba="0.4 0.4 0.45 1" friction="1.0" quat="0.9239 0 0 0.3827"/>
+    <!-- Battery -->
+    <geom name="obstacle_z3_13" pos="4.10 0.15 0.008" type="cylinder" size="0.012 0.008" rgba="0.3 0.6 0.3 1" friction="1.0"/>
+    <!-- More small debris from spill -->
+    <geom name="obstacle_z3_14" pos="4.05 -0.05 0.003" type="box" size="0.015 0.01 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <geom name="obstacle_z3_15" pos="3.40 -0.12 0.003" type="box" size="0.01 0.018 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <geom name="obstacle_z3_16" pos="4.15 0.28 0.003" type="box" size="0.012 0.008 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+    <!-- Utility knife -->
+    <geom name="obstacle_z3_17" pos="4.25 -0.30 0.006" type="box" size="0.055 0.008 0.006" rgba="0.85 0.75 0.1 1" friction="1.0" quat="0.9962 0 0 -0.0872"/>
+    <!-- Small box (parts container, tipped) -->
+    <geom name="obstacle_z3_18" pos="4.35 0.08 0.020" type="box" size="0.04 0.03 0.020" rgba="0.2 0.5 0.8 1" friction="1.0"/>
+
+    <!-- ======================== ZONE 4: Final gauntlet (x=4.6–6.0) ====== -->
+    <!-- Mixed obstacles — the robot must thread through carefully          -->
+
+    <!-- Cable running along path -->
+    <geom name="obstacle_z4_00" pos="4.80 -0.15 0.004" type="box" size="0.30 0.005 0.004" rgba="0.2 0.4 0.8 1" friction="1.0"/>
+    <!-- Another cable crossing -->
+    <geom name="obstacle_z4_01" pos="5.10 0.0 0.004" type="box" size="0.005 0.30 0.004" rgba="0.15 0.35 0.75 1" friction="1.0"/>
+    <!-- Tablet lying flat -->
+    <geom name="obstacle_z4_02" pos="4.75 0.20 0.004" type="box" size="0.10 0.065 0.004" rgba="0.2 0.2 0.25 1" friction="1.0"/>
+    <!-- Scattered stationery -->
+    <geom name="obstacle_z4_03" pos="5.00 0.25 0.004" type="box" size="0.065 0.004 0.004" rgba="0.1 0.1 0.8 1" friction="1.0" quat="0.9659 0 0 0.2588"/>
+    <geom name="obstacle_z4_04" pos="5.05 0.30 0.004" type="box" size="0.06 0.004 0.004" rgba="0.8 0.1 0.2 1" friction="1.0"/>
+    <!-- USB hub -->
+    <geom name="obstacle_z4_05" pos="5.20 -0.08 0.008" type="box" size="0.04 0.02 0.008" rgba="0.3 0.3 0.35 1" friction="1.0"/>
+    <!-- Coiled cable -->
+    <geom name="obstacle_z4_06" pos="5.35 0.10 0.006" type="cylinder" size="0.04 0.006" rgba="0.2 0.4 0.8 1" friction="1.0"/>
+    <!-- Phone -->
+    <geom name="obstacle_z4_07" pos="5.50 -0.25 0.004" type="box" size="0.075 0.035 0.004" rgba="0.6 0.15 0.15 1" friction="1.0" quat="0.9397 0 0 -0.342"/>
+    <!-- Small cardboard box -->
+    <geom name="obstacle_z4_08" pos="5.60 0.05 0.030" type="box" size="0.06 0.05 0.030" rgba="0.75 0.6 0.4 1" friction="1.0"/>
+    <!-- Loose screws -->
+    <geom name="obstacle_z4_09" pos="5.45 -0.05 0.003" type="cylinder" size="0.005 0.003" rgba="0.5 0.5 0.55 1" friction="1.0"/>
+    <geom name="obstacle_z4_10" pos="5.48 -0.02 0.003" type="cylinder" size="0.005 0.003" rgba="0.5 0.5 0.55 1" friction="1.0"/>
+    <!-- Final cable -->
+    <geom name="obstacle_z4_11" pos="5.80 -0.10 0.004" type="box" size="0.18 0.005 0.004" rgba="0.2 0.4 0.8 1" friction="1.0" quat="0.9848 0 0 0.1736"/>
+    <!-- Pen near finish -->
+    <geom name="obstacle_z4_12" pos="5.90 0.18 0.004" type="box" size="0.065 0.004 0.004" rgba="0.85 0.75 0.1 1" friction="1.0"/>
+    <!-- Last debris -->
+    <geom name="obstacle_z4_13" pos="6.00 -0.15 0.003" type="box" size="0.015 0.012 0.003" rgba="0.5 0.5 0.5 1" friction="1.0"/>
+
+
+    <!-- ======================== FINISH LINE ============================== -->
     <geom name="destination_x_1" pos="6.5 0.0 0.05" type="box" size="0.3 0.02 0.05" rgba="0.0 1.0 0.0 1" quat="0.9239 0 0 0.3827" contype="0" conaffinity="0"/>
     <geom name="destination_x_2" pos="6.5 0.0 0.05" type="box" size="0.3 0.02 0.05" rgba="0.0 1.0 0.0 1" quat="0.9239 0 0 -0.3827" contype="0" conaffinity="0"/>
-
-    <!-- Finish line - Two vertical poles with horizontal bar -->
     <geom name="finish_pole_left" pos="6.5 -0.5 0.4" type="cylinder" size="0.03 0.4" rgba="1.0 1.0 1.0 1" contype="0" conaffinity="0"/>
     <geom name="finish_pole_right" pos="6.5 0.5 0.4" type="cylinder" size="0.03 0.4" rgba="1.0 1.0 1.0 1" contype="0" conaffinity="0"/>
     <geom name="finish_bar" pos="6.5 0.0 0.75" type="box" size="0.02 0.5 0.02" rgba="1.0 1.0 1.0 1" contype="0" conaffinity="0"/>
