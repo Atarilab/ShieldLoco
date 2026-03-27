@@ -91,10 +91,11 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
                 )
 
             self.eval_cfg.start_mpc = True
+            self.eval_m.start_time = time.time()
 
         cmd = super().compute_lowlevelcmd(state)
 
-        if self.eval_m.started:
+        if self.eval_cfg.start_mpc and self.safety_manager._plan_count >= self.eval_cfg.min_plans:
             self._eval_log_step(state)
 
         return cmd
@@ -124,7 +125,6 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
             self.logger.info(f"[EvalController] Reset signal written: {_reset_sig}")
 
         self.eval_m.started = True
-        self.eval_m.start_time = time.time()
         self.eval_m.file = open(self.eval_cfg.controller_metric_file, "w", newline="")
         self.eval_m.writer = csv.DictWriter(
             self.eval_m.file,

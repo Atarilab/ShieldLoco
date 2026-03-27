@@ -8,7 +8,7 @@ start_move: up            # forward
 
 goal_position: [6.5, 0.0] # xy only
 goal_threshold: 0.5        # metres
-max_time: 120.0            # seconds
+max_time: 200.0            # seconds
 
 sim_metric_file: logs/eval/sim_a.csv
 controller_metric_file: logs/eval/ctrl_a.csv

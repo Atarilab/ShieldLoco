@@ -567,6 +567,13 @@ class RLQuadrupedMPSController(RLControllerBase):
             if hasattr(self, "soft_dof_pos_limit"):
                 self.joint_pos_targets = self._clip_dof_pos(self.joint_pos_targets)
 
+            # NaN/Inf guard: torch.clamp does NOT replace NaN, so a corrupt plan
+            # can still reach MuJoCo. Fall back to default pose to prevent sim crash.
+            if torch.isnan(self.joint_pos_targets).any() or torch.isinf(self.joint_pos_targets).any():
+                if self.logger is not None:
+                    self.logger.warning("[MPS] NaN/Inf in joint_pos_targets — reverting to default pose.")
+                self.joint_pos_targets = self.default_joint_pos.clone()
+
             # Prepare motor commands
             self.cmd = {
                 f"motor_{i}": {
@@ -873,6 +880,14 @@ class RLQuadrupedMPSController(RLControllerBase):
                     f"got {tuple(optimized_plan.shape)}, expected {tuple(self.future_feet_positions_w.shape)}"
                 )
             return
+
+        if torch.isnan(optimized_plan).any() or torch.isinf(optimized_plan).any():
+            if self.logger is not None:
+                self.logger.warning(
+                    "[MPS] NaN/Inf in optimized contact plan — keeping reference trajectory. "
+                    "Likely MPPI weight collapse: check safety_weight vs temperature ratio."
+                )
+            return  # keep existing future_feet_positions_w unchanged
 
         self.future_feet_positions_w[:] = optimized_plan
 
