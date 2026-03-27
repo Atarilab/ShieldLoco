@@ -21,6 +21,7 @@ class EvalConfig:
     start_gait: str = "trot"
     start_move: str = "up"                          # "up"=forward, "center"=stay
     min_plans: int = 2                              # wait for N plans before auto-starting
+    start_mpc: bool = False
     max_time: float = 120.0                         # seconds; writes done_file when elapsed
     controller_metric_file: str = "logs/eval/ctrl.csv"
     done_file: str = "logs/eval/eval_done.txt"
@@ -72,7 +73,7 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
         if not self.eval_m.started:
             self._eval_autostart()
 
-        if self.safety_manager._plan_count == self.eval_cfg.min_plans:
+        if not self.eval_cfg.start_mpc and self.safety_manager._plan_count == self.eval_cfg.min_plans:
             move_cmd = {}
             if self.eval_cfg.start_move != "center":
                 move_cmd = {"move": self.eval_cfg.start_move}
@@ -82,6 +83,14 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
                 "mpc": "on",
                 **move_cmd,
             })
+
+            if self.logger:
+                self.logger.info(
+                    f"[EvalController] Auto-started: gait={self.eval_cfg.start_gait}, "
+                    f"move={self.eval_cfg.start_move}, mpc=on"
+                )
+
+            self.eval_cfg.start_mpc = True
 
         cmd = super().compute_lowlevelcmd(state)
 
@@ -123,11 +132,6 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
                         "tracking_cost", "plan_seq", "mpc_active"],
         )
         self.eval_m.writer.writeheader()
-        if self.logger:
-            self.logger.info(
-                f"[EvalController] Auto-started: gait={self.eval_cfg.start_gait}, "
-                f"move={self.eval_cfg.start_move}, mpc=on"
-            )
 
     def _eval_log_step(self, state):
         """Write one row to the controller metric CSV. Writes done_file on timeout."""
