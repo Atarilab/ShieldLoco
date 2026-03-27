@@ -324,6 +324,18 @@ class QuadRLTask(Task):
         self.robot_body_ids = jnp.asarray(robot_body_ids_np, dtype=jnp.int32)
         self.robot_body_radii = jnp.asarray(robot_body_radii_np, dtype=jnp.float32)
 
+
+        # Map MuJoCo geom types to our convention
+        # mjtGeom: 0=plane, 2=sphere, 3=capsule, 5=cylinder, 6=box
+        _type_map = {2: 0, 6: 1, 5: 2, 3: 0}
+        hazard_geom_types_mj = mj_model.geom_type[hazard_geom_ids]
+        self.hazard_types = jnp.asarray(
+            [_type_map.get(int(t), 0) for t in hazard_geom_types_mj], dtype=jnp.int32
+        )
+        self.hazard_half_extents = jnp.asarray(
+            mj_model.geom_size[hazard_geom_ids], dtype=jnp.float32
+        )
+
     def make_task_params(self) -> QuadRLTaskParams:
         n = self.max_dynamic_obstacles
         return QuadRLTaskParams(
@@ -720,52 +732,30 @@ class QuadRLTask(Task):
         geom_offset_world = jax.vmap(quat_rotate)(body_quat, self.hazard_geom_pos_local)
         return body_pos + geom_offset_world
 
-    def _contact_obstacle_cost(
-        self, task_params: QuadRLTaskParams, state: mjx.Data, contact_locations_w: jax.Array
-    ) -> jax.Array:
+    def _contact_obstacle_cost(self, task_params, state, contact_locations_w):
         if self.num_hazard_geoms == 0:
-            return jnp.array(0.0, dtype=jnp.float32)
-        
-        hazard_centers = self._hazard_geom_centers_world(state) # (num_hazards, 3)
+            return jnp.array(0.0)
 
-        body_pos = state.xpos[self.base_body_id]  # (3,)
-        contact_points = contact_locations_w.reshape(-1, 3)
-        contact_centers = jnp.mean(contact_locations_w, axis=0) # (2, 3)
+        hazard_centers = self._hazard_geom_centers_world(state)
+        body_pos = state.xpos[self.base_body_id]
 
-        scale = self.obstacle_cost_scale
+        foot_points = contact_locations_w.reshape(-1, 3)
 
-        # Use 2D (xy) distances — obstacle avoidance is a ground-plane problem.
-        # 3D distance inflates clearance by the z-offset between robot/feet and
-        # obstacle centers, weakening the gradient where it matters.
-
-        _EXP_MAX = 20.0  # exp(20) ≈ 5e8, safely below float32 overflow
-
-        # --- Body cost (exponential, 2D xy) ---
-        body_dist_xy = jnp.linalg.norm((body_pos - hazard_centers)[:, :2], axis=-1)
-        body_signed_clearance = body_dist_xy - self.hazard_geom_radii_2d - self.robot_radius
-        body_contact_cost = self.obstacle_cost_weight * jnp.sum(
-            jnp.exp(jnp.clip(-body_signed_clearance / scale, a_max=_EXP_MAX))
+        return contact_obstacle_cost_sdf(
+            body_pos_xy=body_pos[:2],
+            foot_positions=foot_points,
+            obstacle_centers=hazard_centers,
+            obstacle_half_extents=self.hazard_half_extents,
+            obstacle_types=self.hazard_types,              
+            obstacle_radii=self.hazard_geom_radii_2d,
+            robot_radius=self.robot_radius,
+            foot_radius=0.07,
+            margin=self.obstacle_clearance,
+            cost_weight=self.obstacle_cost_weight,
+            cost_fn="softplus",
+            alpha=1.0 / self.obstacle_cost_scale,
+            use_2d=True,  # ground-plane check for footstep planning
         )
-
-        # --- Foot cost (exponential, 2D xy, per foot-hazard pair) ---
-        foot_dist_xy = jnp.linalg.norm(
-            contact_points[:, None, :2] - hazard_centers[None, :, :2], axis=-1
-        )  # (num_foot, num_hazards)
-        foot_signed_clearance = foot_dist_xy - self.hazard_geom_radii_2d[None, :]
-        foot_contact_cost = self.obstacle_cost_weight * jnp.sum(
-            jnp.exp(jnp.clip(-foot_signed_clearance / scale, a_max=_EXP_MAX))
-        )
-
-        # --- Contact center cost (exponential, 2D xy) ---
-        contact_center_dist_xy = jnp.linalg.norm(
-            contact_centers[:, None, :2] - hazard_centers[None, :, :2], axis=-1
-        )  # (num_contact_center, num_hazards)
-        contact_center_signed_clearance = contact_center_dist_xy - self.hazard_geom_radii_2d[None, :] - self.robot_radius
-        contact_center_cost = self.obstacle_cost_weight * jnp.sum(
-            jnp.exp(jnp.clip(-contact_center_signed_clearance / scale, a_max=_EXP_MAX))
-        )
-
-        return body_contact_cost + foot_contact_cost + contact_center_cost
 
     def _dynamic_obstacle_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data, contact_locations_w: jax.Array
@@ -948,10 +938,225 @@ class QuadRLTask(Task):
         contact_locations_w = self.plan_seg_to_contact_locations(
             self.denormalize(plan_segment)
         )
+
         static_obstacle_cost = self._contact_obstacle_cost(
             task_params, state, contact_locations_w
         )
-        dynamic_obstacle_cost = self._dynamic_obstacle_cost(
-            task_params, state, contact_locations_w
-        )
-        return tracking_cost + static_obstacle_cost + dynamic_obstacle_cost
+
+        # dynamic_obstacle_cost = self._dynamic_obstacle_cost(
+        #     task_params, state, contact_locations_w
+        # )
+
+        return tracking_cost + static_obstacle_cost #+ dynamic_obstacle_cost
+
+
+
+
+
+# =============================================================================
+# 1. SDF Primitives (negative inside, positive outside)
+# =============================================================================
+
+def sdf_sphere(point: jax.Array, center: jax.Array, radius: float) -> jax.Array:
+    return jnp.linalg.norm(point - center) - radius
+
+
+def sdf_box_3d(point: jax.Array, center: jax.Array, half_extents: jax.Array,
+               rotation: jax.Array = None) -> jax.Array:
+    """Exact SDF for a 3D box (oriented or axis-aligned). Inigo Quilez formula."""
+    p = point - center
+    if rotation is not None:
+        p = rotation.T @ p
+    q = jnp.abs(p) - half_extents
+    return jnp.linalg.norm(jnp.maximum(q, 0.0)) + jnp.minimum(jnp.max(q), 0.0)
+
+
+def sdf_box_2d(point_xy: jax.Array, center_xy: jax.Array,
+               half_extents_xy: jax.Array) -> jax.Array:
+    """Exact SDF for a 2D box (ground-plane foothold check)."""
+    q = jnp.abs(point_xy - center_xy) - half_extents_xy
+    return jnp.linalg.norm(jnp.maximum(q, 0.0)) + jnp.minimum(jnp.max(q), 0.0)
+
+
+def sdf_cylinder(point: jax.Array, center: jax.Array, radius: float,
+                 half_height: float) -> jax.Array:
+    """Exact SDF for an upright (z-axis) cylinder."""
+    p = point - center
+    d_radial = jnp.linalg.norm(p[:2]) - radius
+    d_axial = jnp.abs(p[2]) - half_height
+    outside = jnp.linalg.norm(jnp.maximum(jnp.array([d_radial, d_axial]), 0.0))
+    inside = jnp.minimum(jnp.maximum(d_radial, d_axial), 0.0)
+    return outside + inside
+
+
+def sdf_capsule(point: jax.Array, a: jax.Array, b: jax.Array,
+                radius: float) -> jax.Array:
+    """Exact SDF for a capsule (sphere-swept line segment)."""
+    pa = point - a
+    ba = b - a
+    t = jnp.clip(jnp.dot(pa, ba) / (jnp.dot(ba, ba) + 1e-8), 0.0, 1.0)
+    return jnp.linalg.norm(point - (a + t * ba)) - radius
+
+
+# =============================================================================
+# 2. Cost Wrappers: "zero outside, active inside" (SemLoco-style)
+# =============================================================================
+#
+# SemLoco's 1_col(pk) is the limiting case: step function at the boundary.
+# Below are smooth approximations ordered by how closely they match that
+# step-function behavior, all sharing the property:
+#   cost ≈ 0 when sdf > margin (safely outside)
+#   cost > 0 when sdf < 0 (inside obstacle)
+#   gradient points toward nearest surface when inside
+
+def cost_indicator_smooth(sdf_val: jax.Array, margin: float = 0.02,
+                          sharpness: float = 50.0) -> jax.Array:
+    """
+    Smooth approximation of SemLoco's binary indicator 1_col.
+
+    Uses a sigmoid: σ(sharpness * (margin - sdf))
+      - ≈ 1.0 deep inside the obstacle (sdf << 0)
+      - ≈ 0.5 at the boundary (sdf = margin)
+      - ≈ 0.0 safely outside (sdf >> margin)
+
+    As sharpness → ∞, this converges to 1_col exactly.
+    But unlike 1_col, it's C^∞ differentiable everywhere.
+
+    This is the closest match to SemLoco's formulation.
+    Best for: when you want near-binary inside/outside but need gradients.
+    """
+    return jax.nn.sigmoid(sharpness * (margin - sdf_val))
+
+
+def cost_softplus(sdf_val: jax.Array, margin: float = 0.02,
+                  alpha: float = 20.0) -> jax.Array:
+    """
+    Softplus cost: (1/α) * log(1 + exp(α * (margin - sdf)))
+
+    Unlike the sigmoid above, this grows linearly as you go deeper
+    inside the obstacle — stronger gradient to escape from deep penetration.
+    Near the boundary, it's smooth and near-zero outside.
+
+    Best for: sampling-based planners (MPPI/MPS) where you want both
+    the "zero outside" property AND a strong escape gradient inside.
+    """
+    return jax.nn.softplus(alpha * (margin - sdf_val)) / alpha
+
+
+def cost_hinge_squared(sdf_val: jax.Array, margin: float = 0.02) -> jax.Array:
+    """
+    Squared hinge: max(margin - sdf, 0)^2
+
+    Exactly zero when sdf > margin (hard cutoff, not exponential decay).
+    Quadratic ramp inside. C^1 at the boundary.
+
+    Best for: when you want STRICTLY zero cost outside (no exponential tail).
+    This is what TrajOpt effectively uses.
+    """
+    return jnp.maximum(margin - sdf_val, 0.0) ** 2
+
+
+# =============================================================================
+# 3. Drop-in replacement for QuadRLTask._contact_obstacle_cost
+# =============================================================================
+
+def contact_obstacle_cost_sdf(
+    body_pos_xy: jax.Array,            # (2,) robot body XY position
+    foot_positions: jax.Array,         # (N, 3) or (N, 2) foot contact positions
+    obstacle_centers: jax.Array,       # (M, 3) obstacle centers in world
+    obstacle_half_extents: jax.Array,  # (M, 3) half-extents [hx, hy, hz]
+    obstacle_types: jax.Array,         # (M,) int: 0=sphere, 1=box, 2=cylinder
+    obstacle_radii: jax.Array,         # (M,) radii for spheres/cylinders
+    robot_radius: float = 0.3,
+    foot_radius: float = 0.02,        # dilates AABB by foot radius
+    margin: float = 0.2,             # safety margin (uses rfoot)
+    cost_weight: float = 100.0,       # w_col in SemLoco
+    cost_fn: str = "softplus",        # "sigmoid", "softplus", "hinge_sq"
+    alpha: float = 20.0,              # sharpness parameter
+    use_2d: bool = True,              # ground-plane only (like SemLoco)
+) -> jax.Array:
+    """
+    This computes smooth SDF-based cost for continuous optimization.
+
+    The effective margin = foot_radius + margin
+
+    Args:
+        body_pos_xy: Robot body center (for body-level avoidance)
+        foot_positions: Foot contact locations in world frame
+        obstacle_centers: Obstacle center positions
+        obstacle_half_extents: Half-sizes for box obstacles
+        obstacle_types: 0=sphere, 1=box, 2=cylinder per obstacle
+        obstacle_radii: Radii for sphere/cylinder obstacles
+        robot_radius: Body bounding radius
+        foot_radius: Foot bounding radius (SemLoco's rfoot)
+        margin: Additional safety margin beyond foot_radius
+        cost_weight: Penalty weight (SemLoco's w_col)
+        cost_fn: Which smooth approximation to use
+        alpha: Sharpness (higher = closer to binary indicator)
+        use_2d: If True, only check XY plane (ground-plane foothold)
+
+    Returns:
+        Scalar cost (0.0 when all feet are safely outside obstacles)
+    """
+    n_obs = obstacle_centers.shape[0]
+    if n_obs == 0:
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    effective_margin = foot_radius + margin
+
+    # Select cost wrapper
+    if cost_fn == "sigmoid":
+        _cost = lambda s: cost_indicator_smooth(s, effective_margin, alpha)
+    elif cost_fn == "hinge_sq":
+        _cost = lambda s: cost_hinge_squared(s, effective_margin)
+    else:  # softplus (default, recommended)
+        _cost = lambda s: cost_softplus(s, effective_margin, alpha)
+
+    def _sdf_one(point, obs_idx):
+        """SDF from one point to one obstacle."""
+        c = obstacle_centers[obs_idx]
+        he = obstacle_half_extents[obs_idx]
+        r = obstacle_radii[obs_idx]
+        otype = obstacle_types[obs_idx]
+
+        if use_2d:
+            # Ground-plane check: foot XY vs obstacle XY footprint
+            sdf_s = jnp.linalg.norm(point[:2] - c[:2]) - r
+            sdf_b = sdf_box_2d(point[:2], c[:2], he[:2])
+            sdf_c = jnp.linalg.norm(point[:2] - c[:2]) - r  # cylinder = circle in 2D
+        else:
+            # Full 3D check
+            sdf_s = sdf_sphere(point, c, r)
+            sdf_b = sdf_box_3d(point, c, he)
+            sdf_c = sdf_cylinder(point, c, r, he[2])
+
+        return jnp.where(otype == 0, sdf_s,
+               jnp.where(otype == 1, sdf_b, sdf_c))
+
+    obs_indices = jnp.arange(n_obs)
+
+    # --- Per-foot cost ---
+    def _foot_cost(foot_pos):
+        sdfs = jax.vmap(lambda idx: _sdf_one(foot_pos, idx))(obs_indices)
+        return jnp.sum(_cost(sdfs))
+
+    foot_cost = jnp.sum(jax.vmap(_foot_cost)(foot_positions))
+
+    # --- Body cost (optional) ---
+    def _body_sdf(obs_idx):
+        c = obstacle_centers[obs_idx]
+        he = obstacle_half_extents[obs_idx]
+        r = obstacle_radii[obs_idx]
+        otype = obstacle_types[obs_idx]
+        # Body is a circle in 2D
+        sdf_s = jnp.linalg.norm(body_pos_xy - c[:2]) - r - robot_radius
+        sdf_b = sdf_box_2d(body_pos_xy, c[:2], he[:2]) - robot_radius
+        sdf_c = sdf_s  # same as sphere in 2D
+        return jnp.where(otype == 0, sdf_s,
+               jnp.where(otype == 1, sdf_b, sdf_c))
+
+    body_sdfs = jax.vmap(_body_sdf)(obs_indices)
+    body_cost = jnp.sum(_cost(body_sdfs))
+
+    return cost_weight * (foot_cost + body_cost)
+

@@ -15,7 +15,7 @@ use_threading: false
 use_buffer: false
 device: 'cpu' # "cuda:0"  
 feet_step_size: 0.0
-horizon_length: &horizon_length 5 # footstep horizon
+horizon_length: &horizon_length 8 # footstep horizon
 action_filter_alpha: 0.5
 transition_duration: 0
 visualize: 
@@ -66,7 +66,7 @@ foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
 # 0.3 noise for [-1, 1] normalized
 # plan_lim in meters would be 0.3 * 0.25 (action scale) = 0.075 m
-plan_lim: 0.25
+plan_lim: 0.2
 act_rl_clip: 100 # there is no clip on actions actually
 action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
 
@@ -78,20 +78,21 @@ kp: *stiffness
 kd: *damping
 
 mps_alg_name: "MIMPS"
-mps_num_samples: 512
+mps_num_samples: 800
 mps_noise_level: 0.3        # was 0.3; larger noise allows bigger lateral body shifts (0.2m/step)
-mps_temperature: 1.0
+mps_temperature: 0.01
 mps_plan_horizon: *horizon_length
 mps_iterations: 1           # keep 1: more iterations doubles plan latency (~2.6s), hurting timing
 mps_gamma: 0.99
-mps_safety_weight: 10
+mps_safety_weight: 5000
 mps_collect_data: true
 mps_top_fraction: 0.01
 apply_mpc_contact_plan: false
 
 # Obstacle avoidance cost parameters
-obstacle_cost_weight: 300.0
-obstacle_cost_scale: 0.15   # Exponential decay length scale (meters). Larger = feel obstacles from further.
+obstacle_cost_weight: 1000.0
+obstacle_cost_scale: 1
+obstacle_clearance: 0.1
 
 # Dynamic obstacle (ball) parameters
 max_dynamic_obstacles: 5

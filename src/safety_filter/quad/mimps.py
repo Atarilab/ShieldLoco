@@ -120,7 +120,14 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # Shape: (num_samples, H, plan_dim)
         increments_mean = plans_mean - params.ref
         # Shape: (num_samples,)
-        weights_mean = jax.nn.softmax(-costs_mean / self.temperature, axis=0)
+        # Normalize costs by their std before weighting so that `temperature` is a
+        # dimensionless sharpness parameter independent of cost magnitude.  Without
+        # this, large safety_weight values cause exp(-cost/T) to underflow to 0 for
+        # all-but-the-best sample, collapsing MPPI to pure argmin selection and
+        # producing NaN weighted averages when costs contain outliers.
+        cost_std = jnp.std(costs_mean)
+        costs_normed = (costs_mean - jnp.mean(costs_mean)) / (cost_std + 1e-6)
+        weights_mean = jax.nn.softmax(-costs_normed / self.temperature, axis=0)
         # Shape: (num_plans, plan_dim)
         new_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
 
@@ -183,11 +190,11 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         # --- Per-foot residual noise (small individual adjustment) ---
         foot_noise = jax.random.normal(foot_rng, (N, H, 4, 3))
-        foot_xy = foot_noise[..., :2] * 0.1
+        foot_xy = foot_noise[..., :2]
         foot_z  = foot_noise[..., 2:] * 0.01  # z stays near ground
 
         # --- Combine: body dominates xy, foot residuals are small ---
-        combined_xy = 0.7 * body_xy_4feet + 0.3 * foot_xy   # (N, H, 4, 2)
+        combined_xy = 0.3 * body_xy_4feet + 0.7 * foot_xy   # (N, H, 4, 2)
         combined = jnp.concatenate([combined_xy, foot_z], axis=-1)  # (N, H, 4, 3)
 
         # Flatten to plan_dim: (N, H, 12)
