@@ -174,9 +174,17 @@ def parse_episode(
     # Count onset events (0→1 transitions) rather than total flagged steps
     col_vals = [int(r.get("collision", 0)) for r in sim_rows]
     fall_vals = [int(r.get("fall", 0)) for r in sim_rows]
-    collision_events = sum(1 for i in range(1, len(col_vals)) if col_vals[i] == 1 and col_vals[i-1] == 0)
-    fall_events = sum(1 for i in range(1, len(fall_vals)) if fall_vals[i] == 1 and fall_vals[i-1] == 0)
+    foot_col_vals = [int(r.get("foot_collision", 0)) for r in sim_rows]
+
+    def _onset_count(vals):
+        return sum(1 for i in range(1, len(vals)) if vals[i] == 1 and vals[i-1] == 0)
+
+    collision_events = _onset_count(col_vals)
+    fall_events = _onset_count(fall_vals)
+    foot_collision_events = _onset_count(foot_col_vals)
+
     summary["collision_events"] = collision_events
+    summary["foot_collision_events"] = foot_collision_events
     summary["fall_events"] = fall_events
     summary["constraint_violations"] = collision_events + fall_events
     summary["collision_steps"] = sum(col_vals)
@@ -369,7 +377,7 @@ def main():
             f"goal={s.get('goal_reached')}  "
             f"t_goal={s.get('time_to_goal')}  "
             f"violations={s.get('constraint_violations')}  "
-            f"mean_cost={s.get('mean_tracking_cost'):.4f if s.get('mean_tracking_cost') else 'N/A'}  "
+            f"mean_cost={s['mean_tracking_cost']:.4f if s.get('mean_tracking_cost') is not None else 'N/A'}  "
             f"overrides={s.get('overrides')}"
         )
 

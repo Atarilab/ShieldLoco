@@ -396,16 +396,10 @@ class QuadSamplingBasedPlanner(ABC):
             a_ref = params.ref[idx : idx + 2]
 
             # this is propogate the system by dt
-            tp, x_next = self.task.dynamics(model, tp, x, a, a_ref)
+            tp, x_next, task_cost, constraint_flag = self.task.forward(model, tp, x, a, a_ref)
 
-            task_cost = self.dt * self.task.running_cost(tp, x_next, a, a_ref) * discount
-
-            # Evaluate constraints on the post-action state so hazards caused by
-            # the sampled plan are penalized in the same stage.
-            constraint_flag = self.task.constraint_check(x_next) * discount
-
-            task_costs = task_costs.at[i].set(task_cost)
-            constraint_flags = constraint_flags.at[i].set(constraint_flag)
+            task_costs = task_costs.at[i].set(task_cost * self.dt * discount)
+            constraint_flags = constraint_flags.at[i].set(constraint_flag * discount)
 
             discount = discount * self.gamma
             x = x_next

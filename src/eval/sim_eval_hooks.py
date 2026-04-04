@@ -95,7 +95,7 @@ class SimEvalHooks:
         self._writer = csv.DictWriter(
             self._file,
             fieldnames=["t", "x", "y", "z", "vx", "vy", "heading_error",
-                        "collision", "fall", "goal_dist", "ball_dist"],
+                        "collision", "foot_collision", "fall", "goal_dist", "ball_dist"],
         )
         self._writer.writeheader()
         self._step = 0
@@ -127,6 +127,7 @@ class SimEvalHooks:
         base_vel = self.mj_data.qvel[:2].copy()  # world-frame vx, vy
 
         collision = int(self._check_collision())
+        foot_collision = int(self._check_foot_collision())
         fall = int(self._check_fall())
         goal_pos = np.array(self.cfg.goal_position[:2])
         goal_dist = float(np.linalg.norm(base_pos[:2] - goal_pos))
@@ -148,6 +149,7 @@ class SimEvalHooks:
             "vy": f"{base_vel[1]:.4f}",
             "heading_error": f"{heading_err:.4f}",
             "collision": collision,
+            "foot_collision": foot_collision,
             "fall": fall,
             "goal_dist": f"{goal_dist:.4f}",
             "ball_dist": f"{ball_dist:.4f}",
@@ -185,9 +187,17 @@ class SimEvalHooks:
         ngeom = mj_model.ngeom
         geom_is_hazard = np.zeros(ngeom, dtype=bool)
         geom_is_robot = np.zeros(ngeom, dtype=bool)
+        geom_is_foot = np.zeros(ngeom, dtype=bool)
 
         hazard_prefixes = ("obstacle_",)
         base_link_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+
+        # Foot contact spheres are on the calf bodies (e.g. FL_calf), not the
+        # foot bodies (FL_foot) which are kinematic endpoints with no geoms.
+        foot_body_ids = {
+            bid for bid in range(mj_model.nbody)
+            if (mj_model.body(bid).name or "").endswith("_calf")
+        }
 
         for gid in range(ngeom):
             geom_name = mj_model.geom(gid).name or ""
@@ -196,9 +206,12 @@ class SimEvalHooks:
             body_id = mj_model.geom_bodyid[gid]
             if mj_model.body_rootid[body_id] == base_link_id:
                 geom_is_robot[gid] = True
+            if body_id in foot_body_ids:
+                geom_is_foot[gid] = True
 
         self._geom_is_hazard = geom_is_hazard
         self._geom_is_robot = geom_is_robot
+        self._geom_is_foot = geom_is_foot
 
     # ------------------------------------------------------------------
     # Constraint checks (NumPy / pure MuJoCo — no JAX)
@@ -210,6 +223,22 @@ class SimEvalHooks:
             g1, g2 = int(c.geom1), int(c.geom2)
             if (self._geom_is_robot[g1] and self._geom_is_hazard[g2]) or \
                (self._geom_is_robot[g2] and self._geom_is_hazard[g1]):
+                return True
+        return False
+
+    def _check_foot_collision(self) -> bool:
+        """True if a foot geom is in contact with an obstacle geom.
+
+        MuJoCo's constraint solver prevents real penetration (c.dist ≈ 0 for all
+        resolved contacts), so depth thresholds are ineffective. Filtering to foot
+        geoms only is sufficient — they are small spheres at the leg tips and rarely
+        graze obstacles during swing unless there is actual impact.
+        """
+        for i in range(self.mj_data.ncon):
+            c = self.mj_data.contact[i]
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if (self._geom_is_foot[g1] and self._geom_is_hazard[g2]) or \
+               (self._geom_is_foot[g2] and self._geom_is_hazard[g1]):
                 return True
         return False
 

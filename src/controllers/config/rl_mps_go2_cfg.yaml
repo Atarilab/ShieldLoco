@@ -15,7 +15,7 @@ use_threading: false
 use_buffer: false
 device: 'cpu' # "cuda:0"  
 feet_step_size: 0.0
-horizon_length: &horizon_length 8 # footstep horizon
+horizon_length: &horizon_length 4 # footstep horizon
 action_filter_alpha: 0.5
 transition_duration: 0
 visualize: 
@@ -84,15 +84,15 @@ mps_temperature: 0.01
 mps_plan_horizon: *horizon_length
 mps_iterations: 1           # keep 1: more iterations doubles plan latency (~2.6s), hurting timing
 mps_gamma: 0.99
-mps_safety_weight: 5000
+mps_safety_weight: 10000
 mps_collect_data: true
 mps_top_fraction: 0.01
 apply_mpc_contact_plan: false
 
 # Obstacle avoidance cost parameters
-obstacle_cost_weight: 1000.0
-obstacle_cost_scale: 1
-obstacle_clearance: 0.1
+obstacle_cost_weight: 500.0
+obstacle_cost_scale: 0.01
+obstacle_clearance: 0.5
 
 # Dynamic obstacle (ball) parameters
 max_dynamic_obstacles: 5

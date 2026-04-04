@@ -622,7 +622,7 @@ class QuadRLTask(Task):
         state: mjx.Data,
         plan_segment: jax.Array,
         plan_segment_ref: jax.Array | None = None,
-    ) -> Tuple[QuadRLTaskParams, mjx.Data]:
+    ) -> Tuple[QuadRLTaskParams, mjx.Data, jax.Array]:
         # If ref is optional, default to zeros (or task's current ref convention)
         if plan_segment_ref is None:
             plan_segment_ref = jnp.zeros_like(plan_segment)
@@ -636,6 +636,8 @@ class QuadRLTask(Task):
 
         def _hold_policy(tp, s):
             return tp, tp.last_q_des
+
+        constraint_hits = 0.
 
         for _ in range(self.rollout_decimation):
             # Use the integer step counter to detect command-period boundaries.
@@ -943,9 +945,9 @@ class QuadRLTask(Task):
             task_params, state, contact_locations_w
         )
 
-        # dynamic_obstacle_cost = self._dynamic_obstacle_cost(
-        #     task_params, state, contact_locations_w
-        # )
+        dynamic_obstacle_cost = self._dynamic_obstacle_cost(
+            task_params, state, contact_locations_w
+        )
 
         return tracking_cost + static_obstacle_cost #+ dynamic_obstacle_cost
 
