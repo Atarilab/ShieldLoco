@@ -119,8 +119,15 @@ class SafetyManager:
             from .quad.task import QuadRLTask, QuadRLTaskParams
             self.task = QuadRLTask(self.mj_model, self.rl_policy_jax, self.rl_config)
 
-            nconmax = self.rl_config.get("mps_num_samples", 1000) * 60
-            self.task.data = mjx.make_data(self.task.mj_model, impl="warp", nconmax=nconmax, njmax=2000)
+            _num_samples    = self.rl_config.get("mps_num_samples", 400)
+            _ncon_per_world = self.rl_config.get("mps_ncon_per_world", 32)  # empirical max: 23
+            _njmax          = self.rl_config.get("mps_njmax", 512)           # per-world; empirical max: 161
+            self.task.data = mjx.make_data(
+                self.task.mj_model,
+                impl="warp",
+                nconmax=_ncon_per_world * _num_samples,
+                njmax=_njmax,
+            )
 
             self.task_params = self.task.make_task_params()
 
@@ -497,7 +504,26 @@ def _init_worker_objects(mj_model, rl_policy, rl_config):
     from .quad.mimps import QuadMIMPSPlanner
 
     task = QuadRLTask(mj_model, rl_policy_jax, rl_config)
-    task.data = mjx.make_data(task.mj_model, impl="warp", nconmax=20000, njmax=1000)
+    # Buffer sizing for the MJX warp backend — two different semantics:
+    #
+    # nconmax = TOTAL contacts across ALL parallel worlds (must scale with num_samples).
+    #   Evidence: "increase nconmax to 22" with nconmax=64 total means ~22 contacts/world
+    #   × 400 worlds = 8800 needed >> 64 total.
+    #
+    # njmax = PER-WORLD efc rows (must NOT scale with num_samples).
+    #   Evidence: "increase njmax to 161" = per-world nefc count needed.
+    #   After vmap over N samples, efc_J becomes (N, njmax, nv).
+    #   njmax=512 → (400, 512, 18) × 4 bytes = 14.7 MB — fine.
+    #   njmax=512×400=204800 → (400, 204800, 18) = 5.9 GB → OOM (previous mistake).
+    _num_samples    = rl_config.get("mps_num_samples", 400)
+    _ncon_per_world = rl_config.get("mps_ncon_per_world", 32)  # empirical max: 23
+    _njmax          = rl_config.get("mps_njmax", 512)           # per-world; empirical max: 161
+    task.data = mjx.make_data(
+        task.mj_model,
+        impl="warp",
+        nconmax=_ncon_per_world * _num_samples,
+        njmax=_njmax,
+    )
     task_params = task.make_task_params()
 
     planner = QuadMIMPSPlanner(

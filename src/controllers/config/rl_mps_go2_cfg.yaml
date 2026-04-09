@@ -83,16 +83,25 @@ mps_noise_level: 0.3        # was 0.3; larger noise allows bigger lateral body s
 mps_temperature: 0.01
 mps_plan_horizon: *horizon_length
 mps_iterations: 1           # keep 1: more iterations doubles plan latency (~2.6s), hurting timing
+mps_policy_decimation: 1    # call RL policy every sim step (~30ms ≈ real 20ms rate).
+                            # Must stay at 1: policy trained at 50Hz; holding PD target for a full
+                            # 300ms plan step (decimation=10) makes rollouts diverge → garbage plans.
 mps_gamma: 0.99
 mps_safety_weight: 10000
 mps_collect_data: true
-mps_top_fraction: 0.01
-apply_mpc_contact_plan: false
+mps_top_fraction: 0.02
+# Contact buffer sizing — two different semantics in the warp backend:
+#   nconmax = TOTAL across all worlds → allocated as ncon_per_world * num_samples.
+#   njmax   = PER-WORLD efc rows     → NOT scaled; after vmap efc_J = (N, njmax, nv).
+# Empirical peaks: ~23 contacts/world, ~161 efc rows/world.
+mps_ncon_per_world: 32   # per-world budget; total = 32 * 400 = 12800
+mps_njmax: 512            # per-world; (400, 512, 18) × 4 bytes = 14.7 MB after vmap
+apply_mpc_contact_plan: false # enabled in code during run cuz jit compile is slow
 
-# Obstacle avoidance cost parameters
-obstacle_cost_weight: 500.0
-obstacle_cost_scale: 0.01
-obstacle_clearance: 0.5
+# --- Speed tuning ---
+physics_iterations: 4     # Newton solver iters per MJX step (default 8). 4 ≈ 2x faster sim, slight accuracy loss.
+physics_ls_iterations: 4  # Line-search iters (default 8). Pair with physics_iterations.
+
 
 # Dynamic obstacle (ball) parameters
 max_dynamic_obstacles: 5

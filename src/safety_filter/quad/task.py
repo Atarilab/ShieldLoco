@@ -142,9 +142,11 @@ class QuadRLTask(Task):
         mj_model.opt.cone = self.meta_data._CONE_MAP[self.meta_data.cone]
         mj_model.opt.jacobian = self.meta_data._JACOBIAN_MAP[self.meta_data.jacobian]
         mj_model.opt.solver = self.meta_data._SOLVER_MAP[self.meta_data.solver]
-        mj_model.opt.iterations = self.meta_data.iterations
+        # Allow overriding solver iterations from config for speed tuning.
+        # Reducing from 8 to 4 roughly halves per-step Newton solve cost.
+        mj_model.opt.iterations = int(rl_config.get("physics_iterations", self.meta_data.iterations))
         mj_model.opt.tolerance = self.meta_data.tolerance
-        mj_model.opt.ls_iterations = self.meta_data.ls_iterations
+        mj_model.opt.ls_iterations = int(rl_config.get("physics_ls_iterations", self.meta_data.ls_iterations))
         mj_model.opt.ls_tolerance = self.meta_data.ls_tolerance
 
         super().__init__(mj_model, trace_sites)
@@ -234,7 +236,12 @@ class QuadRLTask(Task):
         # rollout_decimation is how many sim steps we should take
         # it should be roughly equal to the command duration
         self.rollout_decimation = max(1, int(round(self.command_duration / sim_dt)))
-        self.policy_decimation = max(1, int(round(rl_policy_dt / sim_dt)))
+        # For MPC rollouts the RL policy only needs to fire once per plan step (not every
+        # sub-step). `mps_policy_decimation` defaults to rollout_decimation so the policy
+        # is called once per horizon step.  The real-robot decimation (rl_policy_dt /
+        # sim_dt ≈ 1) is intentionally *not* used here because it causes 10× more NN
+        # inference than needed.
+        self.policy_decimation = int(rl_config.get("mps_policy_decimation", self.rollout_decimation))
 
         self.gait_patterns = jnp.array(
             [
@@ -637,55 +644,49 @@ class QuadRLTask(Task):
         def _hold_policy(tp, s):
             return tp, tp.last_q_des
 
-        constraint_hits = 0.
+        # Use jax.lax.scan instead of a Python for loop so XLA compiles the body
+        # once (a while-loop) rather than unrolling rollout_decimation copies of
+        # mjx.step into the HLO graph.  Unrolling 10 steps × 8 horizon = 80
+        # sequential kernel launches; scan reduces this to a single while-loop.
+        def _substep(carry, _):
+            tp, s, hits = carry
 
-        for _ in range(self.rollout_decimation):
-            # Use the integer step counter to detect command-period boundaries.
-            # Wall-clock timestamps passed as state.time are Unix epoch values
-            # (~1.7e9 s); in float32 their ULP is ~200 s, so sub-second elapsed
-            # time comparisons always round to zero and should_resample never fires
-            # after the first reset.  The integer counter has no precision issue.
-            # Fire at the very first sub-step of every plan step EXCEPT step 0
-            # (counter==0) so that goal_idx starts at 0 for the first plan step.
-            counter = task_params.lowlevel_step_counter
+            # Advance goal at the first sub-step of every plan step (except step 0).
+            counter = tp.lowlevel_step_counter
             should_resample = jnp.logical_and(
                 jnp.equal(jnp.mod(counter, self.rollout_decimation), 0),
                 counter > 0,
             )
-            task_params = jax.lax.cond(
-                should_resample,
-                lambda p: self.update_goal(p),
-                lambda p: p,
-                task_params,
+            tp = jax.lax.cond(
+                should_resample, lambda p: self.update_goal(p), lambda p: p, tp
             )
 
+            # Call RL policy only every policy_decimation sub-steps.
             should_update_policy = jnp.equal(
-                jnp.mod(task_params.lowlevel_step_counter, self.policy_decimation), 0
+                jnp.mod(tp.lowlevel_step_counter, self.policy_decimation), 0
             )
-
-            task_params, q_des = jax.lax.cond(
+            tp, q_des = jax.lax.cond(
                 should_update_policy,
-                lambda _: _update_policy(task_params, state),
-                lambda _: _hold_policy(task_params, state),
-                operand=None,
+                lambda args: _update_policy(*args),
+                lambda args: _hold_policy(*args),
+                (tp, s),
             )
 
-            # Use actuator-ordered joint states to match master low-level PD path.
-            q = state.qpos[self.joint_qpos_indices]
-            dq = state.qvel[self.joint_qvel_indices]
+            q = s.qpos[self.joint_qpos_indices]
+            dq = s.qvel[self.joint_qvel_indices]
+            torq = jnp.clip(self.kp * (q_des - q) + self.kd * -dq, self.j_min, self.j_max)
+            s = mjx.step(model, s.replace(ctrl=torq))
+            tp = tp.replace(lowlevel_step_counter=tp.lowlevel_step_counter + 1)  # type: ignore
+            hits = hits + self.constraint_check(s)
+            return (tp, s, hits), None
 
-            dq_des = jnp.zeros_like(dq)
-
-            torq = self.kp * (q_des - q) + self.kd * (dq_des - dq)  # PD control law
-            # Clip the torques to prevent excessive forces
-            torq = jnp.clip(torq, self.j_min, self.j_max)
-
-            # Step physics
-            state = state.replace(ctrl=torq)
-            state = mjx.step(model, state)
-            task_params = task_params.replace(lowlevel_step_counter=task_params.lowlevel_step_counter + 1)  # type: ignore
-
-        return task_params, state
+        (task_params, state, constraint_hits), _ = jax.lax.scan(
+            _substep,
+            (task_params, state, jnp.array(0.0)),
+            None,
+            length=self.rollout_decimation,
+        )
+        return task_params, state, constraint_hits
 
     @partial(jax.jit, static_argnames=["self"])
     def constraint_check(self, state: mjx.Data) -> jax.Array:

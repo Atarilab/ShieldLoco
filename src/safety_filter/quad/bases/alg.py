@@ -380,36 +380,52 @@ class QuadSamplingBasedPlanner(ABC):
 
         task_costs = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
         constraint_flags = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
-        states_list = []
-        
+
         x = state
         tp = params.task_params
         discount = jnp.asarray(1.0)
-        
-        for i in range(self.plan_horizon):
-            # Advance through the plan using the loop counter directly so that
-            # every footstep row is visited and goal_idx wrap-around cannot
-            # corrupt the index. plans[0:2] → footstep 0+1, plans[1:3] → 1+2 …
-            # clips at the last valid window (plan_horizon-2 : plan_horizon).
-            idx = min(i, self.plan_horizon - 2)
-            a = plans[idx : idx + 2]      # shape (2, plan_dim)
-            a_ref = params.ref[idx : idx + 2]
 
-            # this is propogate the system by dt
+        # Pad plans by repeating the last row so every horizon step gets a unique
+        # 2-step window. Without padding, steps H-2 and H-1 both clip to the same
+        # window [H-2:H], meaning the optimizer has no control over the final step.
+        plans_padded = jnp.concatenate([plans, plans[-1:]], axis=0)      # (H+1, plan_dim)
+        ref_padded = jnp.concatenate([params.ref, params.ref[-1:]], axis=0)  # (H+1, plan_dim)
+
+        # Scan over horizon steps instead of unrolling a Python for loop.
+        # Unrolling plan_horizon=8 steps × rollout_decimation=10 sub-steps = 80
+        # sequential mjx.step kernels in the XLA graph; scan emits a single
+        # while-loop, reducing dispatch overhead and peak memory.
+        #
+        # IMPORTANT: only emit QuadAlgState (4 small arrays) as the scan's stacked
+        # output, NOT the full mjx.Data.  Full mjx.Data includes efc_J of shape
+        # (njmax, nv) = (204800, 18).  Stacked over plan_horizon=8 steps and vmapped
+        # over 400 samples that would be 8 × 400 × 204800 × 18 × 4 bytes ≈ 47 GB.
+        # QuadAlgState carries only qpos/qvel/xpos/xquat — the only fields ever read
+        # downstream (collect_data path in rollout_with_randomizations).
+        def _trim(s: mjx.Data) -> QuadAlgState:
+            return QuadAlgState(qpos=s.qpos, qvel=s.qvel, xpos=s.xpos, xquat=s.xquat)
+
+        def _plan_step(carry, i):
+            tp, x, task_costs, constraint_flags, discount = carry
+            a     = jax.lax.dynamic_slice(plans_padded, (i, 0), (2, self.task.plan_dim))
+            a_ref = jax.lax.dynamic_slice(ref_padded,   (i, 0), (2, self.task.plan_dim))
             tp, x_next, task_cost, constraint_flag = self.task.forward(model, tp, x, a, a_ref)
-
-            task_costs = task_costs.at[i].set(task_cost * self.dt * discount)
+            task_costs       = task_costs.at[i].set(task_cost * self.dt * discount)
             constraint_flags = constraint_flags.at[i].set(constraint_flag * discount)
-
             discount = discount * self.gamma
-            x = x_next
-            states_list.append(x)
-        
-        final_state = x
+            return (tp, x_next, task_costs, constraint_flags, discount), _trim(x_next)
+
+        (tp, final_state, task_costs, constraint_flags, discount), states_stacked = jax.lax.scan(
+            _plan_step,
+            (tp, x, task_costs, constraint_flags, discount),
+            jnp.arange(self.plan_horizon),
+        )
+
+        # Prepend initial state to get shape (plan_horizon+1, ...) matching original.
         states = jax.tree_util.tree_map(
-            lambda x0, *xs: jnp.concatenate([x0[None, ...]] + [x[None, ...] for x in xs], axis=0),
-            state,
-            *states_list,
+            lambda x0, xs: jnp.concatenate([x0[None, ...], xs], axis=0),
+            _trim(state),
+            states_stacked,
         )
 
         terminal_task_cost = self.dt * self.task.terminal_cost(tp, final_state) * discount
