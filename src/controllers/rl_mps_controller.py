@@ -79,6 +79,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.lateral_step_size_change_pending = False
         self.pending_heading = 0.0
         self.pending_step_size = 0.0
+        self.steps_per_reference_advance = configs["controller_config"].get("steps_per_reference_advance", 1)
 
         self.future_feet_positions_w = torch.zeros(4, self.horizon_length, 3, device=self.device)
         self.reference_feet_positions_w = torch.zeros(4, self.horizon_length, 3, device=self.device)
@@ -399,7 +400,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.transition_start_gait = None
             self.transition_end_gait = None
             self.feet_step_size = 0.0
-            self.command_duration = 0.35
+            self.command_duration = self.command_duration  # Keep config value
             self.heading_command = 0.0
             self.lateral_step_size = 0.0
             self.pending_lateral_step_size = 0.0
@@ -512,21 +513,28 @@ class RLQuadrupedMPSController(RLControllerBase):
                     plan_generation_id = plan_info.get("reference_generation_id")
                     plan_step_seq = plan_info.get("reference_step_seq")
 
-                    if self.visualize["opt_contact_locations"]:
-                        self.pub_opt_contact_locations(opt_future_feet_positions_w)
-
+                    aligned_plan = None
                     if plan_generation_id == self.reference_generation_id:
                         with self._gait_lock:
                             aligned_plan = self._align_optimized_contact_plan(
                                 opt_future_feet_positions_w, plan_step_seq
                             )
-                            if aligned_plan is not None:
+                            if aligned_plan is not None and plan_info.get("override", True):
                                 self._apply_optimized_contact_plan(aligned_plan)
                     elif self.logger is not None:
                         self.logger.debug(
                             "Discarded obsolete MPC contact plan generation: "
                             f"plan_generation_id={plan_generation_id}, current_generation_id={self.reference_generation_id}"
                         )
+
+                    if self.visualize["opt_contact_locations"] and aligned_plan is not None:
+                        # Clip to the optimized portion only — the last stale_steps slots
+                        # in aligned_plan are reference-padded, which extends footstep
+                        # markers further than the ghost body trajectory.  Both should
+                        # show the same effective horizon.
+                        stale = max(0, int(self.reference_step_seq) - int(plan_step_seq or self.reference_step_seq))
+                        eff = max(1, self.horizon_length - stale)
+                        self.pub_opt_contact_locations(aligned_plan[:, :eff, :])
 
                 # Publish COM trajectory from train_data
                 if self.visualize["opt_contact_locations"]:
@@ -536,7 +544,11 @@ class RLQuadrupedMPSController(RLControllerBase):
                                                 
                         self.pub_com_trajectory(com_traj)
                     if train_data is not None and "qpos" in train_data:
-                        self.pub_qpos_trajectory(train_data["qpos"])
+                        plan_step_seq = train_data.get("reference_step_seq")
+                        skip_steps = 0
+                        if plan_step_seq is not None:
+                            skip_steps = max(0, int(self.reference_step_seq) - int(plan_step_seq))
+                        self.pub_qpos_trajectory(train_data["qpos"], skip_steps=skip_steps)
 
                     # if train_data is not None and "constraint_flags" in train_data:
                     #     violated = train_data["constraint_flags"].any()
@@ -681,9 +693,9 @@ class RLQuadrupedMPSController(RLControllerBase):
                     self.step_size_change_pending = False
                     if self.logger is not None:
                         self.logger.debug(f"Applied step size change: {self.feet_step_size:.2f} meters")
-                    # Regenerate future feet positions with new step size
-                    avg_base_xy = self.future_feet_positions_w[:, self.current_goal_idx].mean(dim=0).clone()
-                    self.generate_future_feet_positions(pos=avg_base_xy)
+                    # Always anchor from actual robot body position, not MPC-advanced foot positions.
+                    # Using future_feet_positions_w as anchor amplifies any MPC offset by H*step_delta.
+                    self.generate_future_feet_positions()
 
                 # Apply pending heading change if any
                 if self.heading_change_pending:
@@ -691,7 +703,6 @@ class RLQuadrupedMPSController(RLControllerBase):
                     self.heading_change_pending = False
                     if self.logger is not None:
                         self.logger.debug(f"Applied heading change: {self.heading_command:.2f} radians")
-                    # Regenerate future feet positions with new heading
                     self.generate_future_feet_positions()
 
                 if self.lateral_step_size_change_pending:
@@ -699,9 +710,7 @@ class RLQuadrupedMPSController(RLControllerBase):
                     self.lateral_step_size_change_pending = False
                     if self.logger is not None:
                         self.logger.debug(f"Applied lateral step size change: {self.lateral_step_size:.2f} meters")
-                    # Regenerate future feet positions with new lateral step size
-                    avg_base_xy = self.future_feet_positions_w[:, self.current_goal_idx].mean(dim=0).clone()
-                    self.generate_future_feet_positions(pos=avg_base_xy)
+                    self.generate_future_feet_positions()
 
                 # Apply pending command duration change if any
                 if self.command_duration_change_pending:
@@ -716,14 +725,10 @@ class RLQuadrupedMPSController(RLControllerBase):
                     self.current_offset[1, 1] = -self.pending_stance_width_front
                     self.current_offset[2, 1] = self.pending_stance_width_rear
                     self.current_offset[3, 1] = -self.pending_stance_width_rear
-
                     self.stance_width_change_pending = False
                     if self.logger is not None:
                         self.logger.debug(f"Applied stance width change: {self.current_offset}")
-                    # Regenerate future feet positions with new stance width
-                    avg_base_xy = self.future_feet_positions_w[:, self.current_goal_idx].mean(dim=0).clone()
-
-                    self.generate_future_feet_positions(pos=avg_base_xy)
+                    self.generate_future_feet_positions()
 
                 # Handle gait transitions
                 if self.pending_gait_change is not None:
@@ -796,7 +801,7 @@ class RLQuadrupedMPSController(RLControllerBase):
                     # Handle different gait phases
                     if "crawl" in self.current_gait:
                         # For crawl gait or trot fly, cycle through 4 phases
-                        should_advance_reference = self.goal_completion_counter % 4 == 0
+                        should_advance_reference = self.goal_completion_counter % (4 * self.steps_per_reference_advance) == 0
                         self.current_contact_plan = torch.stack(
                             [
                                 self.gait_patterns[self.current_gait][(self.goal_completion_counter) % 4],
@@ -814,9 +819,13 @@ class RLQuadrupedMPSController(RLControllerBase):
 
                     else:
                         # For other gaits (2 phases), alternate between phases
+                        # Contact plan alternates every resample, but reference advances every N resamples
+                        steps = self.steps_per_reference_advance
                         should_advance_reference = (
-                            self.goal_completion_counter % 2 != 0 and self.goal_completion_counter > 0
+                            self.goal_completion_counter > 0
+                            and self.goal_completion_counter % steps == 0
                         )
+                        # Always alternate contact plan every resample
                         self.current_contact_plan = torch.stack(
                             [
                                 self.current_contact_plan[1],
@@ -1519,13 +1528,16 @@ class RLQuadrupedMPSController(RLControllerBase):
             if self.logger is not None:
                 self.logger.error(f"Failed to publish COM trajectory: {e}")
 
-    def pub_qpos_trajectory(self, qpos_traj):
+    def pub_qpos_trajectory(self, qpos_traj, skip_steps: int = 0):
         """
         Publishes predicted qpos trajectory from train_data.
 
         qpos_traj can be:
         - (num_traj, horizon+1, nq): first trajectory is used
         - (horizon+1, nq)
+
+        skip_steps: stale leading steps (same count as _align_optimized_contact_plan uses),
+        trimmed so the ghost starts at the current plan step, matching the footstep markers.
         """
         try:
             qpos_arr = np.asarray(qpos_traj, dtype=np.float32)
@@ -1534,6 +1546,9 @@ class RLQuadrupedMPSController(RLControllerBase):
 
             if qpos_arr.ndim != 2:
                 return
+
+            if skip_steps > 0:
+                qpos_arr = qpos_arr[min(skip_steps, qpos_arr.shape[0] - 1):]
 
             msg = Float32MultiArray()
             msg.layout.dim = [MultiArrayDimension(), MultiArrayDimension()]

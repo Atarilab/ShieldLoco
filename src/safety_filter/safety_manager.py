@@ -218,6 +218,7 @@ class SafetyManager:
                 "error": None,
                 "reference_generation_id": None,
                 "reference_step_seq": None,
+                "logs": [],
             }
         )
         self._state_event = self._ctx.Event()
@@ -384,6 +385,13 @@ class SafetyManager:
             self._log_error(f"Safety worker reported error:\n{worker_error}")
             self._worker_error_logged = True
 
+        # Drain logs unconditionally (worker may log before first plan)
+        logs = self._shared_result.get("logs", [])
+        for log_msg in logs:
+            self._log_info(log_msg)
+        if logs:
+            self._shared_result["logs"] = []
+
         result_seq = int(self._shared_result.get("seq", -1))
         if result_seq <= self._last_result_seq:
             return
@@ -398,7 +406,7 @@ class SafetyManager:
             "reference_generation_id": self._shared_result.get("reference_generation_id"),
             "reference_step_seq": self._shared_result.get("reference_step_seq"),
         }
-        
+
         # Fetch train_data COM trajectory
         train_data_dict = self._shared_result.get("train_data")
         if train_data_dict is not None:
@@ -432,7 +440,7 @@ class SafetyManager:
     @guard_errors("getting latest safety plan metadata", stop_on_error=False)
     def get_latest_plan_info(self):
         self._poll_results()
-        if self.updated_plan and self.override:
+        if self.updated_plan:
             self.updated_plan = False
             return self._latest_plan_info
         return None
@@ -441,6 +449,12 @@ class SafetyManager:
     def get_train_data(self):
         self._poll_results()
         return self._last_train_data
+
+    @guard_errors("getting safety logs", stop_on_error=False)
+    def get_logs(self):
+        if self._shared_result is None:
+            return []
+        return self._shared_result.get("logs", [])
 
     def __enter__(self):
         """Context manager entry."""
@@ -546,6 +560,12 @@ def _init_worker_objects(mj_model, rl_policy, rl_config):
 
 
 # TODO: is it possible to decouple update and opt? might give a bump in speed
+def _add_log(shared_result, message):
+    logs = shared_result.get("logs", [])
+    logs.append(message)
+    shared_result["logs"] = logs
+
+
 def _safety_worker_main(
     mj_model,
     rl_policy,
@@ -566,6 +586,7 @@ def _safety_worker_main(
 
         period = 1.0 / max(rate, 1e-3)
         last_processed_seq = -1
+        last_reference_generation_id = None
         while not stop_event.is_set():
             loop_start = time.perf_counter()
             state_event.wait(timeout=period)
@@ -596,6 +617,18 @@ def _safety_worker_main(
                 ref=latest_state.get("ref"),
                 goal_idx=latest_state.get("goal_idx", 0),
             )
+
+            current_generation_id = latest_state.get("reference_generation_id")
+            if current_generation_id != last_reference_generation_id:
+                # Reference trajectory changed (e.g. step size or heading command).
+                # Reset warm-start to the new reference so MPPI doesn't spend several
+                # 300ms cycles converging from the old stale plan.
+                policy_params = policy_params.replace(  # type: ignore
+                    best_plan=ref_plan_normalized,
+                    mean=jnp.zeros_like(policy_params.mean),
+                )
+                last_reference_generation_id = current_generation_id
+
             policy_params = update_params(
                 policy_params,
                 task_params=task_params,
@@ -643,6 +676,7 @@ def _safety_worker_main(
                         "qpos": best_qpos,
                         "costs": best_costs,
                         "constraint_flags": best_constraints,
+                        "reference_step_seq": latest_state.get("reference_step_seq"),
                     }
                 else:
                     shared_result["train_data"] = None

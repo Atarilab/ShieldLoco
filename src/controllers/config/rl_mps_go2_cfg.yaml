@@ -50,6 +50,7 @@ timestep: 0.03
 
 obs_horizon: 2 # specific to RL policy
 command_duration: 0.3
+steps_per_reference_advance: 2  # 1 = advance every resample, 2 = every 2 resamples, etc.
 
 # Use the correct mapping from the existing config
 # JOINT_OBSERVATION_UNITREE_TO_ISAAC_LAB_MAPPING: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
