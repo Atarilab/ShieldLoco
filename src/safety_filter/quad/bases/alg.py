@@ -73,6 +73,7 @@ class QuadAlgSamplingParams:
         ref: The reference trajectory that we are sampling around.
 
         task_params: Optional task parameters that can be updated during plan call
+        c_max: Adaptive maximum violation threshold for CaT (Constraints as Termination).
         
     """
     mean: jax.Array
@@ -80,6 +81,8 @@ class QuadAlgSamplingParams:
     ref: jax.Array
 
     task_params: QuadRLTaskParams
+
+    c_max: float = 1.0
 
     train_data: Optional[QuadAlgTrainData] = None
 
@@ -98,7 +101,9 @@ class QuadSamplingBasedPlanner(ABC):
         gamma: float = 0.99,
         safety_weight: float = 1e3,
         collect_data: bool = False,
-        top_fraction: float = 0.01,        
+        top_fraction: float = 0.01,
+        p_max: float = 1.0,
+        c_max_decay: float = 0.9,
     ) -> None:
         """Initialize the MPC controller.
 
@@ -156,6 +161,8 @@ class QuadSamplingBasedPlanner(ABC):
         self.collect_data = collect_data
         self.top_fraction = top_fraction
         self.gamma = gamma
+        self.p_max = p_max
+        self.c_max_decay = c_max_decay
 
     def init_params(
         self, task_params: QuadRLTaskParams, initial_mean: Optional[jax.Array] = None, ref_traj: Optional[jax.Array] = None, seed: int = 0
@@ -190,7 +197,7 @@ class QuadSamplingBasedPlanner(ABC):
             f"Initial reference trajectory must have shape (plan_steps, plan_dim), got {ref.shape}"
         )
 
-        return QuadAlgSamplingParams(mean=mean, rng=rng, ref=ref, task_params=task_params)
+        return QuadAlgSamplingParams(mean=mean, rng=rng, ref=ref, task_params=task_params, c_max=1.0)
 
     def optimize(self, state: mjx.Data, params: QuadAlgSamplingParams, solve: bool) -> QuadAlgSamplingParams:
         """Perform an optimization step to update the policy parameters.
@@ -302,9 +309,10 @@ class QuadSamplingBasedPlanner(ABC):
             B = max(1, int((R * N) * self.top_fraction))
 
             per_traj_costs = jnp.sum(
-                rollouts.costs + self.safety_weight * rollouts.constraint_flags,
+                rollouts.costs,
                 axis=2,
             )  # shape: (R, N)
+            # Note: constraint handling is now done via CaT in get_rollouts
             costs_flat = per_traj_costs.reshape(-1)  # shape: (R*N,)
 
             sorted_indices = jnp.argsort(costs_flat)
@@ -376,7 +384,12 @@ class QuadSamplingBasedPlanner(ABC):
         params: QuadAlgSamplingParams,
         plans: jax.Array,
     ) -> Tuple[mjx.Data, mjx.Data, jax.Array, jax.Array, jax.Array]:
-        """Rollout control sequences (in parallel) with optional value bootstrap."""
+        """Rollout control sequences (in parallel) with optional value bootstrap.
+        
+        Uses CaT (Constraints as Termination): constraint violations modulate the 
+        discount factor to penalize trajectories that violate constraints early.
+        c_max is read from params.c_max.
+        """
 
         task_costs = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
         constraint_flags = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
@@ -410,10 +423,28 @@ class QuadSamplingBasedPlanner(ABC):
             a     = jax.lax.dynamic_slice(plans_padded, (i, 0), (2, self.task.plan_dim))
             a_ref = jax.lax.dynamic_slice(ref_padded,   (i, 0), (2, self.task.plan_dim))
             tp, x_next, task_cost, constraint_flag = self.task.forward(model, tp, x, a, a_ref)
-            task_costs       = task_costs.at[i].set(task_cost * self.dt * discount)
-            constraint_flags = constraint_flags.at[i].set(constraint_flag * discount)
-            discount = discount * self.gamma
-            return (tp, x_next, task_costs, constraint_flags, discount), _trim(x_next)
+            
+            # CaT: compute termination probability from constraint violation
+            c_max = params.c_max
+            normalized = jnp.clip(constraint_flag / c_max, 0.0, 1.0)
+            termination_prob = self.p_max * normalized
+            
+            # Store RAW constraint flag
+            constraint_flags = constraint_flags.at[i].set(constraint_flag)
+            
+            # CaT penalty: add termination penalty directly to this step's cost
+            # This penalizes trajectories that violate constraints EARLY
+            penalty = self.safety_weight * termination_prob
+            
+            # Apply normal discount for future costs + add penalty to this step
+            effective_cost = (task_cost + penalty) * discount * self.dt 
+            
+            task_costs = task_costs.at[i].set(effective_cost)
+            
+            # Update discount for next step
+            new_discount = discount * self.gamma
+            
+            return (tp, x_next, task_costs, constraint_flags, new_discount), _trim(x_next)
 
         (tp, final_state, task_costs, constraint_flags, discount), states_stacked = jax.lax.scan(
             _plan_step,
@@ -428,10 +459,18 @@ class QuadSamplingBasedPlanner(ABC):
             states_stacked,
         )
 
-        terminal_task_cost = self.dt * self.task.terminal_cost(tp, final_state) * discount
-        terminal_flag = self.task.constraint_check(final_state) * discount
-
-        task_costs = jnp.append(task_costs, terminal_task_cost)
+        terminal_cost = self.dt * self.task.terminal_cost(tp, final_state)
+        terminal_flag = self.task.constraint_check(final_state)
+        
+        # CaT penalty for terminal step
+        c_max = params.c_max
+        terminal_normalized = jnp.clip(terminal_flag / c_max, 0.0, 1.0)
+        terminal_term_prob = self.p_max * terminal_normalized
+        
+        terminal_penalty = self.safety_weight * terminal_term_prob
+        terminal_cost_with_penalty = (terminal_cost + terminal_penalty) * discount
+        
+        task_costs = jnp.append(task_costs, terminal_cost_with_penalty)
         constraint_flags = jnp.append(constraint_flags, terminal_flag)
 
         return states, final_state, task_costs, constraint_flags, discount * self.gamma

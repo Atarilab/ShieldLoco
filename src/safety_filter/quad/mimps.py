@@ -41,6 +41,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         safety_weight: float = 1e3,
         collect_data: bool = False,
         top_fraction: float = 0.01,
+        p_max: float = 1.0,
+        c_max_decay: float = 0.9,
     ) -> None:
         """Initialize the controller.
 
@@ -68,6 +70,12 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             seed=seed,
             plan_horizon=plan_horizon,
             iterations=iterations,
+            gamma=gamma,
+            safety_weight=safety_weight,
+            collect_data=collect_data,
+            top_fraction=top_fraction,
+            p_max=p_max,
+            c_max_decay=c_max_decay,
         )
 
         if temperature <= 0.0:
@@ -102,13 +110,19 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         return params
 
     def update_params(self, params: MIMPSParams, rollouts: QuadAlgTrajectory) -> MIMPSParams:
-        """Update the mean with an exponentially weighted average."""
-        costs = jnp.sum(
-            rollouts.costs + self.safety_weight * rollouts.constraint_flags,
-            axis=1,
-        )
+        """Update the mean with an exponentially weighted average.
+        
+        CaT (Constraints as Termination) is now applied in get_rollouts - 
+        constraint violations modulate the discount factor during rollout.
+        This just computes the MPPI weights and updates c_max.
+        """
+        # Just sum costs - CaT already applied in rollout
+        costs = jnp.sum(rollouts.costs, axis=1)
 
-        # N.B. jax.nn.softmax takes care of details like baseline subtraction.
+        # Update c_max: adapt to observed constraint violations
+        constraint_flags = rollouts.constraint_flags.astype(jnp.float32)
+        batch_max_violation = jnp.max(constraint_flags)
+        new_c_max = jnp.maximum(batch_max_violation, 1.0)
 
         # First num_samples are from mean around ref
         costs_mean = costs[: self.num_samples]
@@ -137,6 +151,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         best_plan = rollouts.plans[best_index]  # Shape: (H, plan_dim)
 
         return params.replace(  # type: ignore
+            c_max=new_c_max,
             mean=new_mean,
             best_plan=best_plan,
         )
@@ -162,6 +177,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             ref=_params.ref,
             rng=_params.rng,
             task_params=_params.task_params,
+            c_max=_params.c_max,
             train_data=self._empty_train_data(self.num_samples) if self.collect_data else None,
         )
 
