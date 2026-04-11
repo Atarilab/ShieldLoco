@@ -556,7 +556,8 @@ def _init_worker_objects(mj_model, rl_policy, rl_config):
     random_seed = np.random.randint(0, 2**31)
     policy_params = planner.init_params(task_params=task_params, seed=random_seed)
     jit_optimize = jax.jit(planner.optimize)
-    return task, task_params, policy_params, jit_optimize
+    jit_dynamics = jax.jit(task.dynamics)
+    return task, task_params, policy_params, jit_optimize, jit_dynamics
 
 
 # TODO: is it possible to decouple update and opt? might give a bump in speed
@@ -581,7 +582,8 @@ def _safety_worker_main(
         from mujoco import mjx
         import jax
 
-        task, task_params, policy_params, jit_optimize = _init_worker_objects(mj_model, rl_policy, rl_config)
+        task, task_params, policy_params, jit_optimize, jit_dynamics = _init_worker_objects(mj_model, rl_policy, rl_config)
+        # jit_mjx_forward = jax.jit(mjx.forward)
         jit_mjx_forward = jax.jit(mjx.forward)
 
         period = 1.0 / max(rate, 1e-3)
@@ -634,6 +636,16 @@ def _safety_worker_main(
                 task_params=task_params,
                 ref=ref_plan_normalized,
             )
+
+            # Latency compensation: plan from the predicted state 1 plan step ahead.
+            # The planner takes ~250ms and each plan step is ~300ms, so stale_steps=1
+            # always. By forward-simulating one step before optimizing, plan step 0
+            # corresponds to the state when the plan actually arrives → controller
+            # applies step 0 directly with no horizon shift needed.
+            _, data_ahead, _ = jit_dynamics(
+                task.model, task_params, task.data, policy_params.best_plan[:2]
+            )
+            policy_params = jit_optimize(data_ahead, policy_params, True)
 
             override = True
             policy_params = jit_optimize(task.data, policy_params, override)
