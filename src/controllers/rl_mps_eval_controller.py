@@ -21,6 +21,7 @@ class EvalConfig:
     start_gait: str = "trot"
     start_move: str = "up"                          # "up"=forward, "center"=stay
     min_plans: int = 2                              # wait for N plans before auto-starting
+    start_move_num: int = 8
     start_mpc: bool = False
     max_time: float = 120.0                         # seconds; writes done_file when elapsed
     controller_metric_file: str = "logs/eval/ctrl.csv"
@@ -32,6 +33,7 @@ class EvalConfig:
             start_gait=d.get("start_gait", "trot"),
             start_move=d.get("start_move", "up"),
             min_plans=int(d.get("min_plans", 2)),
+            start_move_num=int(d.get("start_move_num", 8)),
             max_time=float(d.get("max_time", 120.0)),
             controller_metric_file=d.get("controller_metric_file", "logs/eval/ctrl.csv"),
             done_file=d.get("done_file", "logs/eval/eval_done.txt"),
@@ -41,6 +43,7 @@ class EvalConfig:
 @dataclass
 class EvalMetrics:
     started: bool = False
+    move_sent: bool = False
     start_time: Optional[float] = None
     file: Optional[IO] = None
     writer: Optional[csv.DictWriter] = None
@@ -74,14 +77,9 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
             self._eval_autostart()
 
         if not self.eval_cfg.start_mpc and self.safety_manager._plan_count == self.eval_cfg.min_plans:
-            move_cmd = {}
-            if self.eval_cfg.start_move != "center":
-                move_cmd = {"move": self.eval_cfg.start_move}
-
             self.change_commands({
                 "gait": self.eval_cfg.start_gait,
                 "mpc": "on",
-                **move_cmd,
             })
 
             if self.logger:
@@ -92,6 +90,10 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
 
             self.eval_cfg.start_mpc = True
             self.eval_m.start_time = time.time()
+
+        if self.eval_cfg.start_mpc and not self.eval_m.move_sent and self.safety_manager._plan_count >= self.eval_cfg.start_move_num:
+            self.change_commands({"move": self.eval_cfg.start_move})
+            self.eval_m.move_sent = True
 
         cmd = super().compute_lowlevelcmd(state)
 
