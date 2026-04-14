@@ -33,9 +33,9 @@ class QuadAlgTrainData:
     """
 
     states: QuadAlgState  # shape: (num_traj, horizon + 1, state_dim)
-    plans: jax.Array  # shape: (num_traj, horizon, plan_dim)
-    costs: jax.Array  # shape: (num_traj, horizon + 1)
-    constraint_flags: jax.Array  # shape: (num_traj, horizon + 1)
+    plans: jax.Array
+    costs: jax.Array
+    constraint_flags: jax.Array  # shape (num_rollouts, H+1, 2): [feet_flag, body_count]
 
     optimized: bool = True
 
@@ -50,7 +50,9 @@ class QuadAlgTrajectory:
     Attributes:
         plans: Plan actions of shape (num_rollouts, H, plan_dim).
         costs: Costs of shape (num_rollouts, H+1).
-        constraint_flags: Optional binary flags indicating constraint violations, shape (num_rollouts, H+1).
+        constraint_flags: Dual constraint flags, shape (num_rollouts, H+1, 2).
+            [..., 0] = feet-only binary flag (for CaT penalty).
+            [..., 1] = whole-body collision count (for argmin selection).
     """
 
     plans: jax.Array
@@ -324,7 +326,7 @@ class QuadSamplingBasedPlanner(ABC):
             )
             costs_flat = rollouts.costs.reshape(-1, rollouts.costs.shape[2])
             constraint_flags_flat = rollouts.constraint_flags.reshape(
-                -1, rollouts.constraint_flags.shape[2]
+                -1, rollouts.constraint_flags.shape[2], rollouts.constraint_flags.shape[3]
             )
 
             states_selected = jax.tree_util.tree_map(
@@ -392,7 +394,7 @@ class QuadSamplingBasedPlanner(ABC):
         """
 
         task_costs = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
-        constraint_flags = jnp.zeros(self.plan_horizon, dtype=jnp.float32)
+        constraint_flags = jnp.zeros((self.plan_horizon, 2), dtype=jnp.float32)
 
         x = state
         tp = params.task_params
@@ -422,14 +424,17 @@ class QuadSamplingBasedPlanner(ABC):
             tp, x, task_costs, constraint_flags, discount = carry
             a     = jax.lax.dynamic_slice(plans_padded, (i, 0), (2, self.task.plan_dim))
             a_ref = jax.lax.dynamic_slice(ref_padded,   (i, 0), (2, self.task.plan_dim))
-            tp, x_next, task_cost, constraint_flag = self.task.forward(model, tp, x, a, a_ref)
+            tp, x_next, task_cost, constraint_flag = self.task.forward(model, tp, x, a, a_ref, step_idx=i)
             
-            # CaT: compute termination probability from constraint violation
+            # Dual constraint: constraint_flag is (2,) = [feet_flag, body_count]
+            # CaT penalty uses feet-only flag (discriminative, avoids weight collapse)
+            feet_flag = constraint_flag[0]
+            
             c_max = params.c_max
-            normalized = jnp.clip(constraint_flag / c_max, 0.0, 1.0)
+            normalized = jnp.clip(feet_flag / c_max, 0.0, 1.0)
             termination_prob = self.p_max * normalized
             
-            # Store RAW constraint flag
+            # Store both flags for downstream argmin selection
             constraint_flags = constraint_flags.at[i].set(constraint_flag)
             
             # CaT penalty: add termination penalty directly to this step's cost
@@ -460,18 +465,19 @@ class QuadSamplingBasedPlanner(ABC):
         )
 
         terminal_cost = self.dt * self.task.terminal_cost(tp, final_state)
-        terminal_flag = self.task.constraint_check(final_state)
+        terminal_flags = self.task.constraint_check(final_state)
         
-        # CaT penalty for terminal step
+        # CaT penalty for terminal step uses feet-only flag
         c_max = params.c_max
-        terminal_normalized = jnp.clip(terminal_flag / c_max, 0.0, 1.0)
+        terminal_feet = terminal_flags[0]
+        terminal_normalized = jnp.clip(terminal_feet / c_max, 0.0, 1.0)
         terminal_term_prob = self.p_max * terminal_normalized
         
         terminal_penalty = self.safety_weight * terminal_term_prob
         terminal_cost_with_penalty = (terminal_cost + terminal_penalty) * discount
         
         task_costs = jnp.append(task_costs, terminal_cost_with_penalty)
-        constraint_flags = jnp.append(constraint_flags, terminal_flag)
+        constraint_flags = jnp.concatenate([constraint_flags, terminal_flags[None, :]], axis=0)
 
         return states, final_state, task_costs, constraint_flags, discount * self.gamma
 
@@ -494,10 +500,11 @@ class QuadSamplingBasedPlanner(ABC):
         dummy_states = jax.tree_util.tree_map(make_leaf, state)
         # Match rollout outputs exactly:
         # - plans: (B, H, plan_dim)
-        # - costs/constraint_flags: (B, H + 1) including terminal value
+        # - costs: (B, H + 1) including terminal value
+        # - constraint_flags: (B, H + 1, 2) dual flags [feet_flag, body_count]
         dummy_plans = jnp.zeros((B, H, self.task.plan_dim), dtype=jnp.float32)
         dummy_costs = jnp.zeros((B, H + 1), dtype=jnp.float32)
-        dummy_constraint_flags = jnp.zeros((B, H + 1), dtype=jnp.float32)
+        dummy_constraint_flags = jnp.zeros((B, H + 1, 2), dtype=jnp.float32)
 
         return QuadAlgTrainData(
             states=dummy_states,

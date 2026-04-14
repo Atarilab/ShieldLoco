@@ -20,9 +20,12 @@ class MIMPSParams(QuadAlgSamplingParams):
 
     Attributes:
         best_plan: The best plan spline knots found so far.
+        min_violations: Constraint sum of the best (argmin) sample from the last MPPI iteration.
+                        0.0 means at least one sample was collision-free → safe to override.
     """
     best_plan: Optional[jax.Array] = None
     exec_plan: Optional[jax.Array] = None
+    min_violations: Optional[jax.Array] = None
 
 
 class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
@@ -112,16 +115,20 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
     def update_params(self, params: MIMPSParams, rollouts: QuadAlgTrajectory) -> MIMPSParams:
         """Update the mean with an exponentially weighted average.
         
-        CaT (Constraints as Termination) is now applied in get_rollouts - 
-        constraint violations modulate the discount factor during rollout.
-        This just computes the MPPI weights and updates c_max.
+        CaT (Constraints as Termination) is applied in get_rollouts using
+        feet-only collision flags.  Argmin selection uses whole-body collision
+        counts to pick the sample with fewest physical contacts.
         """
         # Just sum costs - CaT already applied in rollout
         costs = jnp.sum(rollouts.costs, axis=1)
 
-        # Update c_max: adapt to observed constraint violations
+        # Dual constraint flags: (N, H+1, 2) = [feet_flag, body_count]
         constraint_flags = rollouts.constraint_flags.astype(jnp.float32)
-        batch_max_violation = jnp.max(constraint_flags)
+        feet_flags = constraint_flags[..., 0]   # (N, H+1) binary foot-hazard contacts
+        body_flags = constraint_flags[..., 1]    # (N, H+1) whole-body contact counts
+
+        # Update c_max: adapt to observed FEET-ONLY violations (discriminative)
+        batch_max_violation = jnp.max(feet_flags)
         new_c_max = jnp.maximum(batch_max_violation, 1.0)
 
         # First num_samples are from mean around ref
@@ -139,21 +146,46 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # this, large safety_weight values cause exp(-cost/T) to underflow to 0 for
         # all-but-the-best sample, collapsing MPPI to pure argmin selection and
         # producing NaN weighted averages when costs contain outliers.
-        cost_std = jnp.std(costs_mean)
-        costs_normed = (costs_mean - jnp.mean(costs_mean)) / (cost_std + 1e-6)
+        #
+        # Guard against NaN/Inf: if any cost is NaN (e.g. from corrupted physics
+        # state), replace it with 0 for std computation and clip normalized costs
+        # to prevent exp overflow in softmax.
+        costs_mean_safe = jnp.where(jnp.isfinite(costs_mean), costs_mean, 0.0)
+        cost_std = jnp.std(costs_mean_safe)
+        costs_normed = (costs_mean_safe - jnp.mean(costs_mean_safe)) / (cost_std + 1e-6)
+        costs_normed = jnp.clip(costs_normed, -100.0, 100.0)  # prevent exp overflow
         weights_mean = jax.nn.softmax(-costs_normed / self.temperature, axis=0)
         # Shape: (num_plans, plan_dim)
         new_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
 
-        # TODO: sample from the mean
-        # Get best knots (lowest cost among all)
-        best_index = jnp.argmin(costs)
-        best_plan = rollouts.plans[best_index]  # Shape: (H, plan_dim)
+        # Argmin selection uses WHOLE-BODY collision count to pick the
+        # sample with fewest physical contacts (swing arcs, calf brushes, etc.)
+        body_sums = jnp.sum(body_flags, axis=1)  # (N,) total body contacts per sample
+        best_index = jnp.argmin(body_sums)
+        new_best = rollouts.plans[best_index]  # Shape: (H, plan_dim)
+
+        # Tie-breaking: if all samples have similar body contact counts, fall
+        # back to the stance-anchored plan (plans[-2]) for EXECUTION.
+        # best_plan is intentionally kept as argmin (not stance) so that
+        # prepare_optimize warm-starts from the optimizer's current search
+        # direction rather than resetting to stance every tied cycle.
+        # exec_plan is overridden in finalize_best_plan, which in
+        # QuadMIMPSPlanner projects exec_plan (not best_plan) for execution.
+        range_ratio = (jnp.max(body_sums) - jnp.min(body_sums)) / (jnp.mean(body_sums) + 1e-6)
+        constraint_tied = range_ratio < 0.01
+        stance_plan = rollouts.plans[-2]  # second-to-last sample = stance-anchored
+        exec_plan = jax.lax.cond(
+            constraint_tied,
+            lambda: self.task.get_exec_plan(stance_plan),   # stance-anchored: feet stay put
+            lambda: self.task.get_exec_plan(new_best),       # avoidance argmin
+        )
 
         return params.replace(  # type: ignore
             c_max=new_c_max,
             mean=new_mean,
-            best_plan=best_plan,
+            best_plan=new_best,
+            exec_plan=exec_plan,
+            min_violations=body_sums[best_index],
         )
 
     #### Can be called with super/modified by child classes ####
@@ -174,6 +206,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             mean=_params.mean,
             best_plan=abs_plan,
             exec_plan=self.task.get_exec_plan(abs_plan),
+            min_violations=jnp.zeros(()),
             ref=_params.ref,
             rng=_params.rng,
             task_params=_params.task_params,
@@ -194,8 +227,20 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         N = self.num_samples
         H = self.plan_horizon
 
+        # --- 3-zone exploration: low / med / high noise multipliers ---
+        # Low zone  refines near the current mean (exploitation).
+        # Med zone  uses the nominal noise_level.
+        # High zone explores far from the mean to escape large obstacles.
+        N_low  = N // 3
+        N_med  = N // 3
+        N_high = N - N_low - N_med
+        zone_scales = jnp.concatenate([
+            jnp.full((N_low,),  0.2 * self.noise_level),
+            jnp.full((N_med,),  0.5 * self.noise_level),
+            jnp.full((N_high,), 1.5 * self.noise_level),
+        ])  # (N,)
+
         # --- Body-level xy noise (all 4 feet shift together) ---
-        # Constant + gentle linear trend → temporally coherent across horizon.
         body_const = jax.random.normal(body_const_rng, (N, 1, 2))          # (N, 1, 2)
         body_slope = jax.random.normal(body_slope_rng, (N, 1, 2)) * 0.3   # (N, 1, 2)
         t = jnp.linspace(0.0, 1.0, H).reshape(1, H, 1)                   # (1, H, 1)
@@ -209,41 +254,50 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         foot_xy = foot_noise[..., :2]
         foot_z  = foot_noise[..., 2:] * 0.01  # z stays near ground
 
-        # --- Combine: body dominates xy, foot residuals are small ---
-        combined_xy = 0.3 * body_xy_4feet + 0.7 * foot_xy   # (N, H, 4, 2)
+        # --- Combine and apply per-sample zone scale ---
+        combined_xy = 0.7 * body_xy_4feet + 0.3 * foot_xy   # (N, H, 4, 2)
         combined = jnp.concatenate([combined_xy, foot_z], axis=-1)  # (N, H, 4, 3)
-
-        # Flatten to plan_dim: (N, H, 12)
         noise = combined.reshape(N, H, self.task.plan_dim)
+        noise = noise * zone_scales[:, None, None]  # (N, H, plan_dim)
 
-        # Analytically-guided mean bias: shift all samples toward the dodge
-        # position predicted from the dynamic obstacle trajectory.  This centres the
-        # MPPI sampling distribution around whole-body avoidance so the
-        # optimizer can find physics-feasible dodge plans in a single cycle.
-        dyna_safety_bias = self.task.get_dynamic_safety_bias(
-            params.task_params, params.ref
+        knots = params.mean + params.ref + noise
+
+        # Last sample is always the plain reference (zero exploration)
+        knots = knots.at[-1].set(params.ref)
+
+        # Second-to-last sample anchors all feet at current stance positions.
+        # Guarantees at least one near-side option when the warm-start has
+        # drifted to the far side of an obstacle.  Without this, ALL samples
+        # project to the same (far) side after the warm-start crosses through
+        # an obstacle, giving MPPI zero near-side plans to select from.
+        stance_world = params.task_params.init_foot_positions  # (4, 3)
+        stance_plan_world = jnp.tile(
+            stance_world.reshape(1, self.task.plan_dim), (H, 1)
         )  # (H, plan_dim)
+        stance_plan_norm = stance_plan_world / self.task.plan_lim
+        knots = knots.at[-2].set(stance_plan_norm)
 
-        # Shape: (num_samples, H, plan_dim)
-        mean = (params.mean + dyna_safety_bias) + params.ref + self.noise_level * noise
+        current_feet_xy = params.task_params.init_foot_positions[:, :2]
+        knots = self.task.project_plan_to_safe_with_arc_check(knots, current_feet_xy)
+        # knots = self.task.project_plan_to_safe(knots)
 
-        return mean, params.replace(rng=rng)  # type: ignore
+        return knots, params.replace(rng=rng)  # type: ignore
 
     def prepare_optimize(self, state: mjx.Data, params: MIMPSParams) -> MIMPSParams:
-        # # Use best_plan (stored in absolute normalized coords) for warm-starting.
-        # # This is critical: mean is an offset from ref, but ref changes between
-        # # planning cycles (goal_idx advances, reference positions update).
-        # # Using ref + mean would corrupt the absolute plan by (new_ref - old_ref).
-        # # best_plan is ref-independent, so it survives ref changes correctly.
-        # abs_plan = params.best_plan
-        # abs_plan = jnp.concatenate([abs_plan[1:], params.ref[-1:]], axis=0)
-
-        # Shift the previous best plan forward by one step to preserve corridor structure.
-        # Append the last reference control to the end of the shifted plan to maintain the same length.
-        abs_plan = params.ref + params.mean # Shape: (H, plan_dim)
+        # Use best_plan (stored in absolute normalized coords) for warm-starting.
+        # This is critical: mean is an offset from ref, but ref changes between
+        # planning cycles (goal_idx advances, reference positions update).
+        # Using ref + mean would corrupt the absolute plan by (new_ref - old_ref).
+        # best_plan is ref-independent, so it survives ref changes correctly.
+        abs_plan = params.best_plan
         abs_plan = jnp.concatenate([abs_plan[1:], params.ref[-1:]], axis=0)
 
         abs_plan = jnp.clip(abs_plan, self.task.u_min, self.task.u_max)
+
+        # Project warm-start plan to safe set so MPPI starts from
+        # a feasible reference and doesn't warm-start into an obstacle.
+        abs_plan = self.task.project_plan_to_safe(abs_plan)
+
         new_mean = abs_plan - params.ref
 
         params = params.replace(  # type: ignore
@@ -270,6 +324,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         """Materialize the controller-facing execution plan without mutating warm-start state."""
         abs_plan = params.mean + params.ref
+
+        abs_plan = self.task.project_plan_to_safe(abs_plan)
 
         exec_plan = self.task.get_exec_plan(abs_plan)
 

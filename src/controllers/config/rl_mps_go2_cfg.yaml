@@ -15,7 +15,8 @@ use_threading: false
 use_buffer: false
 device: 'cpu' # "cuda:0"  
 feet_step_size: 0.0
-horizon_length: &horizon_length 4 # footstep horizon
+# H * dt > H_effective * dt + max_latency
+horizon_length: &horizon_length 6 # footstep horizon
 action_filter_alpha: 0.5
 transition_duration: 0
 visualize: 
@@ -79,16 +80,53 @@ kp: *stiffness
 kd: *damping
 
 mps_alg_name: "MIMPS"
-mps_num_samples: 800
-mps_noise_level: 0.3        # was 0.3; larger noise allows bigger lateral body shifts (0.2m/step)
-mps_temperature: 0.01
+mps_num_samples: 400
+mps_noise_level: 0.6
+mps_temperature: 1
 mps_plan_horizon: *horizon_length
-mps_iterations: 1           # keep 1: more iterations doubles plan latency (~2.6s), hurting timing
+mps_iterations: 2           # keep 1: more iterations doubles plan latency (~2.6s), hurting timing
 mps_policy_decimation: 1    # call RL policy every sim step (~30ms ≈ real 20ms rate).
                             # Must stay at 1: policy trained at 50Hz; holding PD target for a full
                             # 300ms plan step (decimation=10) makes rollouts diverge → garbage plans.
 mps_gamma: 0.99
-mps_safety_weight: 10000
+mps_safety_weight: 10
+# Minimum obstacle height (metres) to include in collision constraint.
+# Thin obstacles (cables 4mm, phones 4mm) contact the 22mm foot sphere during
+# normal stance — unavoidable, so they produce n_safe=0 for all samples.
+# Set to e.g. 0.02 to only penalise obstacles tall enough to impede locomotion.
+# 0.0 = include everything (old behaviour).
+constraint_min_obstacle_height: 0.0005
+# Foot-plan projection: pushes sampled & final foot positions out of obstacle
+# interiors using iterative closest-obstacle projection.  Each iteration finds
+# the worst-violated SDF constraint and pushes onto its boundary.
+# n_iters=3 suffices for circles (exact in 1) and boxes/capsules (2-3 iters).
+# projection_clearance = foot_radius + safety margin (metres).
+projection_clearance: 0.1
+projection_iters: 3
+
+# Whole-body collision avoidance costs:
+# foot_step_weight: penalises ||step0_feet - current_feet||^2 at goal_idx==0.
+#   Reduces intermediate step collisions by preferring short first-step displacements.
+# foot_chain_weight: penalises Σ ||foot_h - foot_{h-1}||^2 across ALL horizon steps.
+#   Encourages shuffling (small step-to-step deltas) rather than big reachy swings.
+#   Fires at ALL goal_idx values — plan-shape regularizer.
+#   0 = off, 10 = mild shuffle, 30 = moderate, 50+ = aggressive shuffle.
+# body_sdf_weight / margin / scale: smooth softplus cost when the robot
+#   body center is within `margin` metres of any obstacle edge.  Provides
+#   a gradient for MPPI to prefer less-cluttered paths.
+foot_step_weight: 50.0
+foot_chain_weight: 100.0
+body_sdf_weight: 5.0
+body_sdf_margin: 0.10
+body_sdf_scale: 0.10
+# Foot path SDF cost: penalizes straight-line foot trajectories that cross
+# through obstacle interiors.  Evaluates 2D SDF at interpolated points
+# between current stance and planned position (and between consecutive
+# planned positions).  Prevents MPPI from selecting plans where the RL
+# policy's intermediate steps would land on obstacles.
+# 0 = off, 10 = mild, 30 = moderate (matches foot_chain_weight), 50+ = aggressive.
+foot_path_sdf_weight: 50.0
+foot_path_sdf_scale: 0.10  # softplus sharpness for foot-path SDF penalty (metres); tune independently of body_sdf_scale
 mps_collect_data: true
 mps_top_fraction: 0.02
 # Contact buffer sizing — two different semantics in the warp backend:
