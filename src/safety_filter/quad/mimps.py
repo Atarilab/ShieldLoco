@@ -25,7 +25,7 @@ class MIMPSParams(QuadAlgSamplingParams):
     """
     best_plan: Optional[jax.Array] = None
     exec_plan: Optional[jax.Array] = None
-    min_violations: Optional[jax.Array] = None
+    # min_violations: Optional[jax.Array] = None
 
 
 class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
@@ -125,7 +125,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # Dual constraint flags: (N, H+1, 2) = [feet_flag, body_count]
         constraint_flags = rollouts.constraint_flags.astype(jnp.float32)
         feet_flags = constraint_flags[..., 0]   # (N, H+1) binary foot-hazard contacts
-        body_flags = constraint_flags[..., 1]    # (N, H+1) whole-body contact counts
+        # body_flags = constraint_flags[..., 1]    # (N, H+1) whole-body contact counts
 
         # Update c_max: adapt to observed FEET-ONLY violations (discriminative)
         batch_max_violation = jnp.max(feet_flags)
@@ -158,34 +158,38 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # Shape: (num_plans, plan_dim)
         new_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
 
+
+        new_best = rollouts.plans[jnp.argmin(costs)]
+
+
         # Argmin selection uses WHOLE-BODY collision count to pick the
         # sample with fewest physical contacts (swing arcs, calf brushes, etc.)
-        body_sums = jnp.sum(body_flags, axis=1)  # (N,) total body contacts per sample
-        best_index = jnp.argmin(body_sums)
-        new_best = rollouts.plans[best_index]  # Shape: (H, plan_dim)
+        # body_sums = jnp.sum(body_flags, axis=1)  # (N,) total body contacts per sample
+        # best_index = jnp.argmin(body_sums)
+        # new_best = rollouts.plans[best_index]  # Shape: (H, plan_dim)
 
-        # Tie-breaking: if all samples have similar body contact counts, fall
-        # back to the stance-anchored plan (plans[-2]) for EXECUTION.
-        # best_plan is intentionally kept as argmin (not stance) so that
-        # prepare_optimize warm-starts from the optimizer's current search
-        # direction rather than resetting to stance every tied cycle.
-        # exec_plan is overridden in finalize_best_plan, which in
-        # QuadMIMPSPlanner projects exec_plan (not best_plan) for execution.
-        range_ratio = (jnp.max(body_sums) - jnp.min(body_sums)) / (jnp.mean(body_sums) + 1e-6)
-        constraint_tied = range_ratio < 0.01
-        stance_plan = rollouts.plans[-2]  # second-to-last sample = stance-anchored
-        exec_plan = jax.lax.cond(
-            constraint_tied,
-            lambda: self.task.get_exec_plan(stance_plan),   # stance-anchored: feet stay put
-            lambda: self.task.get_exec_plan(new_best),       # avoidance argmin
-        )
+        # # Tie-breaking: if all samples have similar body contact counts, fall
+        # # back to the stance-anchored plan (plans[-2]) for EXECUTION.
+        # # best_plan is intentionally kept as argmin (not stance) so that
+        # # prepare_optimize warm-starts from the optimizer's current search
+        # # direction rather than resetting to stance every tied cycle.
+        # # exec_plan is overridden in finalize_best_plan, which in
+        # # QuadMIMPSPlanner projects exec_plan (not best_plan) for execution.
+        # range_ratio = (jnp.max(body_sums) - jnp.min(body_sums)) / (jnp.mean(body_sums) + 1e-6)
+        # constraint_tied = range_ratio < 0.01
+        # stance_plan = rollouts.plans[-2]  # second-to-last sample = stance-anchored
+        # exec_plan = jax.lax.cond(
+        #     constraint_tied,
+        #     lambda: self.task.get_exec_plan(stance_plan),   # stance-anchored: feet stay put
+        #     lambda: self.task.get_exec_plan(new_best),       # avoidance argmin
+        # )
 
         return params.replace(  # type: ignore
             c_max=new_c_max,
             mean=new_mean,
             best_plan=new_best,
-            exec_plan=exec_plan,
-            min_violations=body_sums[best_index],
+            # exec_plan=exec_plan,
+            # min_violations=body_sums[best_index],
         )
 
     #### Can be called with super/modified by child classes ####
@@ -206,7 +210,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             mean=_params.mean,
             best_plan=abs_plan,
             exec_plan=self.task.get_exec_plan(abs_plan),
-            min_violations=jnp.zeros(()),
+            # min_violations=jnp.zeros(()),
             ref=_params.ref,
             rng=_params.rng,
             task_params=_params.task_params,
@@ -296,7 +300,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         # Project warm-start plan to safe set so MPPI starts from
         # a feasible reference and doesn't warm-start into an obstacle.
-        abs_plan = self.task.project_plan_to_safe(abs_plan)
+        # abs_plan = self.task.project_plan_to_safe(abs_plan)
 
         new_mean = abs_plan - params.ref
 
@@ -333,4 +337,44 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # # This is smoother than the argmin best_plan from update_params.
         # return params.replace(exec_plan=exec_plan, best_plan=abs_plan)  # type: ignore
 
-        return params.replace(exec_plan=exec_plan)  # type: ignore
+        return params.replace(exec_plan=exec_plan)
+
+    # def finalize_best_plan(self, params: MIMPSParams) -> MIMPSParams:
+    #     """Project exec_plan to the safe set and finalize for execution.
+
+    #     exec_plan is set in update_params with tie-breaking applied:
+    #     - Normally: exec_plan = get_exec_plan(argmin_plan)
+    #     - When all samples tie (equal body contacts): exec_plan = get_exec_plan(stance_plan)
+
+    #     best_plan is always the argmin plan, preserved for warm-starting next cycle
+    #     via prepare_optimize.  Separating exec_plan from best_plan ensures the
+    #     tie-breaking only affects execution, not the optimizer's search state.
+
+    #     The exec plan is projected to the safe set so that even the selected
+    #     sample — which may still clip an obstacle corner — has its feet pushed to
+    #     the nearest safe position.
+    #     """
+    #     # Recover the denormalized plan from the current exec_plan for projection.
+    #     # exec_plan has shape (4, H, 3) from get_exec_plan; invert back to (H, plan_dim).
+    #     # Simpler: project best_plan (always argmin, not stance) for safe warm-start,
+    #     # but project exec_plan's underlying plan for actual execution.
+    #     #
+    #     # exec_plan is already (4, H, 3); to project we need (H, plan_dim) normalized form.
+    #     # Re-derive from params.best_plan if exec plan == argmin, or leave as-is if stance.
+    #     # Safest: just project exec_plan's normalized equivalent via the stored exec_plan.
+    #     #
+    #     # Since exec_plan is get_exec_plan(plan) = denorm(plan).reshape(4,H,3).T-ish,
+    #     # we cannot easily invert it.  Instead, project best_plan for the warm-start
+    #     # (done in prepare_optimize) and project exec_plan by re-deriving from exec_plan.
+    #     #
+    #     # Practical approach: exec_plan carries the tie-breaking choice.  Project it
+    #     # by converting back to (H, plan_dim) normalized, projecting, re-applying get_exec_plan.
+    #     # exec_plan shape: (4, H, 3) world-frame → normalize → (H, plan_dim) → project → exec.
+    #     exec_world = params.exec_plan                          # (4, H, 3)
+    #     H = exec_world.shape[1]
+    #     exec_norm = (exec_world.transpose(1, 0, 2).reshape(H, self.task.plan_dim)
+    #                  / self.task.plan_lim)                    # (H, plan_dim) normalized
+    #     projected_norm = self.task.project_plan_to_safe(exec_norm[None])[0]  # (H, plan_dim)
+    #     exec_plan = self.task.get_exec_plan(projected_norm)
+
+    #     return params.replace(exec_plan=exec_plan)

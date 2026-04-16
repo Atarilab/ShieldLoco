@@ -583,8 +583,6 @@ def _safety_worker_main(
         import jax
 
         task, task_params, policy_params, jit_optimize, jit_dynamics = _init_worker_objects(mj_model, rl_policy, rl_config)
-        # jit_mjx_forward = jax.jit(mjx.forward)
-        jit_mjx_forward = jax.jit(mjx.forward)
 
         period = 1.0 / max(rate, 1e-3)
         last_processed_seq = -1
@@ -642,7 +640,7 @@ def _safety_worker_main(
             # always. By forward-simulating one step before optimizing, plan step 0
             # corresponds to the state when the plan actually arrives → controller
             # applies step 0 directly with no horizon shift needed.
-            _, data_ahead, _ = jit_dynamics(
+            _, data_ahead, _, _ = jit_dynamics(
                 task.model, task_params, task.data, policy_params.best_plan[:2]
             )
             policy_params = jit_optimize(data_ahead, policy_params, True)

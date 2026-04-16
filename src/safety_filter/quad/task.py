@@ -62,6 +62,9 @@ class QuadRLTaskParams(TaskParams):
     # Used by foot_step_cost to penalize large foot displacements that cause
     # the RL policy to take intermediate contacts through obstacles.
     init_foot_positions: jax.Array = jnp.zeros((4, 3))
+    # Planned foot positions for the current step (from MPPI plan segment).
+    # Used by foot_tracking_cost to penalize deviation between actual and planned.
+    planned_foot_positions: jax.Array = jnp.zeros((4, 3))
 
 
 class PhysicsMetaData:
@@ -201,7 +204,7 @@ class QuadRLTask(Task):
         self.body_sdf_scale = float(rl_config.get("body_sdf_scale", 0.10))
         self.foot_path_sdf_weight = float(rl_config.get("foot_path_sdf_weight", 30.0))
         self.foot_path_sdf_scale = float(rl_config.get("foot_path_sdf_scale", self.body_sdf_scale))
-
+        self.foot_tracking_weight = float(rl_config.get("foot_tracking_weight", 0.0))
 
         # We optimize around absolute reference contact locations in normalized space.
         # Keep planner bounds unbounded to avoid saturating valid world-frame references.
@@ -325,6 +328,7 @@ class QuadRLTask(Task):
             dynamic_obstacle_t0=jnp.zeros((n,), dtype=jnp.float32),
             dynamic_obstacle_radii=jnp.zeros((n,), dtype=jnp.float32),
             dynamic_obstacle_active=jnp.zeros((n,), dtype=jnp.bool_),
+            planned_foot_positions=jnp.zeros((4, 3), dtype=jnp.float32),
         )
 
     def normalize(self, plan: jax.Array) -> jax.Array:
@@ -670,12 +674,15 @@ class QuadRLTask(Task):
         state: mjx.Data,
         plan_segment: jax.Array,
         plan_segment_ref: jax.Array | None = None,
-    ) -> Tuple[QuadRLTaskParams, mjx.Data, jax.Array]:
+    ) -> Tuple[QuadRLTaskParams, mjx.Data, jax.Array, jax.Array]:
         # If ref is optional, default to zeros (or task's current ref convention)
         if plan_segment_ref is None:
             plan_segment_ref = jnp.zeros_like(plan_segment)
 
         plan_segment_denorm = self.denormalize(plan_segment)
+
+        planned_step0_feet = plan_segment_denorm[0].reshape(4, 3)
+        task_params = task_params.replace(planned_foot_positions=planned_step0_feet)  # type: ignore
 
         def _update_policy(tp, s):
             tp_new, q_des_new = self.rl_forward(tp, s, plan_segment_denorm)
@@ -690,7 +697,7 @@ class QuadRLTask(Task):
         # mjx.step into the HLO graph.  Unrolling 10 steps × 8 horizon = 80
         # sequential kernel launches; scan reduces this to a single while-loop.
         def _substep(carry, _):
-            tp, s, hits = carry
+            tp, s, hits, accumulated_cost = carry
 
             # Advance goal at the first sub-step of every plan step (except step 0).
             counter = tp.lowlevel_step_counter
@@ -719,15 +726,20 @@ class QuadRLTask(Task):
             s = mjx.step(model, s.replace(ctrl=torq))
             tp = tp.replace(lowlevel_step_counter=tp.lowlevel_step_counter + 1)  # type: ignore
             hits = hits + self.constraint_check(s)
-            return (tp, s, hits), None
 
-        (task_params, state, constraint_hits), _ = jax.lax.scan(
+            # Accumulate dense cost at every substep (dense signal for MPPI)
+            step_cost = self.dense_running_cost(tp, s, plan_segment_denorm)
+            accumulated_cost = accumulated_cost + step_cost
+
+            return (tp, s, hits, accumulated_cost), None
+
+        (task_params, state, constraint_hits, accumulated_cost), _ = jax.lax.scan(
             _substep,
-            (task_params, state, jnp.zeros(2)),
+            (task_params, state, jnp.zeros(2), jnp.array(0.0)),
             None,
             length=self.rollout_decimation,
         )
-        return task_params, state, constraint_hits
+        return task_params, state, constraint_hits, accumulated_cost
 
     @partial(jax.jit, static_argnames=["self"])
     def constraint_check(self, state: mjx.Data) -> jax.Array:
@@ -782,7 +794,6 @@ class QuadRLTask(Task):
 
         return jnp.array([feet_flag, body_flag])
 
-
     def foot_step_cost(
         self, task_params: QuadRLTaskParams, plan_segment: jax.Array,
         step_idx: jax.Array | None = None
@@ -833,39 +844,107 @@ class QuadRLTask(Task):
     def foot_path_sdf_cost(
         self, task_params: QuadRLTaskParams, plan_segment: jax.Array
     ) -> jax.Array:
-        """Penalize foot step transitions that cross through obstacle interiors.
+        """Penalize foot swing arcs that cross through obstacle interiors.
 
-        For each foot, interpolates along the step[0] -> step[1] transition
-        and evaluates the 2D obstacle SDF at interior points.  If any point
-        is within projection_clearance of an obstacle boundary, a softplus
-        penalty fires.
+        Performs TWO arc safety checks for swing feet only:
 
-        Only evaluates consecutive planned step transitions (not stance ->
-        step[0], which is handled by foot_step_cost).  This avoids stale
-        stance comparisons at later horizon steps where the path from initial
-        stance to deep-planned positions always crosses obstacles regardless.
+        1. Stance -> step[0]: The first swing the RL policy executes, going from
+           the foot's current stance position to the planned first-step landing.
+           Even when step[0] lands safely after projection, the SWING ARC itself
+           may pass through an obstacle interior. foot_step_cost only penalizes
+           distance, NOT arc safety, so this check fills that gap.
+
+        2. step[0] -> step[1]: Consecutive planned swing arcs. Catches when a
+           planned sequence has successive steps that would swing through obstacles
+           even if individual landings are safe.
+
+        Only swing feet (contact_plan[f] == 0) are checked because stance feet
+        do not move — their arc is degenerate (zero length) and irrelevant.
         """
         if self.obstacle_sdf.num_obstacles == 0:
             return jnp.array(0.0)
 
-        feet_curr = self.denormalize(plan_segment[0]).reshape(4, 3)[:, :2]  # (4, 2)
-        feet_next = self.denormalize(plan_segment[1]).reshape(4, 3)[:, :2]  # (4, 2)
+        # Identify swing feet: contact_plan[:4] encodes phase for each foot.
+        # Value 0.0 = swing (foot should move), 1.0 = stance (foot stationary).
+        # Shape: (4,), used as mask to gate penalty contributions.
+        swing_mask = (task_params.contact_plan[:4] == 0.0)  # (4,) bool
 
+        # Denormalize first two plan steps to world-frame XY positions.
+        # Each plan_segment has shape (H, 12) = (H, 4*3) = (H, FLx,FLy,FLz, FRx,...).
+        step0_xy = self.denormalize(plan_segment[0]).reshape(4, 3)[:, :2]  # (4, 2)
+        step1_xy = self.denormalize(plan_segment[1]).reshape(4, 3)[:, :2]  # (4, 2)
+
+        # Current stance positions — where feet are at the START of this plan cycle.
+        # Shape: (4, 2). Used for stance->step[0] arc check.
+        stance_xy = task_params.init_foot_positions[:, :2]  # (4, 2)
+
+        # Number of interior points to sample along each swing arc.
+        # 5 points (excluding endpoints) provides good resolution without excess cost.
         n_interp = 5
-        t_vals = jnp.linspace(0.0, 1.0, n_interp + 2)[1:-1]
+        t_vals = jnp.linspace(0.0, 1.0, n_interp + 2)[1:-1]  # interior-only, shape (n_interp,)
 
-        interp = (1.0 - t_vals[:, None, None]) * feet_curr[None] + t_vals[:, None, None] * feet_next[None]
+        # ============================================================
+        # Check 1: Stance -> step[0] arc for swing feet only
+        # ============================================================
+        # The RL policy executes this swing first when tracking a new plan.
+        # Even if step[0] lands safely (projection worked), the ARC may still
+        # clip an obstacle. This is a primary collision source in cluttered scenes.
+        #
+        # For each swing foot f, interpolate from stance_xy[f] to step0_xy[f]
+        # and evaluate SDF at interior points. Only swing feet contribute.
+        interp_stance_to_step0 = (
+            (1.0 - t_vals[:, None, None]) * stance_xy[None]
+            + t_vals[:, None, None] * step0_xy[None]
+        )  # (n_interp, 4, 2)
 
-        flat_xy = interp.reshape(-1, 2)  # (n_interp * 4, 2)
+        flat_stance_arc = interp_stance_to_step0.reshape(-1, 2)  # (n_interp * 4, 2)
 
-        sdfs, _ = _batch_sdf_and_grad(flat_xy, self.obstacle_sdf)
-        min_sdfs = jnp.min(sdfs, axis=1)
+        sdfs_stance, _ = _batch_sdf_and_grad(flat_stance_arc, self.obstacle_sdf)
+        min_sdfs_stance = jnp.min(sdfs_stance, axis=1)  # (n_interp * 4,)
 
-        violations = jnp.maximum(0.0, self.projection_clearance - min_sdfs)
-        violations = jnp.clip(violations, -1e4, 1e4)
-        cost = jnp.sum(jax.nn.softplus(violations / self.foot_path_sdf_scale) * self.foot_path_sdf_scale)
+        # Compute violations for all feet, then mask to swing feet only.
+        # Non-swing feet get zero contribution regardless of their SDF values.
+        all_violations_stance = jnp.maximum(0.0, self.projection_clearance - min_sdfs_stance)
+        all_violations_stance = jnp.clip(all_violations_stance, -1e4, 1e4)
 
-        return self.foot_path_sdf_weight * cost
+        # Reshape to (n_interp, 4) and apply swing_mask before summing.
+        # foot f at interior point i only contributes if swing_mask[f] == True.
+        violations_stance_reshaped = all_violations_stance.reshape(n_interp, 4)
+        swing_mask_2d = swing_mask[None, :]  # (1, 4) broadcastable
+        violations_stance_masked = violations_stance_reshaped * swing_mask_2d.astype(jnp.float32)
+        penalty_stance = jnp.sum(
+            jax.nn.softplus(violations_stance_masked / self.foot_path_sdf_scale)
+            * self.foot_path_sdf_scale
+        )
+
+        # ============================================================
+        # Check 2: step[0] -> step[1] arc for swing feet only
+        # ============================================================
+        # Same logic as Check 1 but for consecutive planned steps.
+        # Filters to swing feet to avoid penalizing degenerate stance arcs.
+        interp_step0_to_step1 = (
+            (1.0 - t_vals[:, None, None]) * step0_xy[None]
+            + t_vals[:, None, None] * step1_xy[None]
+        )  # (n_interp, 4, 2)
+
+        flat_step_arc = interp_step0_to_step1.reshape(-1, 2)  # (n_interp * 4, 2)
+
+        sdfs_step, _ = _batch_sdf_and_grad(flat_step_arc, self.obstacle_sdf)
+        min_sdfs_step = jnp.min(sdfs_step, axis=1)  # (n_interp * 4,)
+
+        all_violations_step = jnp.maximum(0.0, self.projection_clearance - min_sdfs_step)
+        all_violations_step = jnp.clip(all_violations_step, -1e4, 1e4)
+
+        violations_step_reshaped = all_violations_step.reshape(n_interp, 4)
+        violations_step_masked = violations_step_reshaped * swing_mask_2d.astype(jnp.float32)
+        penalty_step = jnp.sum(
+            jax.nn.softplus(violations_step_masked / self.foot_path_sdf_scale)
+            * self.foot_path_sdf_scale
+        )
+
+        # Combine both arc penalties and apply safety weight.
+        total_penalty = penalty_stance + penalty_step
+        return self.foot_path_sdf_weight * total_penalty
 
     def body_sdf_cost(self, state: mjx.Data) -> jax.Array:
         """Soft penalty for the robot body being near obstacle clusters.
@@ -890,6 +969,25 @@ class QuadRLTask(Task):
         violation_safe = jnp.clip(violation, -1e4, 1e4)
         return self.body_sdf_weight * jax.nn.softplus(violation_safe / self.body_sdf_scale) * self.body_sdf_scale
 
+    def foot_tracking_cost(
+        self, task_params: QuadRLTaskParams, state: mjx.Data
+    ) -> jax.Array:
+        """Penalize deviation between actual foot positions and planned positions.
+
+        S2 cost: during MPPI rollout, compares actual foot positions (from sim)
+        with the planned first-step contact locations. Applies to ALL feet so
+        that MPPI favors plans the RL policy can actually track.
+
+        Cost = foot_tracking_weight * sum_f ||actual_f - planned_f||^2
+        """
+        if self.foot_tracking_weight <= 0.0:
+            return jnp.array(0.0)
+
+        actual_feet = state.xpos[self.foot_ids]  # (4, 3)
+        planned_feet = task_params.planned_foot_positions  # (4, 3)
+        diff = actual_feet - planned_feet
+        return self.foot_tracking_weight * jnp.sum(diff ** 2)
+
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data
     ) -> jax.Array:
@@ -906,17 +1004,197 @@ class QuadRLTask(Task):
         if plan_segment_ref is None:
             plan_segment_ref = jnp.zeros_like(plan_segment)
 
+        # Tracking cost only (terminal - evaluated at end state)
         tracking_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
-        foot_step = self.foot_step_cost(task_params, plan_segment, step_idx)
-        foot_chain = self.foot_chain_cost(task_params, plan_segment)
+        foot_tracking = self.foot_tracking_cost(task_params, state)
+
+        return tracking_cost + foot_tracking
+
+    def dense_running_cost(
+        self,
+        task_params: QuadRLTaskParams,
+        state: mjx.Data,
+        plan_segment: jax.Array,
+    ) -> jax.Array:
+        # dense costs only (dense - accumulated per substep)
+        # foot_step = self.foot_step_cost(task_params, plan_segment)
+        # foot_chain = self.foot_chain_cost(task_params, plan_segment)
         foot_path = self.foot_path_sdf_cost(task_params, plan_segment)
         body_sdf = self.body_sdf_cost(state)
+        foot_tracking = self.foot_tracking_cost(task_params, state)
 
-        return tracking_cost + foot_step + foot_chain + foot_path + body_sdf
+        return (body_sdf 
+                # + foot_step 
+                # + foot_chain 
+                + foot_tracking
+                + foot_path
+            )
 
     def forward(self, model, tp, x, a, a_ref, step_idx=None):
-        tp, x_next, constraint_hits = self.dynamics(model, tp, x, a, a_ref)
+        tp, x_next, constraint_hits, accumulated_safety_cost = self.dynamics(model, tp, x, a, a_ref)
 
-        task_cost = self.running_cost(tp, x_next, a, a_ref, step_idx=step_idx)
+        # Terminal tracking cost (evaluated at final state) + accumulated safety cost (dense per substep)
+        tracking_cost = self.running_cost(tp, x_next, a, a_ref)
+        total_cost = tracking_cost + accumulated_safety_cost
 
-        return tp, x_next, task_cost, constraint_hits
+        return tp, x_next, total_cost, constraint_hits
+
+    # def _dynamic_obstacle_cost(
+    #     self, task_params: QuadRLTaskParams, state: mjx.Data
+    # ) -> jax.Array:
+    #     if (
+    #         self.dynamic_obstacle_cost_weight <= 0.0
+    #         or task_params.dynamic_obstacle_p0.shape[0] == 0
+    #     ):
+    #         return jnp.array(0.0, dtype=jnp.float32)
+
+    #     obstacle_radii = task_params.dynamic_obstacle_radii   # (N,)
+    #     obstacle_active = task_params.dynamic_obstacle_active.astype(jnp.float32)  # (N,)
+    #     W = self.dynamic_obstacle_cost_weight
+    #     scale = self.dynamic_obstacle_cost_scale
+    #     _EXP_MAX = 20.0
+
+    #     body_pos = state.xpos[self.base_body_id]  # (3,)
+
+    #     #  Stage-based cost
+    #     # Ball position at this rollout stage (ballistic projection).
+    #     # dt = lag-since-observation + MPS solve latency + time-into-horizon
+    #     stage_idx = task_params.lowlevel_step_counter // self.rollout_decimation - 1
+    #     stage_idx = jnp.clip(stage_idx, 0, self.horizon_length - 1)
+    #     stage_time = stage_idx.astype(jnp.float32) * self.command_duration
+    #     dt = task_params.dynamic_obstacle_t0 + self.mpc_latency_compensation + stage_time  # (N,)
+
+    #     g = jnp.array([0.0, 0.0, -9.81], dtype=jnp.float32)
+    #     ball_pos_stage = (
+    #         task_params.dynamic_obstacle_p0
+    #         + task_params.dynamic_obstacle_v0 * dt[:, None]
+    #         + 0.5 * g[None, :] * (dt[:, None] ** 2)
+    #     )
+    #     # Clamp ball z to ground so underground balls don't create phantom attraction.
+    #     ball_pos_stage = ball_pos_stage.at[:, 2].set(
+    #         jnp.maximum(ball_pos_stage[:, 2], obstacle_radii)
+    #     )
+
+    #     #  Whole-body check: all robot bodies vs predicted ball (3-D)
+    #     # robot_body_ids covers base, hips, thighs, calves, and feet -- every
+    #     # body whose root is base_link.  Using 3-D distance is correct here
+    #     # because the ball flies through the air and can hit from any direction.
+    #     robot_body_pos = state.xpos[self.robot_body_ids]  # (B, 3)
+    #     robot_ball_dist = jnp.linalg.norm(
+    #         robot_body_pos[:, None, :] - ball_pos_stage[None, :, :], axis=-1
+    #     )  # (B, N)
+    #     robot_clearance = (
+    #         robot_ball_dist - obstacle_radii[None, :] - self.robot_body_radii[:, None] - self.obstacle_clearance
+    #     )
+    #     stage_cost = W * jnp.sum(
+    #         obstacle_active[None, :] * jnp.exp(jnp.clip(-robot_clearance / scale, a_max=_EXP_MAX))
+    #     )
+
+    #     #  Ballistic impact position cost
+    #     # Computes WHERE the ball will be when it descends to the robot's body
+    #     # height (z = body_pos.z) using the full ballistic arc.  Measures the
+    #     # HORIZONTAL distance from that impact position to the robot body.
+    #     # This correctly handles lobbed throws (high v0_z) where the straight-
+    #     # line velocity direction points upward and misses the robot entirely.
+    #     #
+    #     # Works for any trajectory: line-drive, lob, drop -- all correctly
+    #     # mapped to a 2D horizontal clearance check at robot height.
+    #     # Ballistic impact: where does the ball land at the robot's body height?
+    #     # Uses the full parabolic arc -- correctly handles lobs (high v0_z) where
+    #     # the instantaneous velocity direction points skyward and doesn't predict
+    #     # where the ball will actually be at robot height.
+    #     p0 = task_params.dynamic_obstacle_p0   # (N, 3)
+    #     v0 = task_params.dynamic_obstacle_v0   # (N, 3)
+    #     p0_z = p0[:, 2]
+    #     v0_z = v0[:, 2]
+    #     robot_z = body_pos[2]
+
+    #     # Solve: p0_z + v0_z*t - 4.905*t² = robot_z  ->  descent root (larger t)
+    #     disc = v0_z ** 2 + 4.0 * 4.905 * (p0_z - robot_z)     # (N,)
+    #     t_impact = (v0_z + jnp.sqrt(jnp.maximum(disc, 0.0))) / (2.0 * 4.905)  # (N,)
+
+    #     impact_xy = p0[:, :2] + v0[:, :2] * t_impact[:, None]  # (N, 2)  gravity only affects z
+    #     horiz_dist = jnp.linalg.norm(impact_xy - body_pos[None, :2], axis=-1)  # (N,)
+    #     horiz_clearance = horiz_dist - obstacle_radii - self.robot_radius - self.obstacle_clearance
+
+    #     valid_arc = (disc > 0).astype(jnp.float32)  # ball actually reaches robot height
+    #     heading_cost = W * jnp.sum(
+    #         obstacle_active * valid_arc
+    #         * jnp.exp(jnp.clip(-horiz_clearance / scale, a_max=_EXP_MAX))
+    #     )
+
+    #     return stage_cost + heading_cost
+
+    # def get_dynamic_safety_bias(
+    #     self, task_params: QuadRLTaskParams, ref: jax.Array
+    # ) -> jax.Array:
+    #     """Returns (H, plan_dim) normalized plan-space mean bias to avoid
+    #     threatening ballistic obstacles.  Called from MIMPS.sample_plans so
+    #     that all samples are centred around the analytically-predicted dodge
+    #     rather than the nominal trajectory -- enabling single-cycle whole-body
+    #     avoidance.  Returns zeros when no obstacle is active or threatening.
+
+    #     Body position is estimated as the XY centroid of the reference feet at
+    #     horizon step 0.  The bias shifts ALL four feet by the same XY offset
+    #     (rigid-body translation), which is the dominant mode for body-level
+    #     obstacle avoidance.
+    #     """
+    #     if task_params.dynamic_obstacle_p0.shape[0] == 0:
+    #         return jnp.zeros((self.horizon_length, self.plan_dim), dtype=jnp.float32)
+
+    #     #  Estimate robot body XY from reference foot centroid
+    #     # ref: (H, plan_dim) normalized.  Step-0 feet -> (4, 3) world coords.
+    #     step0_feet = (ref[0] * self.plan_lim).reshape(4, 3)   # (4, 3)
+    #     body_xy = step0_feet[:, :2].mean(axis=0)               # (2,)
+    #     body_z  = jnp.array(0.35, dtype=jnp.float32)          # nominal torso height
+
+    #     #  Per-obstacle ballistic impact check
+    #     p0  = task_params.dynamic_obstacle_p0    # (N, 3)
+    #     v0  = task_params.dynamic_obstacle_v0    # (N, 3)
+    #     radii = task_params.dynamic_obstacle_radii  # (N,)
+    #     active = task_params.dynamic_obstacle_active.astype(jnp.float32)  # (N,)
+
+    #     p0_z = p0[:, 2]
+    #     v0_z = v0[:, 2]
+
+    #     # Time for ball to descend to body_z (descent root of ballistic arc).
+    #     disc = v0_z ** 2 + 4.0 * 4.905 * (p0_z - body_z)          # (N,)
+    #     disc_safe = jnp.maximum(disc, 0.0)
+    #     t_imp = (v0_z + jnp.sqrt(disc_safe)) / (2.0 * 4.905)       # (N,)
+
+    #     # Impact XY position
+    #     impact_xy = p0[:, :2] + v0[:, :2] * t_imp[:, None]         # (N, 2)
+
+    #     # Vector and distance from body to impact
+    #     to_impact = impact_xy - body_xy[None, :]                    # (N, 2)
+    #     horiz_dist = jnp.linalg.norm(to_impact, axis=-1)            # (N,)
+    #     horiz_dist_safe = jnp.maximum(horiz_dist, 1e-6)
+
+    #     r_safe = radii + self.robot_radius + self.obstacle_clearance + 0.1  # (N,)
+    #     deficit = jnp.maximum(r_safe - horiz_dist, 0.0)             # (N,) >0 when threatening
+
+    #     # Dodge direction: directly away from impact point
+    #     dodge_dir = -to_impact / horiz_dist_safe[:, None]           # (N, 2)
+
+    #     # Mask: only fire for active obstacles with valid arc and actual threat
+    #     valid = active * (disc > 0).astype(jnp.float32) * (t_imp > 0).astype(jnp.float32)
+    #     per_obs_offset = valid[:, None] * deficit[:, None] * dodge_dir  # (N, 2)
+
+    #     # Aggregate: sum offsets (handles multiple balls)
+    #     total_xy = per_obs_offset.sum(axis=0)                       # (2,)
+
+    #     # Clamp to plan_lim so the bias stays within one normalized unit.
+    #     # Larger values are clipped by f() anyway but can corrupt warm-start mean.
+    #     total_xy_norm = total_xy / self.plan_lim
+    #     total_xy_norm = jnp.clip(total_xy_norm, -1.0, 1.0)
+
+    #     #  Convert to normalized plan-space bias
+    #     # Shift all 4 feet by the same XY amount (rigid body translation).
+    #     # plan_dim layout: [foot0_x, foot0_y, foot0_z, foot1_x, …] × 4
+    #     foot_bias = jnp.zeros(self.plan_dim, dtype=jnp.float32)
+    #     for f in range(4):
+    #         foot_bias = foot_bias.at[f * 3    ].set(total_xy_norm[0])
+    #         foot_bias = foot_bias.at[f * 3 + 1].set(total_xy_norm[1])
+
+    #     # Constant across all horizon steps (simple and stable)
+    #     return jnp.broadcast_to(foot_bias[None, :], (self.horizon_length, self.plan_dim))

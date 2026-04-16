@@ -68,8 +68,19 @@ class ObstacleSDF:
         for gid in range(ngeom):
             name = mj_model.geom(gid).name or ""
             if any(name.startswith(p) for p in hazard_prefixes):
-                size_z = mj_model.geom_size[gid, 2]
-                if size_z >= min_height:
+                gtype = int(mj_model.geom_type[gid])
+                size = mj_model.geom_size[gid]
+                # Height index depends on geom type:
+                #   BOX (6):               size = [hx, hy, hz]   → size[2]
+                #   CYLINDER (5), CAPSULE (3): size = [r, half_len, 0] → size[1]
+                #   SPHERE (2):            size = [r, 0, 0]      → size[0]
+                if gtype == 6:
+                    height = size[2]
+                elif gtype in (3, 5):
+                    height = size[1]
+                else:
+                    height = size[0]
+                if height >= min_height:
                     geom_is_hazard[gid] = True
 
         hazard_ids = np.flatnonzero(geom_is_hazard).astype(np.int32)
@@ -154,10 +165,15 @@ def _sdf_and_grad_one(point_xy, center, R2, half_ext, obs_type):
     grad_b_ext = (diff_local - nearest_on_box) / (
         jnp.linalg.norm(diff_local - nearest_on_box) + 1e-10
     )
+    # Use >= 0 → +1, < 0 → -1 to guarantee non-zero gradient.
+    # jnp.sign(0) = 0 causes zero gradient when a point lands exactly on a
+    # box's symmetry axis (common with regular grids or axis-aligned obstacles).
+    s_x = jnp.where(diff_local[0] >= 0, 1.0, -1.0)
+    s_y = jnp.where(diff_local[1] >= 0, 1.0, -1.0)
     grad_b_int = jnp.where(
         jnp.argmax(q_b) == 0,
-        jnp.array([jnp.sign(diff_local[0]), 0.0]),
-        jnp.array([0.0, jnp.sign(diff_local[1])]),
+        jnp.array([s_x, 0.0]),
+        jnp.array([0.0, s_y]),
     )
     grad_b_local = jnp.where(exterior_b, grad_b_ext, grad_b_int)
     grad_b = R2 @ grad_b_local
@@ -390,8 +406,6 @@ def project_plan_feet_with_arc_check(plans_denorm, sdf, r_safe, current_feet_xy,
     projected_flat_xy, _ = jax.lax.scan(_step, flat_xy, None, length=n_iters)
     projected_xy = projected_flat_xy.reshape(feet_xy.shape)
 
-    current_flat = current_feet_xy.reshape(-1, 2)
-
     def _fix_arc_h0(p_proj, p_curr):
         return jax.vmap(check_and_fix_swing_arc, in_axes=(0, 0, None, None))(
             p_curr, p_proj, sdf, r_safe
@@ -403,10 +417,14 @@ def project_plan_feet_with_arc_check(plans_denorm, sdf, r_safe, current_feet_xy,
         )
 
     corrected_xy = projected_xy.copy()
-    corrected_flat = corrected_xy.reshape(-1, 2)
 
-    h0_to_check = corrected_xy[..., 0, :, :]
-    h0_from = jnp.broadcast_to(current_flat[None, :, :], h0_to_check.shape)
+    h0_to_check = corrected_xy[..., 0, :, :]  # (*batch, 4, 2)
+    # current_feet_xy: (4, 2) shared across batch, or (*batch, 4, 2) per-sample
+    current_arr = jnp.asarray(current_feet_xy)
+    if current_arr.ndim == 2:
+        h0_from = jnp.broadcast_to(current_arr, h0_to_check.shape)
+    else:
+        h0_from = current_arr.reshape(*batch, 4, 2)
     fixed_h0 = _fix_arc_h0(h0_to_check, h0_from)
     corrected_xy = corrected_xy.at[..., 0, :, :].set(fixed_h0)
 
