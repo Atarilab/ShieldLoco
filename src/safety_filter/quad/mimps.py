@@ -16,16 +16,13 @@ from safety_filter.bases.risk import RiskStrategy
 class MIMPSParams(QuadAlgSamplingParams):
     """Policy parameters for model-predictive path integral control.
 
-    Same as SamplingParams
+    Same as QuadAlgSamplingParams (best_plan, exec_plan now inherited from base).
 
     Attributes:
         best_plan: The best plan spline knots found so far.
-        min_violations: Constraint sum of the best (argmin) sample from the last MPPI iteration.
-                        0.0 means at least one sample was collision-free → safe to override.
+        exec_plan: Materialized execution plan for controller output.
     """
-    best_plan: Optional[jax.Array] = None
-    exec_plan: Optional[jax.Array] = None
-    # min_violations: Optional[jax.Array] = None
+    pass
 
 
 class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
@@ -119,77 +116,30 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         feet-only collision flags.  Argmin selection uses whole-body collision
         counts to pick the sample with fewest physical contacts.
         """
-        # Just sum costs - CaT already applied in rollout
         costs = jnp.sum(rollouts.costs, axis=1)
 
-        # Dual constraint flags: (N, H+1, 2) = [feet_flag, body_count]
         constraint_flags = rollouts.constraint_flags.astype(jnp.float32)
-        feet_flags = constraint_flags[..., 0]   # (N, H+1) binary foot-hazard contacts
-        # body_flags = constraint_flags[..., 1]    # (N, H+1) whole-body contact counts
+        feet_flags = constraint_flags[..., 0]
 
-        # Update c_max: adapt to observed FEET-ONLY violations (discriminative)
-        batch_max_violation = jnp.max(feet_flags)
-        new_c_max = jnp.maximum(batch_max_violation, 1.0)
+        params = self.update_c_max(params, rollouts, self.p_max, self.c_max_decay)
 
-        # First num_samples are from mean around ref
         costs_mean = costs[: self.num_samples]
-
-        # Shape: (num_samples, H, plan_dim)
         plans_mean = rollouts.plans[: self.num_samples]
 
-        # Update mean (around ref)
-        # Shape: (num_samples, H, plan_dim)
         increments_mean = plans_mean - params.ref
-        # Shape: (num_samples,)
-        # Normalize costs by their std before weighting so that `temperature` is a
-        # dimensionless sharpness parameter independent of cost magnitude.  Without
-        # this, large safety_weight values cause exp(-cost/T) to underflow to 0 for
-        # all-but-the-best sample, collapsing MPPI to pure argmin selection and
-        # producing NaN weighted averages when costs contain outliers.
-        #
-        # Guard against NaN/Inf: if any cost is NaN (e.g. from corrupted physics
-        # state), replace it with 0 for std computation and clip normalized costs
-        # to prevent exp overflow in softmax.
         costs_mean_safe = jnp.where(jnp.isfinite(costs_mean), costs_mean, 0.0)
         cost_std = jnp.std(costs_mean_safe)
         costs_normed = (costs_mean_safe - jnp.mean(costs_mean_safe)) / (cost_std + 1e-6)
-        costs_normed = jnp.clip(costs_normed, -100.0, 100.0)  # prevent exp overflow
+        costs_normed = jnp.clip(costs_normed, -100.0, 100.0)
         weights_mean = jax.nn.softmax(-costs_normed / self.temperature, axis=0)
-        # Shape: (num_plans, plan_dim)
         new_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
-
 
         new_best = rollouts.plans[jnp.argmin(costs)]
 
-
-        # Argmin selection uses WHOLE-BODY collision count to pick the
-        # sample with fewest physical contacts (swing arcs, calf brushes, etc.)
-        # body_sums = jnp.sum(body_flags, axis=1)  # (N,) total body contacts per sample
-        # best_index = jnp.argmin(body_sums)
-        # new_best = rollouts.plans[best_index]  # Shape: (H, plan_dim)
-
-        # # Tie-breaking: if all samples have similar body contact counts, fall
-        # # back to the stance-anchored plan (plans[-2]) for EXECUTION.
-        # # best_plan is intentionally kept as argmin (not stance) so that
-        # # prepare_optimize warm-starts from the optimizer's current search
-        # # direction rather than resetting to stance every tied cycle.
-        # # exec_plan is overridden in finalize_best_plan, which in
-        # # QuadMIMPSPlanner projects exec_plan (not best_plan) for execution.
-        # range_ratio = (jnp.max(body_sums) - jnp.min(body_sums)) / (jnp.mean(body_sums) + 1e-6)
-        # constraint_tied = range_ratio < 0.01
-        # stance_plan = rollouts.plans[-2]  # second-to-last sample = stance-anchored
-        # exec_plan = jax.lax.cond(
-        #     constraint_tied,
-        #     lambda: self.task.get_exec_plan(stance_plan),   # stance-anchored: feet stay put
-        #     lambda: self.task.get_exec_plan(new_best),       # avoidance argmin
-        # )
-
-        return params.replace(  # type: ignore
-            c_max=new_c_max,
+        return params.replace(
+            c_max=params.c_max,
             mean=new_mean,
             best_plan=new_best,
-            # exec_plan=exec_plan,
-            # min_violations=body_sums[best_index],
         )
 
     #### Can be called with super/modified by child classes ####

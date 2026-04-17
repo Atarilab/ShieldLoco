@@ -47,6 +47,40 @@ ISAAC_LAB_DEFAULT_JOINT_POS: &ISAAC_LAB_DEFAULT_JOINT_POS [
 
 
 # MPS stuff
+
+# === OPTIMIZER ===
+
+mps_alg_name: "MIMPS"
+
+# === COMMON PARAMS (used by all optimizers) ===
+mps_num_samples: 800
+mps_plan_horizon: *horizon_length
+mps_iterations: 2
+mps_gamma: 0.99
+mps_safety_weight: 1
+mps_collect_data: true
+mps_top_fraction: 0.02
+
+# === OPTIMIZER-SPECIFIC PARAMS (nested by algorithm) ===
+
+MIMPS:
+  noise_level: 0.6
+  temperature: 1
+
+CEMPS:
+  elite_fraction: 0.1
+  max_iters: 5
+
+DMPS:
+  temperature: 1
+
+CMPS:
+  temperature: 1
+  dt: 0.1
+
+
+# === Task ===
+
 mps_task_name: "QuadRLTask"
 timestep: 0.03
 
@@ -80,17 +114,7 @@ j_pd_max: 100.0
 kp: *stiffness
 kd: *damping
 
-mps_alg_name: "MIMPS"
-mps_num_samples: 800
-mps_noise_level: 0.6
-mps_temperature: 1
-mps_plan_horizon: *horizon_length
-mps_iterations: 2           # keep 1: more iterations doubles plan latency (~2.6s), hurting timing
-mps_policy_decimation: 1    # call RL policy every sim step (~30ms ≈ real 20ms rate).
-                            # Must stay at 1: policy trained at 50Hz; holding PD target for a full
-                            # 300ms plan step (decimation=10) makes rollouts diverge → garbage plans.
-mps_gamma: 0.99
-mps_safety_weight: 1
+mps_policy_decimation: 1
 # Minimum obstacle height (metres) to include in collision constraint.
 # Thin obstacles (cables 4mm, phones 4mm) contact the 22mm foot sphere during
 # normal stance — unavoidable, so they produce n_safe=0 for all samples.
@@ -129,8 +153,7 @@ body_sdf_scale: 0.2
 foot_path_sdf_weight: 1.0
 foot_path_sdf_scale: 0.2  # softplus sharpness for foot-path SDF penalty (metres); tune independently of body_sdf_scale
 foot_tracking_weight: 1.0  # S2: penalize actual-vs-planned foot position error during rollout (0=off, tune up)
-mps_collect_data: true
-mps_top_fraction: 0.02
+
 # Contact buffer sizing — two different semantics in the warp backend:
 #   nconmax = TOTAL across all worlds → allocated as ncon_per_world * num_samples.
 #   njmax   = PER-WORLD efc rows     → NOT scaled; after vmap efc_J = (N, njmax, nv).

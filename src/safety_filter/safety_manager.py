@@ -32,6 +32,57 @@ def guard_errors(context: str, *, stop_on_error: bool = True):
     return decorator
 
 
+PLANNER_REGISTRY = {
+    "MIMPS": "QuadMIMPSPlanner",
+    "CEM": "QuadCEMPSlanner",
+    "DIAL_MPC": "QuadDPMSPlanner",
+    "CONSENSUS": "QuadCMPSPlanner",
+}
+
+
+def create_planner(alg_name, task, config):
+    """Factory function to create a planner based on algorithm name.
+    
+    Args:
+        alg_name: Algorithm name (MIMPS, CEMPS, DMPS, CMPS)
+        task: QuadRLTask instance
+        config: Configuration dict with common + optimizer-specific params
+        
+    Returns:
+        Planner instance of the appropriate type
+    """
+    from .quad.mimps import QuadMIMPSPlanner
+    from .quad.cemps import QuadCEMPSPlanner
+    from .quad.dmps import QuadDPMSPlanner
+    from .quad.cmps import QuadCMPSPlanner
+    
+    registry = {
+        "MIMPS": QuadMIMPSPlanner,
+        "CEMPS": QuadCEMPSPlanner,
+        "DMPS": QuadDPMSPlanner,
+        "CMPS": QuadCMPSPlanner,
+    }
+    
+    if alg_name not in registry:
+        raise ValueError(f"Unsupported algorithm: {alg_name}. Choose from {list(registry.keys())}")
+    
+    planner_cls = registry[alg_name]
+    
+    common_params = {
+        "num_samples": config.get("mps_num_samples", 800),
+        "plan_horizon": config.get("mps_plan_horizon", 6),
+        "iterations": config.get("mps_iterations", 2),
+        "gamma": config.get("mps_gamma", 0.99),
+        "safety_weight": config.get("mps_safety_weight", 1.0),
+        "collect_data": config.get("mps_collect_data", False),
+        "top_fraction": config.get("mps_top_fraction", 0.01),
+    }
+    
+    optimizer_params = config.get(alg_name, {})
+    
+    return planner_cls(task=task, **common_params, **optimizer_params)
+
+
 class SafetyManager:
     """Safety manager that runs RL policy planning in a separate thread to find safe contact locations."""
 
@@ -132,22 +183,7 @@ class SafetyManager:
             self.task_params = self.task.make_task_params()
 
             alg_name = self.rl_config.get("mps_alg_name", "MIMPS")
-            if alg_name == "MIMPS":
-                from .quad.mimps import QuadMIMPSPlanner
-                self.planner = QuadMIMPSPlanner(
-                    task=self.task,
-                    num_samples=self.rl_config.get("mps_num_samples", 1000),
-                    noise_level=self.rl_config.get("mps_noise_level", 0.5),
-                    temperature=self.rl_config.get("mps_temperature", 0.1),
-                    plan_horizon=self.rl_config.get("mps_plan_horizon", 1.0),
-                    iterations=self.rl_config.get("mps_iterations", 3),
-                    gamma=self.rl_config.get("mps_gamma", 0.99),
-                    safety_weight=self.rl_config.get("mps_safety_weight", 1e3),
-                    collect_data=self.rl_config.get("mps_collect_data", False),
-                    top_fraction=self.rl_config.get("mps_top_fraction", 0.01),
-                )
-            else:
-                raise ValueError(f"Unsupported algorithm name: {alg_name}")
+            self.planner = create_planner(alg_name, self.task, self.rl_config)
 
         else:
             raise ValueError(f"Unsupported task name: {task_name}")
@@ -515,7 +551,6 @@ def _init_worker_objects(mj_model, rl_policy, rl_config):
         raise ValueError(f"Unsupported task name: {task_name}")
 
     from .quad.task import QuadRLTask
-    from .quad.mimps import QuadMIMPSPlanner
 
     task = QuadRLTask(mj_model, rl_policy_jax, rl_config)
     # Buffer sizing for the MJX warp backend — two different semantics:
@@ -540,18 +575,8 @@ def _init_worker_objects(mj_model, rl_policy, rl_config):
     )
     task_params = task.make_task_params()
 
-    planner = QuadMIMPSPlanner(
-        task=task,
-        num_samples=rl_config.get("mps_num_samples", 1000),
-        noise_level=rl_config.get("mps_noise_level", 0.5),
-        temperature=rl_config.get("mps_temperature", 0.1),
-        plan_horizon=rl_config.get("mps_plan_horizon", 1.0),
-        iterations=rl_config.get("mps_iterations", 3),
-        gamma=rl_config.get("mps_gamma", 0.99),
-        safety_weight=rl_config.get("mps_safety_weight", 1e3),
-        collect_data=rl_config.get("mps_collect_data", False),
-        top_fraction=rl_config.get("mps_top_fraction", 0.01),
-    )
+    alg_name = rl_config.get("mps_alg_name", "MIMPS")
+    planner = create_planner(alg_name, task, rl_config)
 
     random_seed = np.random.randint(0, 2**31)
     policy_params = planner.init_params(task_params=task_params, seed=random_seed)
@@ -646,8 +671,9 @@ def _safety_worker_main(
             policy_params = jit_optimize(data_ahead, policy_params, True)
 
             override = True
-            policy_params = jit_optimize(task.data, policy_params, override)
             exec_plan = np.asarray(policy_params.exec_plan)
+
+            _add_log(shared_result, f"[SAFETY] Optimization completed: exec_plan shape={exec_plan.shape}, override={override}")
 
             # Share train_data COM trajectory if available
             if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:
@@ -656,18 +682,40 @@ def _safety_worker_main(
                 constraint_traj = np.asarray(policy_params.train_data.constraint_flags)
 
                 if qpos_traj.ndim == 3 and qpos_traj.shape[0] > 0:
-                    if costs_traj.ndim >= 2 and constraint_traj.ndim >= 2:
-                        combined = costs_traj + float(rl_config.get("mps_safety_weight", 1e3)) * constraint_traj
-                        per_traj_obj = np.sum(combined, axis=1)
-                        best_idx = int(np.argmin(per_traj_obj))
+                    if costs_traj.ndim > 1:
+                        _add_log(shared_result, f"[SAFETY] WARNING: costs_traj is multidimensional {costs_traj.shape}, using axis=0 argmin")
+                        best_idx = np.argmin(costs_traj, axis=0)[0]
+                        if best_idx >= qpos_traj.shape[0]:
+                            best_idx = 0
+                        best_qpos = qpos_traj[best_idx]
+                        best_costs = costs_traj[best_idx]
+                        best_constraints = (
+                            constraint_traj[best_idx] if constraint_traj.ndim > 1 else constraint_traj
+                        )
+                    elif costs_traj.shape[0] != qpos_traj.shape[0]:
+                        _add_log(shared_result, f"[SAFETY] WARNING: costs_traj size ({costs_traj.shape[0]}) != qpos_traj size ({qpos_traj.shape[0]}), skipping best_qpos selection")
+                        best_qpos = None
+                        best_costs = None
+                        best_constraints = None
                     else:
-                        best_idx = 0
-
-                    best_qpos = qpos_traj[best_idx]
-                    best_costs = costs_traj[best_idx] if costs_traj.ndim >= 2 else costs_traj
-                    best_constraints = (
-                        constraint_traj[best_idx] if constraint_traj.ndim >= 2 else constraint_traj
-                    )
+                        best_idx = np.argmin(costs_traj)
+                        best_qpos = qpos_traj[best_idx]
+                        best_costs = costs_traj[best_idx] if costs_traj.ndim >= 2 else costs_traj
+                        best_constraints = (
+                            constraint_traj[best_idx] if constraint_traj.ndim >= 2 else constraint_traj
+                        )
+                    
+                    if best_costs is not None:
+                        _add_log(shared_result, f"[SAFETY] Best costs: min={best_costs.min():.4f}, max={best_costs.max():.4f}, mean={best_costs.mean():.4f}, sum={best_costs.sum():.4f}")
+                    if best_constraints is not None:
+                        violations = np.sum(best_constraints > 0)
+                        total_constraints = best_constraints.shape[0] * best_constraints.shape[1]
+                        _add_log(shared_result, f"[SAFETY] Best constraints: violations={violations}/{total_constraints}, max_val={best_constraints.max():.4f}")
+                    # Distribution of constraint_sums across all top-B samples
+                    if constraint_traj.ndim == 2:
+                        c_sums = constraint_traj.sum(axis=1)
+                        n_safe = int(np.sum(c_sums == 0))
+                        _add_log(shared_result, f"[SAFETY] Top-B constraint_sums: min={c_sums.min():.1f}, mean={c_sums.mean():.1f}, max={c_sums.max():.1f}, n_safe={n_safe}/{len(c_sums)}")
                 elif qpos_traj.ndim == 2:
                     best_qpos = qpos_traj
                     best_costs = costs_traj if costs_traj.ndim == 1 else None
@@ -698,8 +746,11 @@ def _safety_worker_main(
             shared_result["seq"] = latest_seq
             shared_result["reference_generation_id"] = latest_state.get("reference_generation_id")
             shared_result["reference_step_seq"] = latest_state.get("reference_step_seq")
+            
+            _add_log(shared_result, f"[SAFETY] === Result Summary === seq={latest_seq}, override={override}, plan_shape={exec_plan.shape}")
 
             elapsed = time.perf_counter() - loop_start
+            _add_log(shared_result, f"[SAFETY] Optimization elapsed time: {elapsed*1000:.2f}ms (target period: {period*1000:.2f}ms)")
             sleep_time = max(0.0, period - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)

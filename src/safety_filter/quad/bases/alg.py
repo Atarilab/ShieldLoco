@@ -77,6 +77,9 @@ class QuadAlgSamplingParams:
         task_params: Optional task parameters that can be updated during plan call
         c_max: Adaptive maximum violation threshold for CaT (Constraints as Termination).
         
+        best_plan: Absolute normalized plan for warm-starting (ref-independent).
+        exec_plan: Materialized execution plan (4, H, 3) for controller output.
+        
     """
     mean: jax.Array
     rng: jax.Array
@@ -87,6 +90,9 @@ class QuadAlgSamplingParams:
     c_max: float = 1.0
 
     train_data: Optional[QuadAlgTrainData] = None
+    
+    best_plan: Optional[jax.Array] = None
+    exec_plan: Optional[jax.Array] = None
 
 
 class QuadSamplingBasedPlanner(ABC):
@@ -165,6 +171,27 @@ class QuadSamplingBasedPlanner(ABC):
         self.gamma = gamma
         self.p_max = p_max
         self.c_max_decay = c_max_decay
+
+    @staticmethod
+    def update_c_max(params, rollouts, p_max, c_max_decay):
+        """Update c_max based on observed constraint violations (CaT adaptation).
+        
+        Uses feet-only flags (discriminative) to avoid weight collapse.
+        c_max adapts to observed batch maximum violation.
+        
+        Args:
+            params: Current sampling params with c_max field.
+            rollouts: QuadAlgTrajectory with constraint_flags (N, H+1, 2).
+            p_max: Maximum termination probability.
+            c_max_decay: Decay rate for c_max when no violations observed.
+            
+        Returns:
+            Updated params with new c_max value.
+        """
+        feet_flags = rollouts.constraint_flags[..., 0]
+        batch_max_violation = jnp.max(feet_flags)
+        new_c_max = jnp.maximum(batch_max_violation, 1.0)
+        return params.replace(c_max=new_c_max)
 
     def init_params(
         self, task_params: QuadRLTaskParams, initial_mean: Optional[jax.Array] = None, ref_traj: Optional[jax.Array] = None, seed: int = 0
