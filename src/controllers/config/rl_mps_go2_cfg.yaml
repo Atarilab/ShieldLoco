@@ -69,7 +69,7 @@ foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 
 # 0.3 noise for [-1, 1] normalized
 # plan_lim in meters would be 0.3 * 0.25 (action scale) = 0.075 m
-plan_lim: 0.2
+plan_lim: 0.25
 act_rl_clip: 100 # there is no clip on actions actually
 action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
 
@@ -90,7 +90,7 @@ mps_policy_decimation: 1    # call RL policy every sim step (~30ms ≈ real 20ms
                             # Must stay at 1: policy trained at 50Hz; holding PD target for a full
                             # 300ms plan step (decimation=10) makes rollouts diverge → garbage plans.
 mps_gamma: 0.99
-mps_safety_weight: 0
+mps_safety_weight: 1
 # Minimum obstacle height (metres) to include in collision constraint.
 # Thin obstacles (cables 4mm, phones 4mm) contact the 22mm foot sphere during
 # normal stance — unavoidable, so they produce n_safe=0 for all samples.
@@ -102,7 +102,7 @@ constraint_min_obstacle_height: 0.0005
 # the worst-violated SDF constraint and pushes onto its boundary.
 # n_iters=3 suffices for circles (exact in 1) and boxes/capsules (2-3 iters).
 # projection_clearance = foot_radius + safety margin (metres).
-projection_clearance: 0.12
+projection_clearance: 0.08
 projection_iters: 3
 
 # Whole-body collision avoidance costs:
@@ -115,11 +115,11 @@ projection_iters: 3
 # body_sdf_weight / margin / scale: smooth softplus cost when the robot
 #   body center is within `margin` metres of any obstacle edge.  Provides
 #   a gradient for MPPI to prefer less-cluttered paths.
-foot_step_weight: 5.0
+# foot_step_weight: 5.0
 foot_chain_weight: 1.0
 body_sdf_weight: 1
-body_sdf_margin: 0.15
-body_sdf_scale: 0.10
+body_sdf_margin: 0.2
+body_sdf_scale: 0.2
 # Foot path SDF cost: penalizes straight-line foot trajectories that cross
 # through obstacle interiors.  Evaluates 2D SDF at interpolated points
 # between current stance and planned position (and between consecutive
@@ -127,8 +127,8 @@ body_sdf_scale: 0.10
 # policy's intermediate steps would land on obstacles.
 # 0 = off, 10 = mild, 30 = moderate (matches foot_chain_weight), 50+ = aggressive.
 foot_path_sdf_weight: 1.0
-foot_path_sdf_scale: 0.15  # softplus sharpness for foot-path SDF penalty (metres); tune independently of body_sdf_scale
-foot_tracking_weight: 10.0  # S2: penalize actual-vs-planned foot position error during rollout (0=off, tune up)
+foot_path_sdf_scale: 0.2  # softplus sharpness for foot-path SDF penalty (metres); tune independently of body_sdf_scale
+foot_tracking_weight: 1.0  # S2: penalize actual-vs-planned foot position error during rollout (0=off, tune up)
 mps_collect_data: true
 mps_top_fraction: 0.02
 # Contact buffer sizing — two different semantics in the warp backend:

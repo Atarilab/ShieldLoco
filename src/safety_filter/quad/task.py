@@ -62,9 +62,6 @@ class QuadRLTaskParams(TaskParams):
     # Used by foot_step_cost to penalize large foot displacements that cause
     # the RL policy to take intermediate contacts through obstacles.
     init_foot_positions: jax.Array = jnp.zeros((4, 3))
-    # Planned foot positions for the current step (from MPPI plan segment).
-    # Used by foot_tracking_cost to penalize deviation between actual and planned.
-    planned_foot_positions: jax.Array = jnp.zeros((4, 3))
 
 
 class PhysicsMetaData:
@@ -328,7 +325,6 @@ class QuadRLTask(Task):
             dynamic_obstacle_t0=jnp.zeros((n,), dtype=jnp.float32),
             dynamic_obstacle_radii=jnp.zeros((n,), dtype=jnp.float32),
             dynamic_obstacle_active=jnp.zeros((n,), dtype=jnp.bool_),
-            planned_foot_positions=jnp.zeros((4, 3), dtype=jnp.float32),
         )
 
     def normalize(self, plan: jax.Array) -> jax.Array:
@@ -681,9 +677,6 @@ class QuadRLTask(Task):
 
         plan_segment_denorm = self.denormalize(plan_segment)
 
-        planned_step0_feet = plan_segment_denorm[0].reshape(4, 3)
-        task_params = task_params.replace(planned_foot_positions=planned_step0_feet)  # type: ignore
-
         def _update_policy(tp, s):
             tp_new, q_des_new = self.rl_forward(tp, s, plan_segment_denorm)
             tp_new = tp_new.replace(last_q_des=q_des_new)  # type: ignore
@@ -728,7 +721,8 @@ class QuadRLTask(Task):
             hits = hits + self.constraint_check(s)
 
             # Accumulate dense cost at every substep (dense signal for MPPI)
-            step_cost = self.dense_running_cost(tp, s, plan_segment_denorm)
+            # Pass normalized plan_segment - cost functions call denormalize() internally
+            step_cost = self.dense_running_cost(tp, s, plan_segment)
             accumulated_cost = accumulated_cost + step_cost
 
             return (tp, s, hits, accumulated_cost), None
@@ -818,7 +812,7 @@ class QuadRLTask(Task):
     def foot_chain_cost(self, task_params: QuadRLTaskParams, plan_segment: jax.Array) -> jax.Array:
         """Penalize step-to-step foot displacement across the full horizon.
 
-        Cost = Σ_{h=1}^{H} Σ_{f=1}^{4} ||foot_h_f − foot_{h-1}_f||²
+        Cost = Σ_{h=1}^{H} Σ_{f=1}^{4} ||foot_h_f - foot_{h-1}_f||²
 
         Unlike foot_step_cost (only fires at goal_idx==0, penalizes distance from
         CURRENT stance), this penalizes the SHAPE of the plan: large jumps between
@@ -970,7 +964,7 @@ class QuadRLTask(Task):
         return self.body_sdf_weight * jax.nn.softplus(violation_safe / self.body_sdf_scale) * self.body_sdf_scale
 
     def foot_tracking_cost(
-        self, task_params: QuadRLTaskParams, state: mjx.Data
+        self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array
     ) -> jax.Array:
         """Penalize deviation between actual foot positions and planned positions.
 
@@ -983,10 +977,16 @@ class QuadRLTask(Task):
         if self.foot_tracking_weight <= 0.0:
             return jnp.array(0.0)
 
-        actual_feet = state.xpos[self.foot_ids]  # (4, 3)
-        planned_feet = task_params.planned_foot_positions  # (4, 3)
-        diff = actual_feet - planned_feet
-        return self.foot_tracking_weight * jnp.sum(diff ** 2)
+        # Denormalize first two plan steps to world-frame XY positions.
+        # Each plan_segment has shape (H, 12) = (H, 4*3) = (H, FLx,FLy,FLz, FRx,...).
+        step0_xy = self.denormalize(plan_segment[0]).reshape(4, 3)[:, :2]  # (4, 2)
+        step1_xy = self.denormalize(plan_segment[1]).reshape(4, 3)[:, :2]  # (4, 2)
+
+        actual_feet = state.xpos[self.foot_ids, :2]  # (4, 2) 
+
+        return self.foot_tracking_weight * jnp.sum(
+            (actual_feet - step0_xy) ** 2 + (actual_feet - step1_xy) ** 2
+        )
 
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data
@@ -1006,9 +1006,9 @@ class QuadRLTask(Task):
 
         # Tracking cost only (terminal - evaluated at end state)
         tracking_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
-        foot_tracking = self.foot_tracking_cost(task_params, state)
+        # foot_tracking = self.foot_tracking_cost(task_params, state)
 
-        return tracking_cost + foot_tracking
+        return tracking_cost # + foot_tracking
 
     def dense_running_cost(
         self,
@@ -1018,15 +1018,15 @@ class QuadRLTask(Task):
     ) -> jax.Array:
         # dense costs only (dense - accumulated per substep)
         # foot_step = self.foot_step_cost(task_params, plan_segment)
-        # foot_chain = self.foot_chain_cost(task_params, plan_segment)
+        foot_chain = self.foot_chain_cost(task_params, plan_segment)
         foot_path = self.foot_path_sdf_cost(task_params, plan_segment)
         body_sdf = self.body_sdf_cost(state)
-        foot_tracking = self.foot_tracking_cost(task_params, state)
+        # foot_tracking = self.foot_tracking_cost(task_params, state, plan_segment)
 
         return (body_sdf 
                 # + foot_step 
-                # + foot_chain 
-                + foot_tracking
+                + foot_chain 
+                # + foot_tracking
                 + foot_path
             )
 
