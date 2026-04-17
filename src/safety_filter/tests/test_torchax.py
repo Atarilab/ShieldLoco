@@ -12,7 +12,8 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 import torch
 import torch.nn as nn
 # 1. Load TorchScript model
-ts_model = torch.jit.load("controllers/policies/locomotion_go2/contact_policy_stanceSeperate.pt")
+ts_model = torch.jit.load("controllers/policies/locomotion_go2/contact_policy_latest.pt")
+# ts_model = torch.jit.load("controllers/policies/locomotion_go2/contact_policy_stanceSeperate.pt")
 print("=== TorchScript model structure ===")
 print(ts_model)
 print("\n=== TorchScript code ===")
