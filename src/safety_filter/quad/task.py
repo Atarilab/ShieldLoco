@@ -1,6 +1,6 @@
 import copy
 from functools import partial
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple, Callable
 
 import jax
 import jax.numpy as jnp
@@ -10,12 +10,24 @@ import numpy as np
 
 from utils.mps import *
 from safety_filter.bases.task import Task, TaskParams
-from safety_filter.quad.foot_projection import ObstacleSDF, project_plan_feet, project_plan_feet_with_arc_check, _sdf_and_grad_all, _batch_sdf_and_grad
+from safety_filter.quad.foot_projection import (
+    ObstacleSDF,
+    project_plan_feet,
+    project_plan_feet_with_arc_check,
+    _sdf_and_grad_all,
+    _batch_sdf_and_grad,
+)
 
 from flax.struct import dataclass
 
 
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+
 def get_torch_policy():
+    """Factory function to create torch policy network."""
     import torch
     import torch.nn as nn
 
@@ -39,6 +51,210 @@ def get_torch_policy():
     return model
 
 
+def _init_physics_config(mj_model: mujoco.MjModel, rl_config: Dict[str, Any]) -> None:
+    """Configure MuJoCo physics solver settings.
+    
+    Modifies mj_model.opt in place with settings from rl_config.
+    """
+    meta_data = PhysicsMetaData()
+    
+    mj_model.opt.timestep = rl_config["timestep"]
+    mj_model.opt.integrator = meta_data._INTEGRATOR_MAP[meta_data.integrator]
+    mj_model.opt.impratio = meta_data.impratio
+    mj_model.opt.cone = meta_data._CONE_MAP[meta_data.cone]
+    mj_model.opt.jacobian = meta_data._JACOBIAN_MAP[meta_data.jacobian]
+    mj_model.opt.solver = meta_data._SOLVER_MAP[meta_data.solver]
+    
+    # Allow overriding solver iterations from config for speed tuning.
+    mj_model.opt.iterations = int(
+        rl_config.get("physics_iterations", meta_data.iterations)
+    )
+    mj_model.opt.tolerance = meta_data.tolerance
+    mj_model.opt.ls_iterations = int(
+        rl_config.get("physics_ls_iterations", meta_data.ls_iterations)
+    )
+    mj_model.opt.ls_tolerance = meta_data.ls_tolerance
+
+
+def _init_joint_mapping(
+    mj_model: mujoco.MjModel, rl_config: Dict[str, Any], num_joints: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract joint position/velocity indices and observation mapping.
+    
+    Returns:
+        joint_qpos_indices: Indices into qpos for each joint
+        joint_qvel_indices: Indices into qvel for each joint
+        joint_obs_mapping: Unitree to Isaac observation mapping
+        actuator_joint_ids: IDs of actuated joints
+    """
+    actuator_joint_ids = np.asarray(mj_model.actuator_trnid[:, 0], dtype=np.int32)
+    
+    joint_qpos_indices = np.asarray(
+        mj_model.jnt_qposadr[actuator_joint_ids[:num_joints]], dtype=np.int32
+    )
+    joint_qvel_indices = np.asarray(
+        mj_model.jnt_dofadr[actuator_joint_ids[:num_joints]], dtype=np.int32
+    )
+    
+    joint_obs_mapping = np.asarray(
+        rl_config["joint_obs_unitree_to_isaac_mapping"], dtype=np.int32
+    )
+    
+    return (
+        joint_qpos_indices,
+        joint_qvel_indices,
+        joint_obs_mapping,
+        actuator_joint_ids[:num_joints],
+    )
+
+
+def _init_action_mapping(
+    rl_config: Dict[str, Any]
+) -> Tuple[float, float, jnp.ndarray, float, np.ndarray]:
+    """Extract action scaling, offset, clipping, and mapping.
+    
+    Returns:
+        plan_lim: Plan normalization limit
+        act_rl_clip: Action clipping bound
+        act_rl_offset: Action offset vector
+        act_rl_scale: Action scaling factor
+        act_rl_mapping: Action mapping indices
+    """
+    plan_lim = rl_config["plan_lim"]
+    act_rl_clip = rl_config["act_rl_clip"]
+    act_rl_offset = jnp.asarray(rl_config["action_offset"], dtype=jnp.float32)
+    act_rl_scale = rl_config["action_scale"]
+    act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
+    
+    return plan_lim, act_rl_clip, act_rl_offset, act_rl_scale, act_rl_mapping
+
+
+def _init_joint_limits(
+    mj_model: mujoco.MjModel,
+    rl_config: Dict[str, Any],
+    actuator_joint_ids: np.ndarray,
+    num_joints: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Compute soft joint limits respecting config overrides.
+    
+    Returns:
+        j_pd_min: Minimum joint positions for PD control
+        j_pd_max: Maximum joint positions for PD control
+    """
+    soft_limit_factor = float(rl_config.get("soft_dof_limit_factor", 0.95))
+    
+    joint_lower = np.asarray(
+        mj_model.jnt_range[actuator_joint_ids, 0], dtype=np.float32
+    )
+    joint_upper = np.asarray(
+        mj_model.jnt_range[actuator_joint_ids, 1], dtype=np.float32
+    )
+    
+    joint_center = 0.5 * (joint_lower + joint_upper)
+    joint_span = joint_upper - joint_lower
+    soft_joint_min = joint_center - 0.5 * joint_span * soft_limit_factor
+    soft_joint_max = joint_center + 0.5 * joint_span * soft_limit_factor
+
+    cfg_jpd_min = np.asarray(
+        rl_config.get("j_pd_min", -np.inf), dtype=np.float32
+    )
+    cfg_jpd_max = np.asarray(
+        rl_config.get("j_pd_max", np.inf), dtype=np.float32
+    )
+    
+    if cfg_jpd_min.ndim == 0:
+        cfg_jpd_min = np.full(num_joints, float(cfg_jpd_min), dtype=np.float32)
+    if cfg_jpd_max.ndim == 0:
+        cfg_jpd_max = np.full(num_joints, float(cfg_jpd_max), dtype=np.float32)
+
+    j_pd_min = jnp.asarray(
+        np.maximum(soft_joint_min, cfg_jpd_min), dtype=jnp.float32
+    )
+    j_pd_max = jnp.asarray(
+        np.minimum(soft_joint_max, cfg_jpd_max), dtype=jnp.float32
+    )
+    
+    return j_pd_min, j_pd_max
+
+
+def _init_foot_ids(
+    mj_model: mujoco.MjModel, rl_config: Dict[str, Any]
+) -> np.ndarray:
+    """Extract foot body IDs from model."""
+    foot_names = rl_config["foot_names"]
+    return np.asarray(
+        [mj_model.body(foot).id for foot in foot_names], dtype=np.int32
+    )
+
+
+def _init_collision_geometry(
+    mj_model: mujoco.MjModel,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Classify geoms as hazard/robot/foot for collision detection.
+    
+    Returns:
+        geom_is_hazard: Boolean array indicating hazard geoms
+        geom_is_robot: Boolean array indicating robot geoms
+        geom_is_foot: Boolean array indicating foot geoms
+    """
+    ngeom = mj_model.ngeom
+    geom_is_hazard_np = np.zeros(ngeom, dtype=bool)
+    geom_is_robot_np = np.zeros(ngeom, dtype=bool)
+
+    hazard_prefixes = ("obstacle_",)
+    base_link_id = mj_model.body("base_link").id
+
+    for gid in range(ngeom):
+        geom_name = mj_model.geom(gid).name or ""
+
+        if any(geom_name.startswith(p) for p in hazard_prefixes):
+            geom_is_hazard_np[gid] = True
+
+        body_id = mj_model.geom_bodyid[gid]
+        if mj_model.body_rootid[body_id] == base_link_id:
+            geom_is_robot_np[gid] = True
+
+    foot_geom_names = {"FL", "FR", "RL", "RR"}
+    geom_is_foot_np = np.array(
+        [(mj_model.geom(gid).name or "") in foot_geom_names for gid in range(ngeom)],
+        dtype=bool,
+    )
+
+    return (
+        jnp.array(geom_is_hazard_np),
+        jnp.array(geom_is_robot_np),
+        jnp.array(geom_is_foot_np),
+    )
+
+
+def _init_gait_patterns() -> jnp.ndarray:
+    """Define standard quadruped gait patterns."""
+    return jnp.array(
+        [
+            [[True, True, True, True], [True, True, True, True]],  # 0: stance
+            [[True, True, True, True], [True, True, True, True]],  # 1: transition
+            [[False, True, True, False], [True, False, False, True]],  # 2: trot
+            [[True, False, True, False], [False, True, False, True]],  # 3: pace
+            [[True, True, False, False], [False, False, True, True]],  # 4: bound
+            [[False, False, False, False], [True, True, True, True]],  # 5: jump
+        ]
+    )
+
+
+def _init_base_body_id(mj_model: mujoco.MjModel) -> int:
+    """Get base_link body ID, raising error if not found."""
+    body_name_to_id = {mj_model.body(i).name: i for i in range(mj_model.nbody)}
+    base_body_id = body_name_to_id.get("base_link", None)
+    if base_body_id is None:
+        raise KeyError("No 'base_link' found in model bodies for constraint check")
+    return base_body_id
+
+
+# =============================================================================
+# DATACLASSES
+# =============================================================================
+
+
 @dataclass
 class QuadRLTaskParams(TaskParams):
     """Task parameters specific to the MPSQuadRL task."""
@@ -53,9 +269,9 @@ class QuadRLTaskParams(TaskParams):
     lowlevel_step_counter: int = 0
     last_q_des: jax.Array = jnp.zeros(12)
     # Ball state at last observation: MPC computes p(t) = p0 + v0*(t0+t) + 0.5*g*(t0+t)^2
-    dynamic_obstacle_p0: jax.Array = jnp.zeros((0, 3))      # position at obs time
-    dynamic_obstacle_v0: jax.Array = jnp.zeros((0, 3))      # velocity at obs time
-    dynamic_obstacle_t0: jax.Array = jnp.zeros((0,))        # lag since obs (seconds)
+    dynamic_obstacle_p0: jax.Array = jnp.zeros((0, 3))  # position at obs time
+    dynamic_obstacle_v0: jax.Array = jnp.zeros((0, 3))  # velocity at obs time
+    dynamic_obstacle_t0: jax.Array = jnp.zeros((0,))  # lag since obs (seconds)
     dynamic_obstacle_radii: jax.Array = jnp.zeros((0,))
     dynamic_obstacle_active: jax.Array = jnp.zeros((0,), dtype=jnp.bool_)
     # Current foot positions in world frame at start of each planning cycle.
@@ -66,8 +282,6 @@ class QuadRLTaskParams(TaskParams):
 
 class PhysicsMetaData:
     """Full config for Go2"""
-
-    # ------------- Physics -------------
 
     _JACOBIAN_MAP = {
         "auto": mujoco.mjtJacobian.mjJAC_AUTO,  # type: ignore
@@ -102,9 +316,14 @@ class PhysicsMetaData:
     solver: str = "newton"
 
 
+# =============================================================================
+# MAIN TASK CLASS
+# =============================================================================
+
+
 class QuadRLTask(Task):
     """
-    A Dynamics class that takes the following input and ouput
+    A Dynamics class that takes the following input and output:
 
     Input:
         mjx.Data: the current state of the system
@@ -114,18 +333,13 @@ class QuadRLTask(Task):
         mjx.Data: the next state of the system after applying the plan_segment
 
     Internal Logic:
-        1. plan_segment (delta of contact_locations) # TODO: contact_time_left, contact_plan
+        1. plan_segment (delta of contact_locations)
             contact_locations: (4, 2, 3) 4 is legs, 2 is reference length, and 3 is xyz position.
             plan_segment: (4, 2, 3) delta of contact_locations
         2. plan_segment + state to observation_rl
         3. observation_rl to action_rl (using the learned policy)
         4. action_rl to joint_pd (using the learned policy)
         5. joint_pd to next_state (using the MuJoCo dynamics)
-
-
-    PLAN:
-        1. goal indx and contact loc
-
     """
 
     def __init__(
@@ -135,181 +349,153 @@ class QuadRLTask(Task):
         rl_config: Dict[str, Any],
         trace_sites: Sequence[str] | None = None,
     ):
-        # copy
+        # =============================================================================
+        # PHYSICS CONFIGURATION
+        # =============================================================================
         mj_model = copy.deepcopy(mj_model)
-        self.meta_data = PhysicsMetaData()
-
-        # Set MJX physics for all meta_data
-        mj_model.opt.timestep = rl_config["timestep"]
-        mj_model.opt.integrator = self.meta_data._INTEGRATOR_MAP[
-            self.meta_data.integrator
-        ]
-        mj_model.opt.impratio = self.meta_data.impratio
-        mj_model.opt.cone = self.meta_data._CONE_MAP[self.meta_data.cone]
-        mj_model.opt.jacobian = self.meta_data._JACOBIAN_MAP[self.meta_data.jacobian]
-        mj_model.opt.solver = self.meta_data._SOLVER_MAP[self.meta_data.solver]
-        # Allow overriding solver iterations from config for speed tuning.
-        # Reducing from 8 to 4 roughly halves per-step Newton solve cost.
-        mj_model.opt.iterations = int(rl_config.get("physics_iterations", self.meta_data.iterations))
-        mj_model.opt.tolerance = self.meta_data.tolerance
-        mj_model.opt.ls_iterations = int(rl_config.get("physics_ls_iterations", self.meta_data.ls_iterations))
-        mj_model.opt.ls_tolerance = self.meta_data.ls_tolerance
-
+        _init_physics_config(mj_model, rl_config)
         super().__init__(mj_model, trace_sites)
 
+        # =============================================================================
+        # RL POLICY
+        # =============================================================================
         self.rl_policy = rl_policy
 
+        # =============================================================================
+        # OBSERVATION / COMMAND TIMING
+        # =============================================================================
         self.obs_horizon = rl_config["obs_horizon"]
         self.command_duration = rl_config["command_duration"]
-        self.joint_obs_unitree_to_isaac_mapping = np.asarray(
-            rl_config["joint_obs_unitree_to_isaac_mapping"], dtype=np.int32
+
+        # Compute decimation values
+        sim_dt = mj_model.opt.timestep
+        self.rollout_decimation = max(
+            1, int(round(self.command_duration / sim_dt))
         )
+        self.policy_decimation = int(
+            rl_config.get("mps_policy_decimation", self.rollout_decimation)
+        )
+
+        # =============================================================================
+        # JOINT MAPPING
+        # =============================================================================
+        # Load default_joint_pos first to determine num_joints
         self.default_joint_pos = jnp.asarray(
             rl_config["default_joint_pos"], dtype=jnp.float32
         )
-
         self.num_joints = len(self.default_joint_pos)
-        actuator_joint_ids = np.asarray(mj_model.actuator_trnid[:, 0], dtype=np.int32)
-        self.joint_qpos_indices = np.asarray(
-            mj_model.jnt_qposadr[actuator_joint_ids[: self.num_joints]], dtype=np.int32
+        
+        (
+            self.joint_qpos_indices,
+            self.joint_qvel_indices,
+            self.joint_obs_unitree_to_isaac_mapping,
+            actuator_joint_ids,
+        ) = _init_joint_mapping(mj_model, rl_config, self.num_joints)
+
+        # =============================================================================
+        # ACTION MAPPING
+        # =============================================================================
+        (
+            self.plan_lim,
+            self.act_rl_clip,
+            self.act_rl_offset,
+            self.act_rl_scale,
+            self.act_rl_mapping,
+        ) = _init_action_mapping(rl_config)
+
+        # =============================================================================
+        # JOINT LIMIT CLAMPING
+        # =============================================================================
+        self.j_pd_min, self.j_pd_max = _init_joint_limits(
+            mj_model, rl_config, actuator_joint_ids, self.num_joints
         )
-        self.joint_qvel_indices = np.asarray(
-            mj_model.jnt_dofadr[actuator_joint_ids[: self.num_joints]], dtype=np.int32
+
+        # =============================================================================
+        # PD CONTROLLER GAINS
+        # =============================================================================
+        self.kp = rl_config["kp"]
+        self.kd = rl_config["kd"]
+
+        # =============================================================================
+        # GAIT PATTERNS
+        # =============================================================================
+        self.gait_patterns = _init_gait_patterns()
+        self.plan_dim = 4 * 3  # 4 legs, 3D position
+        self.horizon_length = rl_config["horizon_length"]
+
+        # =============================================================================
+        # FOOT IDENTIFICATION
+        # =============================================================================
+        self.foot_ids = _init_foot_ids(mj_model, rl_config)
+
+        # =============================================================================
+        # BASE BODY
+        # =============================================================================
+        self.base_body_id = _init_base_body_id(mj_model)
+
+        # =============================================================================
+        # DYNAMIC OBSTACLES
+        # =============================================================================
+        self.max_dynamic_obstacles = int(
+            rl_config.get("max_dynamic_obstacles", 0)
         )
-        actuator_joint_ids = actuator_joint_ids[: self.num_joints]
 
-        foot_names = rl_config["foot_names"]
-        self.foot_ids = np.asarray(
-            [mj_model.body(foot).id for foot in foot_names], dtype=np.int32
+        # =============================================================================
+        # FOOT PROJECTION SETTINGS
+        # =============================================================================
+        self.projection_clearance = float(
+            rl_config.get("projection_clearance", 0.07)
         )
-
-        self.plan_lim = rl_config["plan_lim"]
-        self.act_rl_clip = rl_config["act_rl_clip"]
-        self.act_rl_offset = jnp.asarray(rl_config["action_offset"])
-        self.act_rl_scale = rl_config["action_scale"]
-        self.act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
-
-        self.max_dynamic_obstacles = int(rl_config.get("max_dynamic_obstacles", 0))
-
-        self.projection_clearance = float(rl_config.get("projection_clearance", 0.07))
         self.projection_iters = int(rl_config.get("projection_iters", 3))
 
+        # =============================================================================
+        # COST WEIGHTS - GROUPED BY COST FUNCTION
+        # =============================================================================
+        
+        # Foot step cost: penalizes displacement from current stance at step 0
         self.foot_step_weight = float(rl_config.get("foot_step_weight", 50.0))
+        
+        # Foot chain cost: penalizes step-to-step foot displacement
         self.foot_chain_weight = float(rl_config.get("foot_chain_weight", 30.0))
-        self.body_sdf_weight = float(rl_config.get("body_sdf_weight", 5.0))
+        
+        # Body SDF cost: soft penalty for body near obstacles
         self.body_sdf_margin = float(rl_config.get("body_sdf_margin", 0.10))
         self.body_sdf_scale = float(rl_config.get("body_sdf_scale", 0.10))
-        self.foot_path_sdf_weight = float(rl_config.get("foot_path_sdf_weight", 30.0))
-        self.foot_path_sdf_scale = float(rl_config.get("foot_path_sdf_scale", self.body_sdf_scale))
-        self.foot_tracking_weight = float(rl_config.get("foot_tracking_weight", 0.0))
+        self.body_sdf_weight = float(rl_config.get("body_sdf_weight", 5.0))
+        
+        # Foot path SDF cost: penalizes swing arcs through obstacles
+        self.foot_path_sdf_scale = float(
+            rl_config.get("foot_path_sdf_scale", self.body_sdf_scale)
+        )
+        self.foot_path_sdf_weight = float(
+            rl_config.get("foot_path_sdf_weight", 30.0)
+        )
+        
+        # Foot tracking cost: penalizes deviation from planned foot positions
+        self.foot_tracking_weight = float(
+            rl_config.get("foot_tracking_weight", 0.0)
+        )
 
+        # =============================================================================
+        # PLAN BOUNDS
+        # =============================================================================
         # We optimize around absolute reference contact locations in normalized space.
         # Keep planner bounds unbounded to avoid saturating valid world-frame references.
         self.u_min = -jnp.inf
         self.u_max = jnp.inf
 
-        soft_limit_factor = float(rl_config.get("soft_dof_limit_factor", 0.95))
-        joint_lower = np.asarray(
-            mj_model.jnt_range[actuator_joint_ids, 0], dtype=np.float32
-        )
-        joint_upper = np.asarray(
-            mj_model.jnt_range[actuator_joint_ids, 1], dtype=np.float32
-        )
-        joint_center = 0.5 * (joint_lower + joint_upper)
-        joint_span = joint_upper - joint_lower
-        soft_joint_min = joint_center - 0.5 * joint_span * soft_limit_factor
-        soft_joint_max = joint_center + 0.5 * joint_span * soft_limit_factor
+        # =============================================================================
+        # COLLISION GEOMETRY
+        # =============================================================================
+        (
+            self.geom_is_hazard,
+            self.geom_is_robot,
+            self.geom_is_foot,
+        ) = _init_collision_geometry(mj_model)
 
-        cfg_jpd_min = np.asarray(rl_config.get("j_pd_min", -np.inf), dtype=np.float32)
-        cfg_jpd_max = np.asarray(rl_config.get("j_pd_max", np.inf), dtype=np.float32)
-        if cfg_jpd_min.ndim == 0:
-            cfg_jpd_min = np.full(self.num_joints, float(cfg_jpd_min), dtype=np.float32)
-        if cfg_jpd_max.ndim == 0:
-            cfg_jpd_max = np.full(self.num_joints, float(cfg_jpd_max), dtype=np.float32)
-
-        self.j_pd_min = jnp.asarray(
-            np.maximum(soft_joint_min, cfg_jpd_min), dtype=jnp.float32
-        )
-        self.j_pd_max = jnp.asarray(
-            np.minimum(soft_joint_max, cfg_jpd_max), dtype=jnp.float32
-        )
-
-        self.kp = rl_config["kp"]
-        self.kd = rl_config["kd"]
-
-        sim_dt = mj_model.opt.timestep
-        decimation = rl_config["decimation"]
-        # Freq at which the main controller runs (RL + PD)
-        main_controller_dt = rl_config["control_dt"]
-        # It is called every decimation steps of main_controller_dt
-        rl_policy_dt = main_controller_dt * decimation
-        # rollout_decimation is how many sim steps we should take
-        # it should be roughly equal to the command duration
-        self.rollout_decimation = max(1, int(round(self.command_duration / sim_dt)))
-        # For MPC rollouts the RL policy only needs to fire once per plan step (not every
-        # sub-step). `mps_policy_decimation` defaults to rollout_decimation so the policy
-        # is called once per horizon step.  The real-robot decimation (rl_policy_dt /
-        # sim_dt ≈ 1) is intentionally *not* used here because it causes 10× more NN
-        # inference than needed.
-        self.policy_decimation = int(rl_config.get("mps_policy_decimation", self.rollout_decimation))
-
-        self.gait_patterns = jnp.array(
-            [
-                [[True, True, True, True], [True, True, True, True]],  # 0: stance
-                [[True, True, True, True], [True, True, True, True]],  # 1: transition
-                [[False, True, True, False], [True, False, False, True]],  # 2: trot
-                [[True, False, True, False], [False, True, False, True]],  # 3: pace
-                [[True, True, False, False], [False, False, True, True]],  # 4: bound
-                [[False, False, False, False], [True, True, True, True]],  # 5: jump
-            ]
-        )
-        self.plan_dim = 4 * 3  # 4 legs, 3D position
-        self.horizon_length = rl_config["horizon_length"]
-
-        self.body_name_to_id = {mj_model.body(i).name: i for i in range(mj_model.nbody)}
-        self.base_body_id = self.body_name_to_id.get("base_link", None)
-        if self.base_body_id is None:
-            raise KeyError("No 'base_link' found in model bodies for constraint check")
-        ngeom = mj_model.ngeom
-        geom_is_hazard_np = np.zeros(ngeom, dtype=bool)
-        geom_is_robot_np = np.zeros(ngeom, dtype=bool)
-
-        # Make it xml specific remember!
-        hazard_prefixes = ("obstacle_",)
-        base_link_id = mj_model.body("base_link").id
-
-        for gid in range(ngeom):
-            # -- HAZARD CHECK --
-            # Handle the case where a geom might not have a name (returns None or empty)
-            geom_name = mj_model.geom(gid).name or ""
-
-            if any(geom_name.startswith(p) for p in hazard_prefixes):
-                geom_is_hazard_np[gid] = True
-
-            # -- ROBOT CHECK --
-            # Find which body this geom belongs to
-            body_id = mj_model.geom_bodyid[gid]
-
-            # Check if this body's ultimate parent is the base_link
-            if mj_model.body_rootid[body_id] == base_link_id:
-                geom_is_robot_np[gid] = True
-
-        # Convert to JAX arrays and store them
-        self.geom_is_hazard = jnp.array(geom_is_hazard_np)
-        self.geom_is_robot = jnp.array(geom_is_robot_np)
-
-        # Dual constraint check: always compute both feet-only and full-body
-        # collision signals.  Feet-only (discriminative, avoids weight collapse)
-        # is used for CaT penalty; full-body (exhaustive) is used for argmin
-        # selection so MPPI picks the sample with least whole-body contact.
-        foot_geom_names = {"FL", "FR", "RL", "RR"}
-        geom_is_foot_np = np.array(
-            [(mj_model.geom(gid).name or "") in foot_geom_names for gid in range(ngeom)],
-            dtype=bool,
-        )
-        self.geom_is_foot = jnp.array(geom_is_foot_np)
-
-        # 2D SDF for foot-plan projection onto obstacle-free region.
+        # =============================================================================
+        # OBSTACLE SDF
+        # =============================================================================
         min_obs_h = float(rl_config.get("constraint_min_obstacle_height", 0.001))
         self.obstacle_sdf = ObstacleSDF.from_mujoco_model(
             mj_model,
@@ -1008,7 +1194,7 @@ class QuadRLTask(Task):
         tracking_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
         # foot_tracking = self.foot_tracking_cost(task_params, state)
 
-        return tracking_cost # + foot_tracking
+        return tracking_cost  # + foot_tracking
 
     def dense_running_cost(
         self,
@@ -1023,15 +1209,18 @@ class QuadRLTask(Task):
         body_sdf = self.body_sdf_cost(state)
         # foot_tracking = self.foot_tracking_cost(task_params, state, plan_segment)
 
-        return (body_sdf 
-                # + foot_step 
-                + foot_chain 
-                # + foot_tracking
-                + foot_path
-            )
+        return (
+            body_sdf
+            # + foot_step
+            + foot_chain
+            # + foot_tracking
+            + foot_path
+        )
 
     def forward(self, model, tp, x, a, a_ref, step_idx=None):
-        tp, x_next, constraint_hits, accumulated_safety_cost = self.dynamics(model, tp, x, a, a_ref)
+        tp, x_next, constraint_hits, accumulated_safety_cost = self.dynamics(
+            model, tp, x, a, a_ref
+        )
 
         # Terminal tracking cost (evaluated at final state) + accumulated safety cost (dense per substep)
         tracking_cost = self.running_cost(tp, x_next, a, a_ref)

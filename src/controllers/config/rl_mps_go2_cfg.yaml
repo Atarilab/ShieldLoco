@@ -1,26 +1,184 @@
-# TODO: Clean this config
+# ============================================================================
+# DoomMPC: RL-MPS Controller Configuration for Unitree Go2
+# ============================================================================
 
-# policy_path: "contact_policy_actuatorRand.pt"
-# policy_path: "locomotion_go2/contact_policy_feetRandom.pt"
-# policy_path: "locomotion_go2/contact_policy_stanceSeperate.pt"
+# ----------------------------------------------------------------------------
+# POLICY
+# ----------------------------------------------------------------------------
+# Available policies in src/controllers/policies/locomotion_go2/:
+#   - contact_policy_actuatorRand.pt
+#   - contact_policy_feetRandom.pt
+#   - contact_policy_stanceSeperate.pt
+#   - contact_policy_stance2.pt
+#   - contact_policy_latest.pt (current)
 policy_path: "locomotion_go2/contact_policy_latest.pt"
-# policy_path: "locomotion_go2/contact_policy_stance2.pt"
+
 fixed_feet_positions: false
-control_dt: 0.005
-decimation: 4
+device: 'cpu'  # or "cuda:0"
+
+# ----------------------------------------------------------------------------
+# CONTROL TIMING
+# ----------------------------------------------------------------------------
+control_dt: 0.005          # Main controller frequency (200 Hz)
+decimation: 4              # RL policy decimation
+command_duration: 0.3      # Duration per contact plan step
+obs_horizon: 2             # Reference trajectory horizon for policy observations
+timestep: 0.03             # MuJoCo physics timestep
+
+# ----------------------------------------------------------------------------
+# ACTION CONFIGURATION
+# ----------------------------------------------------------------------------
 action_dim: 12
 action_scale: 0.35
+action_filter_alpha: 0.5
+
+# Joint ordering: maps Unitree hardware order to IsaacLab training order
+joint_obs_unitree_to_isaac_mapping: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
+
+# Default joint positions (IsaacLab order)
+# Used as action offset and for initialization
+ISAAC_LAB_DEFAULT_JOINT_POS: &ISAAC_LAB_DEFAULT_JOINT_POS [
+    0.1000,   # 0: FL hip
+    -0.1000,  # 1: FR hip
+    0.1000,   # 2: RL hip
+    -0.1000,  # 3: RR hip
+    0.8000,   # 4: FL thigh
+    0.8000,   # 5: FR thigh
+    1.0000,   # 6: RL thigh
+    1.0000,   # 7: RR thigh
+    -1.5000,  # 8: FL calf
+    -1.5000,  # 9: FR calf
+    -1.5000,  # 10: RL calf
+    -1.5000,  # 11: RR calf
+]
+default_joint_pos: *ISAAC_LAB_DEFAULT_JOINT_POS
+action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
+
+# ----------------------------------------------------------------------------
+# PD CONTROLLER
+# ----------------------------------------------------------------------------
 stiffness: &stiffness 30.0
 damping: &damping 0.5
-use_threading: false
-use_buffer: false
-device: 'cpu' # "cuda:0"  
+kp: *stiffness
+kd: *damping
+
+# Joint position limits for PD control (soft limits applied in code)
+# Actual limits are joint_range * soft_dof_limit_factor (default 0.95)
+soft_dof_limit_factor: 0.95
+j_pd_min: -100.0  # Override if needed, otherwise uses soft limits
+j_pd_max: 100.0
+
+# ----------------------------------------------------------------------------
+# PLANNING
+# ----------------------------------------------------------------------------
+horizon_length: &horizon_length 6    # Number of contact plan steps
+plan_lim: 0.25                      # Plan normalization limit (meters)
+act_rl_clip: 100                    # Action clipping (large = no effective clip)
 feet_step_size: 0.0
-# H * dt > H_effective * dt + max_latency
-horizon_length: &horizon_length 6 # footstep horizon
-action_filter_alpha: 0.5
 transition_duration: 0
-visualize: 
+
+# ----------------------------------------------------------------------------
+# OPTIMIZER
+# ----------------------------------------------------------------------------
+mps_alg_name: "MIMPS"  # MIMPS, CEM, DIAL_MPC, CONSENSUS
+
+# Common parameters (all optimizers)
+mps_num_samples: 800
+mps_plan_horizon: *horizon_length
+mps_iterations: 2
+mps_gamma: 0.99
+mps_safety_weight: 1
+mps_collect_data: true
+mps_top_fraction: 0.02
+mps_policy_decimation: 1
+
+# Optimizer-specific parameters
+MIMPS:
+  noise_level: 0.6
+  temperature: 1
+
+CEM:
+  elite_fraction: 0.1
+  max_iters: 5
+  cross_entropy_decay: 0.8
+
+DIAL_MPC:
+  num_agents: 4
+  consensus_tolerance: 0.01
+
+CONSENSUS:
+  consensus_iters: 10
+  step_size: 0.5
+
+# ----------------------------------------------------------------------------
+# TASK
+# ----------------------------------------------------------------------------
+mps_task_name: "QuadRLTask"
+
+# Foot identification (must match MJCF body names)
+foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+
+# ----------------------------------------------------------------------------
+# COLLISION AVOIDANCE
+# ----------------------------------------------------------------------------
+
+# ---- Obstacle Geometry ----
+# Minimum obstacle height for collision constraint (filters thin obstacles)
+constraint_min_obstacle_height: 0.0005
+
+# ---- Foot Projection ----
+# Pushes sampled foot positions out of obstacles
+projection_clearance: 0.08   # meters (foot_radius + safety_margin)
+projection_iters: 3          # Active-set QP iterations
+
+# ---- Cost Weights ----
+
+# Foot chain cost: penalizes step-to-step displacement (shuffling regularizer)
+# Weight guide: 0=off, 10=mild, 30=moderate, 50+=aggressive shuffle
+foot_chain_weight: 1.0
+
+# Body SDF cost: penalizes body center near obstacles
+# margin: threshold distance (meters)
+# scale: softplus sharpness (meters, smaller = sharper transition)
+# weight: overall cost multiplier
+body_sdf_margin: 0.2
+body_sdf_scale: 0.2
+body_sdf_weight: 1.0
+
+# Foot path SDF cost: penalizes swing arcs through obstacles
+# Evaluates SDF at interpolated points between stance and planned positions
+foot_path_sdf_scale: 0.2
+foot_path_sdf_weight: 1.0
+
+# Foot tracking cost: penalizes deviation between actual and planned foot positions
+# S2-style cost accumulated during rollout
+foot_tracking_weight: 1.0
+
+# Foot step cost: penalizes displacement from current stance (only at step 0)
+# Disabled by default - use foot_chain_weight for regularization
+foot_step_weight: 0.0
+
+# ----------------------------------------------------------------------------
+# PHYSICS SIMULATION
+# ----------------------------------------------------------------------------
+# MJX warp backend buffer sizing:
+#   nconmax = TOTAL contacts across all parallel worlds
+#   njmax = PER-WORLD efc rows (NOT scaled by num_samples)
+# Empirical peaks: ~23 contacts/world, ~161 efc rows/world
+mps_ncon_per_world: 32   # per-world budget; total = 32 * 400 = 12800
+mps_njmax: 512          # per-world; (400, 512, 18) × 4 bytes = 14.7 MB after vmap
+
+# MuJoCo solver settings (reduced from defaults for speed)
+physics_iterations: 4      # Newton solver iters (default 8)
+physics_ls_iterations: 4   # Line-search iters (default 8)
+
+apply_mpc_contact_plan: false  # Enable in code during runtime (slow to JIT)
+
+# ----------------------------------------------------------------------------
+# VISUALIZATION
+# ----------------------------------------------------------------------------
+visualize:
   future_feet_positions: false
   current_contact_locations: false
   opt_contact_locations: true
@@ -29,158 +187,21 @@ visualize:
   foot_forces: false
   contact_status: false
 
-
-ISAAC_LAB_DEFAULT_JOINT_POS: &ISAAC_LAB_DEFAULT_JOINT_POS [
-    0.1000, # 0
-    -0.1000, # 1
-    0.1000, # 2
-    -0.1000, # 3
-    0.8000, # 4
-    0.8000, # 5
-    1.0000, # 6
-    1.0000, # 7
-    -1.5000, # 8
-    -1.5000, # 9
-    -1.5000, # 10
-    -1.5000, # 11
-  ] # from asset.data.default_joint_pos; corresponds to ISAACLAB_JOINT_ORDER; is used as action offset
-
-
-# MPS stuff
-
-# === OPTIMIZER ===
-
-mps_alg_name: "MIMPS"
-
-# === COMMON PARAMS (used by all optimizers) ===
-mps_num_samples: 800
-mps_plan_horizon: *horizon_length
-mps_iterations: 2
-mps_gamma: 0.99
-mps_safety_weight: 1
-mps_collect_data: true
-mps_top_fraction: 0.02
-
-# === OPTIMIZER-SPECIFIC PARAMS (nested by algorithm) ===
-
-MIMPS:
-  noise_level: 0.6
-  temperature: 1
-
-CEMPS:
-  elite_fraction: 0.1
-  max_iters: 5
-
-DMPS:
-  temperature: 1
-
-CMPS:
-  temperature: 1
-  dt: 0.1
-
-
-# === Task ===
-
-mps_task_name: "QuadRLTask"
-timestep: 0.03
-
-obs_horizon: 2 # specific to RL policy
-command_duration: 0.3
-steps_per_reference_advance: 3  # 1 = advance every resample, 2 = every 2 resamples, etc.
-
-# Use the correct mapping from the existing config
-# JOINT_OBSERVATION_UNITREE_TO_ISAAC_LAB_MAPPING: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
-# DoomMPC/src/utils/joint_mapping.py for go2
-joint_obs_unitree_to_isaac_mapping: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
-
-# same as ISAAC_LAB_DEFAULT_JOINT_POS
-default_joint_pos: *ISAAC_LAB_DEFAULT_JOINT_POS
-
-action_mapping: [1, 5, 9, 0, 4, 8, 3, 7, 11, 2, 6, 10]
-
-# DoomMPC/src/robots/go2/go2.py
-foot_names: ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
-
-# 0.3 noise for [-1, 1] normalized
-# plan_lim in meters would be 0.3 * 0.25 (action scale) = 0.075 m
-plan_lim: 0.25
-act_rl_clip: 100 # there is no clip on actions actually
-action_offset: *ISAAC_LAB_DEFAULT_JOINT_POS
-
-# TODO: use limits
-j_pd_min: -100.0
-j_pd_max: 100.0
-
-kp: *stiffness
-kd: *damping
-
-mps_policy_decimation: 1
-# Minimum obstacle height (metres) to include in collision constraint.
-# Thin obstacles (cables 4mm, phones 4mm) contact the 22mm foot sphere during
-# normal stance — unavoidable, so they produce n_safe=0 for all samples.
-# Set to e.g. 0.02 to only penalise obstacles tall enough to impede locomotion.
-# 0.0 = include everything (old behaviour).
-constraint_min_obstacle_height: 0.0005
-# Foot-plan projection: pushes sampled & final foot positions out of obstacle
-# interiors using iterative closest-obstacle projection.  Each iteration finds
-# the worst-violated SDF constraint and pushes onto its boundary.
-# n_iters=3 suffices for circles (exact in 1) and boxes/capsules (2-3 iters).
-# projection_clearance = foot_radius + safety margin (metres).
-projection_clearance: 0.08
-projection_iters: 3
-
-# Whole-body collision avoidance costs:
-# foot_step_weight: penalises ||step0_feet - current_feet||^2 at goal_idx==0.
-#   Reduces intermediate step collisions by preferring short first-step displacements.
-# foot_chain_weight: penalises Σ ||foot_h - foot_{h-1}||^2 across ALL horizon steps.
-#   Encourages shuffling (small step-to-step deltas) rather than big reachy swings.
-#   Fires at ALL goal_idx values — plan-shape regularizer.
-#   0 = off, 10 = mild shuffle, 30 = moderate, 50+ = aggressive shuffle.
-# body_sdf_weight / margin / scale: smooth softplus cost when the robot
-#   body center is within `margin` metres of any obstacle edge.  Provides
-#   a gradient for MPPI to prefer less-cluttered paths.
-# foot_step_weight: 5.0
-foot_chain_weight: 1.0
-body_sdf_weight: 1
-body_sdf_margin: 0.2
-body_sdf_scale: 0.2
-# Foot path SDF cost: penalizes straight-line foot trajectories that cross
-# through obstacle interiors.  Evaluates 2D SDF at interpolated points
-# between current stance and planned position (and between consecutive
-# planned positions).  Prevents MPPI from selecting plans where the RL
-# policy's intermediate steps would land on obstacles.
-# 0 = off, 10 = mild, 30 = moderate (matches foot_chain_weight), 50+ = aggressive.
-foot_path_sdf_weight: 1.0
-foot_path_sdf_scale: 0.2  # softplus sharpness for foot-path SDF penalty (metres); tune independently of body_sdf_scale
-foot_tracking_weight: 1.0  # S2: penalize actual-vs-planned foot position error during rollout (0=off, tune up)
-
-# Contact buffer sizing — two different semantics in the warp backend:
-#   nconmax = TOTAL across all worlds → allocated as ncon_per_world * num_samples.
-#   njmax   = PER-WORLD efc rows     → NOT scaled; after vmap efc_J = (N, njmax, nv).
-# Empirical peaks: ~23 contacts/world, ~161 efc rows/world.
-mps_ncon_per_world: 32   # per-world budget; total = 32 * 400 = 12800
-mps_njmax: 512            # per-world; (400, 512, 18) × 4 bytes = 14.7 MB after vmap
-apply_mpc_contact_plan: false # enabled in code during run cuz jit compile is slow
-
-# --- Speed tuning ---
-physics_iterations: 4     # Newton solver iters per MJX step (default 8). 4 ≈ 2x faster sim, slight accuracy loss.
-physics_ls_iterations: 4  # Line-search iters (default 8). Pair with physics_iterations.
-
-
-# Dynamic obstacle (ball) parameters
+# ----------------------------------------------------------------------------
+# DYNAMIC OBSTACLES (BALL LAUNCHER)
+# ----------------------------------------------------------------------------
 max_dynamic_obstacles: 5
+
 ball_radius: 0.05
 ball_mass: 0.5
-ball_lifetime: 3.0                # Seconds on ground before auto-deactivation
+ball_lifetime: 3.0              # Seconds on ground before auto-deactivation
 ball_launch_distance: [8.0, 12.0]  # [min, max] meters from robot
 ball_launch_height: [6.0, 9.0]    # [min, max] meters
-ball_launch_speed: [0.5, 2.0]     # [min, max] m/s (lobbed arc)
-# dynamic_obs_cost_weight: 2000.0   # was 500; needs to dominate nominal tracking cost
-# dynamic_obs_cost_scale: 0.8       # was 1.5; steeper gradient forces decisive avoidance when close
-# mpc_latency_compensation: 1.3     # Seconds: expected MPS solve latency added to ball prediction dt.
-#                                   # t0 is always ~0 (tracker updated live each tick), so this
-#                                   # only compensates MPS solve time. Tune: if ball is already past
-#                                   # the robot when the plan fires, increase this value.
-# # dpcbf_k: 100                      # DPCBF parabolic safety param: widens lateral clearance requirement
-# #                                   # by sqrt(2*k*||v||*approach_dist). k=0 = plain perpendicular check.
-# #                                   # Increase to react earlier to fast/distant approaching balls.
+ball_launch_speed: [0.5, 2.0]    # [min, max] m/s (lobbed arc)
+
+# ---- Reserved for future use ----
+# Dynamic obstacle cost parameters (currently handled via SDF projection)
+# dynamic_obs_cost_weight: 2000.0
+# dynamic_obs_cost_scale: 0.8
+# mpc_latency_compensation: 1.3
+# dpcbf_k: 100
