@@ -65,6 +65,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         super().__init__(
             task,
+            num_samples=num_samples,
+            noise_level=noise_level,
             num_randomizations=num_randomizations,
             risk_strategy=risk_strategy,  # type: ignore
             seed=seed,
@@ -176,43 +178,10 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         shift smooth across horizon steps.  Per-foot residuals allow small
         individual adjustments within the morphological constraint.
         """
-        rng, body_const_rng, body_slope_rng, foot_rng = jax.random.split(params.rng, 4)
+        rng, noise_rng = jax.random.split(params.rng)
+        noise = self.quad_noise(noise_rng)
 
-        N = self.num_samples
         H = self.plan_horizon
-
-        # --- 3-zone exploration: low / med / high noise multipliers ---
-        # Low zone  refines near the current mean (exploitation).
-        # Med zone  uses the nominal noise_level.
-        # High zone explores far from the mean to escape large obstacles.
-        N_low  = N // 3
-        N_med  = N // 3
-        N_high = N - N_low - N_med
-        zone_scales = jnp.concatenate([
-            jnp.full((N_low,),  0.2 * self.noise_level),
-            jnp.full((N_med,),  0.5 * self.noise_level),
-            jnp.full((N_high,), 1.5 * self.noise_level),
-        ])  # (N,)
-
-        # --- Body-level xy noise (all 4 feet shift together) ---
-        body_const = jax.random.normal(body_const_rng, (N, 1, 2))          # (N, 1, 2)
-        body_slope = jax.random.normal(body_slope_rng, (N, 1, 2)) * 0.3   # (N, 1, 2)
-        t = jnp.linspace(0.0, 1.0, H).reshape(1, H, 1)                   # (1, H, 1)
-        body_xy = body_const + body_slope * t                              # (N, H, 2)
-
-        # Tile to all 4 feet: (N, H, 4, 2)
-        body_xy_4feet = jnp.broadcast_to(body_xy[:, :, None, :], (N, H, 4, 2))
-
-        # --- Per-foot residual noise (small individual adjustment) ---
-        foot_noise = jax.random.normal(foot_rng, (N, H, 4, 3))
-        foot_xy = foot_noise[..., :2]
-        foot_z  = foot_noise[..., 2:] * 0.01  # z stays near ground
-
-        # --- Combine and apply per-sample zone scale ---
-        combined_xy = 0.7 * body_xy_4feet + 0.3 * foot_xy   # (N, H, 4, 2)
-        combined = jnp.concatenate([combined_xy, foot_z], axis=-1)  # (N, H, 4, 3)
-        noise = combined.reshape(N, H, self.task.plan_dim)
-        noise = noise * zone_scales[:, None, None]  # (N, H, plan_dim)
 
         knots = params.mean + params.ref + noise
 
@@ -272,22 +241,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
                 self._empty_train_data(self.num_samples) if self.collect_data else None
             )
         )
-
-    def finalize_best_plan(self, params: MIMPSParams) -> MIMPSParams:
-        """Finalize the best plan by clip and denormalizing if necessary."""
-
-        """Materialize the controller-facing execution plan without mutating warm-start state."""
-        abs_plan = params.mean + params.ref
-
-        abs_plan = self.task.project_plan_to_safe(abs_plan)
-
-        exec_plan = self.task.get_exec_plan(abs_plan)
-
-        # # Store the MPPI weighted-mean absolute plan for warm-starting the next cycle.
-        # # This is smoother than the argmin best_plan from update_params.
-        # return params.replace(exec_plan=exec_plan, best_plan=abs_plan)  # type: ignore
-
-        return params.replace(exec_plan=exec_plan)
 
     # def finalize_best_plan(self, params: MIMPSParams) -> MIMPSParams:
     #     """Project exec_plan to the safe set and finalize for execution.
