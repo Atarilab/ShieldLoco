@@ -13,3 +13,5 @@ max_time: 200.0            # seconds
 sim_metric_file: logs/eval/sim_a.csv
 controller_metric_file: logs/eval/ctrl_a.csv
 done_file: logs/eval/eval_done_a.txt
+
+scene_model: robots/go2/scene.xml

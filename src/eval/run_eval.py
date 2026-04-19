@@ -39,6 +39,149 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+import mujoco
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# SDF helpers (pure NumPy, no JAX/GPU involvement)
+# ---------------------------------------------------------------------------
+
+CIRCLE, BOX, CAPSULE = 0, 1, 2
+
+
+def _sdf_one_np(point_xy, center, R2, half_ext, obs_type):
+    """NumPy SDF for one obstacle at one 2D point. No gradient."""
+    diff = point_xy - center
+    diff_local = R2.T @ diff
+
+    dist_c = np.linalg.norm(diff) + 1e-10
+    sdf_c = dist_c - half_ext[0]
+
+    q_b = np.abs(diff_local) - half_ext
+    nearest_on_box = np.clip(diff_local, -half_ext, half_ext)
+    exterior_b = np.linalg.norm(nearest_on_box - diff_local) > 1e-10
+    sdf_b_ext = np.linalg.norm(np.maximum(q_b, 0.0))
+    sdf_b_int = np.minimum(np.max(q_b), 0.0)
+    sdf_b = sdf_b_ext + sdf_b_int
+
+    clamped_x = np.clip(diff_local[0], -half_ext[1], half_ext[1])
+    dk = diff_local - np.array([clamped_x, 0.0])
+    dist_k = np.linalg.norm(dk) + 1e-10
+    sdf_k = dist_k - half_ext[0]
+
+    if obs_type == BOX:
+        return sdf_b
+    elif obs_type == CAPSULE:
+        return sdf_k
+    else:
+        return sdf_c
+
+
+def _build_sdf_from_model(mj_model):
+    """Build NumPy SDF data from MuJoCo model. Pure NumPy — no JAX."""
+    import mujoco
+    ngeom = mj_model.ngeom
+    geom_is_hazard = np.zeros(ngeom, dtype=bool)
+    for gid in range(ngeom):
+        name = mj_model.geom(gid).name or ""
+        if name.startswith("obstacle_"):
+            gtype = int(mj_model.geom_type[gid])
+            size = mj_model.geom_size[gid]
+            if gtype == 6:
+                height = size[2]
+            elif gtype in (3, 5):
+                height = size[1]
+            else:
+                height = size[0]
+            if height >= 0.001:
+                geom_is_hazard[gid] = True
+
+    hazard_ids = np.flatnonzero(geom_is_hazard).astype(np.int32)
+    M = int(hazard_ids.shape[0])
+    if M == 0:
+        return np.zeros((0, 2)), np.zeros((0, 2, 2)), np.zeros((0, 2)), np.zeros((0,), dtype=np.int32)
+
+    _mj_data = mujoco.MjData(mj_model)
+    mujoco.mj_forward(mj_model, _mj_data)
+
+    positions = np.zeros((M, 2), dtype=np.float32)
+    rotations = np.zeros((M, 2, 2), dtype=np.float32)
+    half_extents = np.zeros((M, 2), dtype=np.float32)
+    types = np.zeros(M, dtype=np.int32)
+
+    CIRCLE_T = 0
+    BOX_T = 1
+    CAPSULE_T = 2
+    _MJ_TYPE_TO_SDF = {2: CIRCLE_T, 6: BOX_T, 5: CIRCLE_T, 3: CAPSULE_T}
+
+    for i, gid in enumerate(hazard_ids):
+        pos3d = _mj_data.geom_xpos[gid]
+        mat3d = _mj_data.geom_xmat[gid].reshape(3, 3)
+        gtype_mj = int(mj_model.geom_type[gid])
+        size = mj_model.geom_size[gid]
+
+        positions[i] = pos3d[:2]
+        rotations[i] = mat3d[:2, :2]
+
+        sdf_type = _MJ_TYPE_TO_SDF.get(gtype_mj, CIRCLE_T)
+        types[i] = sdf_type
+
+        if sdf_type == CIRCLE_T:
+            half_extents[i] = [float(size[0]), 0.0]
+        elif sdf_type == BOX_T:
+            half_extents[i] = [float(size[0]), float(size[1])]
+        elif sdf_type == CAPSULE_T:
+            r = float(size[0])
+            hl = float(size[1])
+            local_z = mat3d[:2, 2]
+            xy_norm = float(np.linalg.norm(local_z))
+            if xy_norm > 0.15:
+                axis_2d = local_z / xy_norm
+                rotations[i] = np.array([[axis_2d[0], -axis_2d[1]],
+                                          [axis_2d[1],  axis_2d[0]]])
+                half_extents[i] = [r, hl * xy_norm]
+            else:
+                half_extents[i] = [r, 0.0]
+                types[i] = CIRCLE_T
+
+    return positions, rotations, half_extents, types
+
+
+def _compute_sdf_foot_violations(sim_rows, mj_model, clearance=0.07):
+    """Count onset SDF foot violations from logged foot positions.
+
+    Pure NumPy — no JAX imported. Builds NumPy SDF data directly from mj_model.
+    """
+    positions, rotations, half_extents, types = _build_sdf_from_model(mj_model)
+    num_obstacles = positions.shape[0]
+    if num_obstacles == 0:
+        return 0
+
+    flags = []
+    for row in sim_rows:
+        min_sdf = np.inf
+        for foot_i in range(4):
+            fx = float(row[f"foot{foot_i}_x"])
+            fy = float(row[f"foot{foot_i}_y"])
+            point = np.array([fx, fy], dtype=np.float32)
+            for obs_i in range(num_obstacles):
+                d = _sdf_one_np(
+                    point,
+                    positions[obs_i],
+                    rotations[obs_i],
+                    half_extents[obs_i],
+                    int(types[obs_i]),
+                )
+                if d < min_sdf:
+                    min_sdf = d
+                if min_sdf < clearance:
+                    break
+            if min_sdf < clearance:
+                break
+        flags.append(1 if min_sdf < clearance else 0)
+
+    return sum(1 for i in range(1, len(flags)) if flags[i] == 1 and flags[i - 1] == 0)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +286,7 @@ def run_episode(
         sim_csv=scenario_cfg["sim_metric_file"],
         ctrl_csv=scenario_cfg["controller_metric_file"],
         scenario_cfg=scenario_cfg,
+        scenario_path=scenario_path,
         run_id=run_id,
         ctrl_overrides=ctrl_overrides or {},
     )
@@ -158,6 +302,7 @@ def parse_episode(
     sim_csv: str,
     ctrl_csv: str,
     scenario_cfg: dict,
+    scenario_path: str,
     run_id: int,
     ctrl_overrides: dict,
 ) -> Dict[str, Any]:
@@ -189,6 +334,23 @@ def parse_episode(
     summary["constraint_violations"] = collision_events + fall_events
     summary["collision_steps"] = sum(col_vals)
     summary["fall_steps"] = sum(fall_vals)
+
+    # --- SDF foot violations (post-processing, no JAX/GPU) ---
+    scene_model = scenario_cfg.get("scene_model")
+    if scene_model:
+        model_base = os.path.join(os.path.dirname(scenario_path), "..", "..", scene_model)
+        if os.path.exists(model_base):
+            try:
+                mj_model = mujoco.MjModel.from_xml_path(model_base)
+                summary["foot_collision_events_sdf"] = _compute_sdf_foot_violations(
+                    sim_rows, mj_model, clearance=0.07
+                )
+            except Exception:
+                summary["foot_collision_events_sdf"] = None
+        else:
+            summary["foot_collision_events_sdf"] = None
+    else:
+        summary["foot_collision_events_sdf"] = None
 
     # --- goal ---
     goal_dists = [float(r["goal_dist"]) for r in sim_rows]
@@ -372,12 +534,14 @@ def main():
     # Quick table
     print("\n--- Summary ---")
     for s in all_summaries:
+        cost = s.get("mean_tracking_cost")
+        mc = f"{cost:.4f}" if cost is not None else "N/A"
         print(
             f"  run={s['run_id']}  "
             f"goal={s.get('goal_reached')}  "
             f"t_goal={s.get('time_to_goal')}  "
             f"violations={s.get('constraint_violations')}  "
-            f"mean_cost={s['mean_tracking_cost']:.4f if s.get('mean_tracking_cost') is not None else 'N/A'}  "
+            f"mean_cost={mc}  "
             f"overrides={s.get('overrides')}"
         )
 

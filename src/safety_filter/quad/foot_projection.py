@@ -302,7 +302,7 @@ def check_and_fix_swing_arc(p_from, p_to, sdf, r_safe):
     arc_length = jnp.linalg.norm(direction)
     is_stationary = arc_length < 1e-7
 
-    n_interp = 5
+    n_interp = 20
     t_vals = jnp.linspace(0.1, 0.9, n_interp)
     interp_pts = p_from + t_vals[:, None, None] * direction
 

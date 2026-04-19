@@ -16,3 +16,5 @@ goal_threshold: 999.0      # never triggers
 sim_metric_file: logs/eval/sim_b.csv
 controller_metric_file: logs/eval/ctrl_b.csv
 done_file: logs/eval/eval_done_b.txt
+
+scene_model: robots/go2/scene.xml

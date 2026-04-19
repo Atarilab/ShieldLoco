@@ -95,10 +95,16 @@ class SimEvalHooks:
         self._writer = csv.DictWriter(
             self._file,
             fieldnames=["t", "x", "y", "z", "vx", "vy", "heading_error",
-                        "collision", "foot_collision", "fall", "goal_dist", "ball_dist"],
+                        "collision", "foot_collision", "fall", "goal_dist", "ball_dist",
+                        "foot0_x", "foot0_y", "foot1_x", "foot1_y",
+                        "foot2_x", "foot2_y", "foot3_x", "foot3_y"],
         )
         self._writer.writeheader()
         self._step = 0
+        self._foot_body_ids = [
+            mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in ("FL_foot", "FR_foot", "RL_foot", "RR_foot")
+        ]
 
     # ------------------------------------------------------------------
     # Main callback — called once per mj_step inside the sim thread
@@ -140,6 +146,8 @@ class SimEvalHooks:
         goal_angle = float(np.arctan2(goal_pos[1] - base_pos[1], goal_pos[0] - base_pos[0]))
         heading_err = float((goal_angle - yaw + np.pi) % (2*np.pi) - np.pi)
 
+        foot_pos = {f"foot{i}_x": f"{self.mj_data.xpos[bid][0]:.4f}" for i, bid in enumerate(self._foot_body_ids)}
+        foot_pos.update({f"foot{i}_y": f"{self.mj_data.xpos[bid][1]:.4f}" for i, bid in enumerate(self._foot_body_ids)})
         self._writer.writerow({
             "t": f"{t:.4f}",
             "x": f"{base_pos[0]:.4f}",
@@ -153,6 +161,7 @@ class SimEvalHooks:
             "fall": fall,
             "goal_dist": f"{goal_dist:.4f}",
             "ball_dist": f"{ball_dist:.4f}",
+            **foot_pos,
         })
 
         # Flush every ~200 steps (~1 s at 200 Hz)

@@ -277,6 +277,8 @@ class QuadSamplingBasedPlanner(ABC):
         )
         params = params.replace(rng=rng)  # type: ignore
 
+        params = self.update_c_max(params, rollouts, self.p_max, self.c_max_decay)
+
         # Update the policy parameters based on the combined costs
         params = self.update_params(params, rollouts)
 

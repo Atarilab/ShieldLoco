@@ -120,11 +120,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         """
         costs = jnp.sum(rollouts.costs, axis=1)
 
-        constraint_flags = rollouts.constraint_flags.astype(jnp.float32)
-        feet_flags = constraint_flags[..., 0]
-
-        params = self.update_c_max(params, rollouts, self.p_max, self.c_max_decay)
-
         costs_mean = costs[: self.num_samples]
         plans_mean = rollouts.plans[: self.num_samples]
 
@@ -139,7 +134,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         new_best = rollouts.plans[jnp.argmin(costs)]
 
         return params.replace(
-            c_max=params.c_max,
             mean=new_mean,
             best_plan=new_best,
         )
@@ -193,12 +187,12 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         # drifted to the far side of an obstacle.  Without this, ALL samples
         # project to the same (far) side after the warm-start crosses through
         # an obstacle, giving MPPI zero near-side plans to select from.
-        stance_world = params.task_params.init_foot_positions  # (4, 3)
-        stance_plan_world = jnp.tile(
-            stance_world.reshape(1, self.task.plan_dim), (H, 1)
-        )  # (H, plan_dim)
-        stance_plan_norm = stance_plan_world / self.task.plan_lim
-        knots = knots.at[-2].set(stance_plan_norm)
+        # stance_world = params.task_params.init_foot_positions  # (4, 3)
+        # stance_plan_world = jnp.tile(
+        #     stance_world.reshape(1, self.task.plan_dim), (H, 1)
+        # )  # (H, plan_dim)
+        # stance_plan_norm = stance_plan_world / self.task.plan_lim
+        # knots = knots.at[-2].set(stance_plan_norm)
 
         current_feet_xy = params.task_params.init_foot_positions[:, :2]
         knots = self.task.project_plan_to_safe_with_arc_check(knots, current_feet_xy)
