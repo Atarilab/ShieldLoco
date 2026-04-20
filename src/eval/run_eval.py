@@ -268,6 +268,19 @@ def run_episode(
     ctrl_env = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
     ctrl_proc = subprocess.Popen(ctrl_cmd, env=ctrl_env, **popen_kwargs)
 
+    # Double reset with delay — robot sometimes needs two resets to stabilize
+    # before the controller takes over (avoids startup instability / fall).
+    _eval_reset_sig = os.path.join(
+        os.path.dirname(__file__), "..", "logs", "eval", "reset_signal.txt"
+    )
+    os.makedirs(os.path.dirname(_eval_reset_sig), exist_ok=True)
+    with open(_eval_reset_sig, "w") as f:
+        f.write("reset")
+    time.sleep(0.5)
+    with open(_eval_reset_sig, "w") as f:
+        f.write("reset")
+    print(f"[run_eval] Run {run_id}: double reset written (0.5s gap)", flush=True)
+
     max_wait = scenario_cfg.get("max_time", 120.0) + 600  # generous: 10 min for JIT
     try:
         sim_proc.wait(timeout=max_wait)
@@ -503,16 +516,61 @@ def main():
         nargs="*",
         help="Hyperparameter sweep: 'key=v1,v2,v3' (space-separated keys)",
     )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Experiment name for output directory (overrides default label)",
+    )
     args = parser.parse_args()
 
     sweep_str = " ".join(args.sweep) if args.sweep else ""
     conditions = parse_sweep_arg(sweep_str)
+    sweep_name = sweep_str.replace(" ", "_") if sweep_str else ""
 
-    all_summaries = []
+    # Determine experiment base name (used as prefix for all condition names)
+    exp_base = args.name or "baseline"
+
+    # For sweeps: each condition gets its own subdirectory + results.json.
+    # For seed-only: all runs go directly to args.out.
+    # Results structure:
+    #   Seed-only:  results/exp_name/results.json
+    #   Sweep:      results/exp_name/cond1/results.json, results/exp_name/cond2/results.json, ...
+    os.makedirs(args.out, exist_ok=True)
+
+    # Save MPS controller config at experiment top level
+    mps_cfg_src = os.path.join(os.path.dirname(__file__), "..", "controllers", "config", "rl_mps_go2_cfg.yaml")
+    mps_cfg_dst = os.path.join(args.out, "controller_cfg.yaml")
+    shutil.copy2(mps_cfg_src, mps_cfg_dst)
+    print(f"[run_eval] Controller config saved to {mps_cfg_dst}")
+
+    # Save sweep metadata if sweeping
+    if sweep_str:
+        sweep_info = {
+            "sweep_str": sweep_str,
+            "conditions": conditions,
+            "runs_per_condition": args.runs,
+            "base_seed": args.seed,
+        }
+        with open(os.path.join(args.out, "sweep_config.json"), "w") as f:
+            json.dump(sweep_info, f, indent=2)
+
+    all_results_dirs = []
     run_id = 0
     for condition in conditions:
-        label = "_".join(f"{k}{v}" for k, v in condition.items()) if condition else "baseline"
-        cond_dir = os.path.join(args.out, label or "baseline")
+        # Build condition label from sweep params, or use exp_base for seed-only
+        if sweep_str:
+            cond_label = "_".join(f"{k}{v}" for k, v in condition.items())
+            experiment_name = f"{exp_base}_{cond_label}"
+            cond_dir = os.path.join(args.out, cond_label)
+        else:
+            experiment_name = exp_base
+            cond_dir = args.out
+
+        os.makedirs(cond_dir, exist_ok=True)
+        # Save MPS config into each condition dir too (so each is self-contained)
+        shutil.copy2(mps_cfg_src, os.path.join(cond_dir, "controller_cfg.yaml"))
+
+        run_summaries = []
         for _ in range(args.runs):
             run_seed = args.seed + run_id if args.seed is not None else None
             summary = run_episode(
@@ -522,28 +580,26 @@ def main():
                 ctrl_overrides=condition if condition else None,
                 seed=run_seed,
             )
-            all_summaries.append(summary)
+            run_summaries.append(summary)
             run_id += 1
 
-    # Save all summaries to JSON
-    results_path = os.path.join(args.out, "results.json")
-    with open(results_path, "w") as f:
-        json.dump(all_summaries, f, indent=2)
-    print(f"\n[run_eval] All done. Results saved to {results_path}")
+        # Save per-condition results.json (self-contained experiment)
+        results_path = os.path.join(cond_dir, "results.json")
+        with open(results_path, "w") as f:
+            json.dump({"experiment_name": experiment_name, "summaries": run_summaries}, f, indent=2)
+        print(f"[run_eval] Condition '{experiment_name}' saved to {results_path}")
+        all_results_dirs.append(cond_dir)
 
-    # Quick table
-    print("\n--- Summary ---")
-    for s in all_summaries:
-        cost = s.get("mean_tracking_cost")
-        mc = f"{cost:.4f}" if cost is not None else "N/A"
-        print(
-            f"  run={s['run_id']}  "
-            f"goal={s.get('goal_reached')}  "
-            f"t_goal={s.get('time_to_goal')}  "
-            f"violations={s.get('constraint_violations')}  "
-            f"mean_cost={mc}  "
-            f"overrides={s.get('overrides')}"
-        )
+    # Final output path for the whole experiment
+    if sweep_str:
+        final_msg = (f"[run_eval] All done. Sweep complete — "
+                     f"{len(conditions)} conditions × {args.runs} runs. "
+                     f"Results in: {args.out}/")
+        print(final_msg)
+        print(f"[run_eval] To analyze all conditions:")
+        print(f"  python3 eval/analyze_results.py {args.out}/*/results.json --out {args.out}")
+    else:
+        print(f"\n[run_eval] All done. Results saved to {args.out}")
 
 
 if __name__ == "__main__":

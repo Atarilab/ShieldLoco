@@ -167,7 +167,7 @@ foot_step_weight: 0.0
 #   njmax = PER-WORLD efc rows (NOT scaled by num_samples)
 # Empirical peaks: ~23 contacts/world, ~161 efc rows/world
 mps_ncon_per_world: 32   # per-world budget; total = 32 * 400 = 12800
-mps_njmax: 512          # per-world; (400, 512, 18) × 4 bytes = 14.7 MB after vmap
+mps_njmax: 2048          # per-world; (400, 2048, 18) × 4 bytes = 59 MB after vmap; raised from 512 for chaotic contact geometry
 
 # MuJoCo solver settings (reduced from defaults for speed)
 physics_iterations: 4      # Newton solver iters (default 8)

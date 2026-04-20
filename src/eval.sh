@@ -1,56 +1,74 @@
 #!/usr/bin/env bash
-# DoomMPC paper sweep
-# Axes: mps_safety_weight × obstacle_cost_weight × mps_temperature
-# Seeds: --runs N with --seed BASE increments seed per run within each condition
+# DoomMPC eval launcher
 #
-# Total conditions = |safety_weight| × |obstacle_cost_weight| × |temperature|
-#   3 × 3 × 3 = 27 conditions × 3 runs = 81 runs
-# Estimate: ~7-9 min/run (JIT + episode) → ~10 hrs.
-# Shrink the grids below to reduce wall time.
-#
-# Usage (from src/):
+# Usage (seed-only, one experiment):
 #   bash eval.sh
-#   bash eval.sh 2>&1 | tee results/sweep_run.log
+#   bash eval.sh 2>&1 | tee results/go2_mimps/eval.log
+#
+# Usage (sweep):
+#   # Edit SWEEP_DIR and SWEEP below, then run
+#   bash eval.sh
+#
+# Results structure:
+#   Seed-only:  results/{NAME}/results.json
+#   Sweep:      results/{SWEEP_DIR}/{cond1}/results.json, {cond2}/results.json, ...
+#
+# To analyze sweeps (each condition is a separate experiment):
+#   python3 eval/analyze_results.py results/{SWEEP_DIR}/*/results.json --out results/{SWEEP_DIR}
+#
+# To analyze seed-only:
+#   python3 eval/analyze_results.py results/{NAME}/results.json --out results/{NAME}
 
 set -euo pipefail
 
 SCENARIO="eval/scenarios/scenario_a.yaml"
-OUT="results/sweep_$(date +%Y%m%d_%H%M%S)"
-RUNS=3        # runs per condition (seeds: BASE_SEED, BASE_SEED+1, ...)
+RUNS=5
 BASE_SEED=42
 
 # ---------------------------------------------------------------------------
-# Sweep grid  (edit values here; cartesian product is computed automatically)
+# Seed-only experiment (edit NAME and OUT, keep sweep commented)
 # ---------------------------------------------------------------------------
-SAFETY_WEIGHTS="1000,10000"
-OBSTACLE_WEIGHTS="500,1000,5000"
-TEMPERATURES="0.01,0.1"
+NAME="go2_mimps"
+OUT="results/${NAME}"
+
+# ---------------------------------------------------------------------------
+# Sweep experiment (uncomment sweep section, edit SWEEP_DIR and sweep axes)
+# ---------------------------------------------------------------------------
+# SWEEP_DIR="results/go2_mimps_sweep"    # parent dir for all sweep conditions
+# SWEEP="mps_safety_weight=10,100,1000 projection_clearance=0.08 body_sdf_margin=0.1,0.2,0.3"
+
 # ---------------------------------------------------------------------------
 
-N_SAFETY=$(echo "$SAFETY_WEIGHTS"  | tr ',' '\n' | wc -l)
-N_OBS=$(   echo "$OBSTACLE_WEIGHTS" | tr ',' '\n' | wc -l)
-N_TEMP=$(  echo "$TEMPERATURES"     | tr ',' '\n' | wc -l)
-N_COND=$(( N_SAFETY * N_OBS * N_TEMP ))
-N_TOTAL=$(( N_COND * RUNS ))
+if [[ -n "${SWEEP:-}" ]]; then
+    # Sweep mode: each condition gets its own subdirectory
+    echo "[eval.sh] Sweep mode: $SWEEP"
+    echo "[eval.sh] Output: $SWEEP_DIR/<condition>/results.json"
+    echo ""
+    python3 eval/run_eval.py \
+        --scenario "$SCENARIO" \
+        --runs "$RUNS" \
+        --seed "$BASE_SEED" \
+        --name "$SWEEP_DIR" \
+        --sweep $SWEEP \
+        --out "$SWEEP_DIR"
 
-echo "[eval.sh] Conditions : $N_COND  (${N_SAFETY}×${N_OBS}×${N_TEMP})"
-echo "[eval.sh] Runs/cond  : $RUNS  (seeds $BASE_SEED – $(( BASE_SEED + N_TOTAL - 1 )))"
-echo "[eval.sh] Total runs : $N_TOTAL"
-echo "[eval.sh] Output dir : $OUT"
-echo ""
+    echo ""
+    echo "[eval.sh] Analyzing all conditions..."
+    python3 eval/analyze_results.py "$SWEEP_DIR"/*/results.json --out "$SWEEP_DIR"
+else
+    # Seed-only mode
+    echo "[eval.sh] Seed-only mode: $NAME"
+    echo "[eval.sh] Output: $OUT"
+    echo ""
+    python3 eval/run_eval.py \
+        --scenario "$SCENARIO" \
+        --runs "$RUNS" \
+        --seed "$BASE_SEED" \
+        --name "$NAME" \
+        --out "$OUT"
 
-python3 eval/run_eval.py \
-    --scenario "$SCENARIO" \
-    --runs     "$RUNS" \
-    --seed     "$BASE_SEED" \
-    --sweep \
-        "mps_safety_weight=$SAFETY_WEIGHTS" \
-        "obstacle_cost_weight=$OBSTACLE_WEIGHTS" \
-        "mps_temperature=$TEMPERATURES" \
-    --out "$OUT"
+    echo ""
+    python3 eval/analyze_results.py "$OUT/results.json" --out "$OUT"
+fi
 
-python3 eval/analyze_results.py "$OUT/results.json" --out "$OUT"
-# python3 eval/analyze_results.py results/sweep_*/results.json
-# python3 eval/analyze_results.py results/sweep_*/results.json --out results/paper_figs/
-
-echo "[eval.sh] All done. Results: $OUT/results.json"
+echo "[eval.sh] All done."

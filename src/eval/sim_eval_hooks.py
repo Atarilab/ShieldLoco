@@ -41,7 +41,7 @@ class SimEvalConfig:
             goal_threshold=float(d.get("goal_threshold", 0.5)),
             max_time=float(d.get("max_time", 120.0)),
             ball_throw_delay=float(d.get("ball_throw_delay", 5.0)),
-            settle_time=float(d.get("settle_time", 3.0)),
+            settle_time=float(d.get("settle_time", 5.0)),
             sim_metric_file=d.get("sim_metric_file", "logs/eval/sim.csv"),
             controller_metric_file=d.get("controller_metric_file", "logs/eval/ctrl.csv"),
             done_file=d.get("done_file", "logs/eval/eval_done.txt"),
