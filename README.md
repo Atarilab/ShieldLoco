@@ -185,6 +185,37 @@ You can further define controller-specific joystick mappings by defining `get_jo
 
 </div>
 
+## 🛡️ Safety-Filtered Control
+
+### Overview
+The safety filter uses a **minimally invasive predictive safety filter** that redirects footsteps around obstacles while preserving goal-reaching performance. It employs a sampling-based receding-horizon optimizer (MPPI) warm-started by nominal commands and a learned value function.
+
+**Key insight**: Formal safety guarantees (HJ Reachability, CBF, MPS) are infeasible for legged locomotion due to curse of dimensionality. Instead, we optimize in the compact **contact-location space** where a pre-trained contact-conditioned policy maps contacts → joint trajectories.
+
+### Core Pipeline
+1. **High-level planner** → nominal contact locations (given user velocity command)
+2. **Risk detector** monitors for safety violations
+3. **If violation detected** → MPPI optimizer samples alternative contact sequences
+4. **MPPI samples** cost via full-simulation rollout
+5. **Optimized contacts** returned in receding-horizon fashion
+
+### Evaluation (Simulation)
+```bash
+./doom.sh -e --safety        # Enter container with safety mode
+cd src/
+python3 eval/launch_eval.py --scenario eval/scenarios/scenario_a.yaml --seed 42
+./eval.sh  # analysis
+```
+
+### Current Status
+- ✅ Large-obstacle navigation: tested
+- ✅ Cluttered scenes: tested
+- ⚠️ Dynamic obstacles: **not tested yet**
+- ⚠️ Some collisions still occur in certain scenarios
+
+> **Note**: Collisions still occur in some scenarios—ongoing work on math and bug fixes.
+
+---
 
 ## 📡 Vicon State Estimation
 The Vicon receiver client is already installed in the Docker container. You can launch it in a new terminal inside the existing container (`./doom.sh -a`) using:
