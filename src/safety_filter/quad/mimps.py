@@ -156,7 +156,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             mean=_params.mean,
             best_plan=abs_plan,
             exec_plan=self.task.get_exec_plan(abs_plan),
-            # min_violations=jnp.zeros(()),
             ref=_params.ref,
             rng=_params.rng,
             task_params=_params.task_params,
@@ -174,8 +173,6 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         """
         rng, noise_rng = jax.random.split(params.rng)
         noise = self.quad_noise(noise_rng)
-
-        H = self.plan_horizon
 
         knots = params.mean + params.ref + noise
 
