@@ -121,6 +121,7 @@ def main():
     
     safety_manager = SafetyManager(
         mj_model=mj_model,
+        mj_model_path=xml_path,
         rl_policy=policy,
         rl_config=rl_config,
         rate=20.0,

@@ -89,6 +89,7 @@ class SafetyManager:
     def __init__(
         self,
         mj_model: mujoco.MjModel, # type: ignore
+        mj_model_path: str,
         rl_policy: Any,
         rl_config: Dict[str, Any],
         rate: float = 50.0,
@@ -97,22 +98,26 @@ class SafetyManager:
         """Initialize the safety manager.
 
         Args:
+            mj_model: MuJoCo model (used for thread-mode init).
+            mj_model_path: File path to the MuJoCo XML model (used for worker process).
             rl_policy: The RL policy to use for safety checking.
             rl_config: The RL configuration to use for safety checking.
             rate: The rate at which to run the safety filter (Hz). Default is 20 Hz.
             logger: Optional logger for debugging.
         """
         self.mj_model = mj_model
+        self.mj_model_path = mj_model_path
 
         self.rl_config = rl_config
         self.torch_script_policy = rl_policy
+        self.model_path = getattr(rl_policy, 'model_path', None)
 
         self.rate = rate
 
         self.logger = logger
         self._pending_log_messages = []
 
-        self._ctx = mp.get_context("fork")
+        self._ctx = mp.get_context("spawn")
         self._manager: Optional[Any] = None
         self._shared_state: Optional[Any] = None
         self._shared_result: Optional[Any] = None
@@ -262,8 +267,8 @@ class SafetyManager:
         self._process = self._ctx.Process(
             target=_safety_worker_main,
             args=(
-                self.mj_model,
-                self.torch_script_policy,
+                self.mj_model_path,
+                self.model_path,
                 self.rl_config,
                 self.rate,
                 self._shared_state,
@@ -540,9 +545,12 @@ def _setup_jax_policy(rl_policy: TorchScriptPolicy, rl_config: Dict[str, Any]):
     return functools.partial(jax_view(run_rl_policy), jax_weights)
 
 
-def _init_worker_objects(mj_model, rl_policy, rl_config):
+def _init_worker_objects(mj_model_path, rl_policy, rl_config):
+    import mujoco
     import jax
     from mujoco import mjx
+
+    mj_model = mujoco.MjModel.from_xml_path(mj_model_path)
 
     rl_policy_jax = _setup_jax_policy(rl_policy, rl_config)
 
@@ -593,8 +601,8 @@ def _add_log(shared_result, message):
 
 
 def _safety_worker_main(
-    mj_model,
-    rl_policy,
+    mj_model_path,
+    model_path,
     rl_config,
     rate: float,
     shared_state: Any,
@@ -602,12 +610,24 @@ def _safety_worker_main(
     state_event: Any,
     stop_event: Any,
 ):
+    import os
+    os.environ["XLA_FLAGS"] = (
+        "--xla_gpu_triton_gemm_any=true "
+        "--xla_gpu_autotune_level=4"
+    )
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
     try:
+        from controllers.policies.policy import TorchScriptPolicy
         import jax.numpy as jnp
         from mujoco import mjx
         import jax
 
-        task, task_params, policy_params, jit_optimize, jit_dynamics = _init_worker_objects(mj_model, rl_policy, rl_config)
+        rl_policy = TorchScriptPolicy(model_path, device="cuda")
+
+        task, task_params, policy_params, jit_optimize, jit_dynamics = _init_worker_objects(mj_model_path, rl_policy, rl_config)
 
         period = 1.0 / max(rate, 1e-3)
         last_processed_seq = -1
