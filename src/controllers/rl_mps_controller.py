@@ -253,6 +253,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         mj_model = mujoco.MjModel.from_xml_path(abs_xml_path)
         self.safety_manager = SafetyManager(
             mj_model=mj_model,
+            mj_model_path=abs_xml_path,
             rl_policy=self.policy,
             rl_config=configs["controller_config"],
             rate=50,

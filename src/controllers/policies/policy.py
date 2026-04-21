@@ -25,6 +25,7 @@ class PolicyBase(abc.ABC):
 class TorchScriptPolicy(PolicyBase):
     def __init__(self, model_path: str, device: str = "cuda"):
         self.device = device
+        self.model_path = model_path
         self.policy = torch.jit.load(model_path).to(device)
         self.policy.eval()
         self._flatten_rnn_parameters()

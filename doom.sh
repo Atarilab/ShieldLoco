@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
             # Build Docker Image if it doesn't exist
             if ! docker image inspect mujuni-image >/dev/null 2>&1; then
                 echo "Building Docker image 'mujuni-image'..."
-                docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -t mujuni-image unitree_mujoco_container/.devcontainer/.
+                docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -u) -t mujuni-image unitree_mujoco_container/.devcontainer/.
             else
                 echo "Docker image 'mujuni-image' already exists. Skipping build."
             fi
@@ -77,7 +77,7 @@ while [[ $# -gt 0 ]]; do
             # Build Docker Image if it doesn't exist
             if ! docker image inspect mujuni-image >/dev/null 2>&1; then
                 echo "Building Docker image 'mujuni-image'..."
-                docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -t mujuni-image unitree_mujoco_container/.devcontainer/.
+                docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -u) -t mujuni-image unitree_mujoco_container/.devcontainer/.
             else
                 echo "Docker image 'mujuni-image' already exists. Skipping build."
             fi
@@ -88,7 +88,7 @@ while [[ $# -gt 0 ]]; do
             # Build Safety Filter Docker Image
             SAFETY_BUILD=true
             echo "Building Safety Filter Docker image 'mujuni-image-safety'..."
-            docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) -t mujuni-image-safety -f Dockerfile.safety .
+            docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -u) -t mujuni-image-safety -f Dockerfile.safety .
             shift
             ;;
 
@@ -126,7 +126,7 @@ while [[ $# -gt 0 ]]; do
                 --network host \
                 --device /dev/input \
                 --group-add 107 \
-                --user $(id -u):$(id -g) \
+                --user $(id -u):$(id -u) \
                 --gpus all \
                 -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
                 -v /dev/shm:/dev/shm \
