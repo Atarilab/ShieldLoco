@@ -34,7 +34,7 @@ def guard_errors(context: str, *, stop_on_error: bool = True):
 
 PLANNER_REGISTRY = {
     "MIMPS": "QuadMIMPSPlanner",
-    "CEM": "QuadCEMPSlanner",
+    "CEMPS": "QuadCEMPSPlanner",
     "DIAL_MPC": "QuadDPMSPlanner",
     "CONSENSUS": "QuadCMPSPlanner",
     "REMIMPS": "QuadREMIMPSPlanner",

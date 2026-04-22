@@ -291,46 +291,13 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             params: Updated with new RNG.
         """
         K = self.num_replicas
-        H = self.plan_horizon
-        N_k = self.samples_per_replica
-        plan_dim = self.task.plan_dim
-
         rng = params.rng
 
         def sample_replica(k, rng_in):
             """Sample plans for a single replica."""
             rng_out, noise_rng = jax.random.split(rng_in)
 
-            # Replicate the 3-zone body/foot noise logic from quad_noise
-            rng_body_const, rng_body_slope, rng_foot, _ = jax.random.split(
-                noise_rng, 4
-            )
-
-            N_low = N_k // 3
-            N_med = N_k // 3
-            N_high = N_k - N_low - N_med
-            zone_scales = jnp.concatenate([
-                jnp.full((N_low,), 0.2 * self.noise_level),
-                jnp.full((N_med,), 0.5 * self.noise_level),
-                jnp.full((N_high,), 1.5 * self.noise_level),
-            ])
-
-            body_const = jax.random.normal(rng_body_const, (N_k, 1, 2))
-            body_slope = jax.random.normal(rng_body_slope, (N_k, 1, 2)) * 0.3
-            t = jnp.linspace(0.0, 1.0, H).reshape(1, H, 1)
-            body_xy = body_const + body_slope * t
-            body_xy_4feet = jnp.broadcast_to(
-                body_xy[:, :, None, :], (N_k, H, 4, 2)
-            )
-
-            foot_noise = jax.random.normal(rng_foot, (N_k, H, 4, 3))
-            foot_xy = foot_noise[..., :2]
-            foot_z = foot_noise[..., 2:] * 0.01
-
-            combined_xy = 0.7 * body_xy_4feet + 0.3 * foot_xy
-            combined = jnp.concatenate([combined_xy, foot_z], axis=-1)
-            noise = combined.reshape(N_k, H, plan_dim)
-            noise = noise * zone_scales[:, None, None]
+            noise = self.quad_noise(noise_rng, self.samples_per_replica)
 
             # Scale noise by temperature: hot replicas explore more
             temp_scale = jnp.sqrt(params.temperature[k] / self.temp_min)

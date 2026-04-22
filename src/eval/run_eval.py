@@ -247,6 +247,8 @@ def run_episode(
         "--log", f"eval_run_{run_id}",
         "--eval-config", os.path.abspath(tmp_scenario),
     ]
+    if tmp_ctrl_cfg is not None:
+        ctrl_cmd.extend(["--ctrl-config", os.path.abspath(tmp_ctrl_cfg)])
 
     # preexec_fn=os.setsid gives each child its own process group so os.killpg
     # reaches all descendants (including the master_node grandchild of ros2 run).

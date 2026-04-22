@@ -81,7 +81,7 @@ transition_duration: 0
 # ----------------------------------------------------------------------------
 # OPTIMIZER
 # ----------------------------------------------------------------------------
-mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEM, DIAL_MPC, CONSENSUS
+mps_alg_name: "CEMPS"  # MIMPS, REMIMPS, CEMPS, DMPS, CMPS
 
 # Common parameters (all optimizers)
 mps_num_samples: 1200
@@ -108,18 +108,11 @@ REMIMPS:
   noise_level: 0.6
   temperature: 1       # Not used directly (replicas have individual temps)
 
-CEM:
+CEMPS:
+  noise_level: 0.6
   elite_fraction: 0.1
-  max_iters: 5
   cross_entropy_decay: 0.8
 
-DIAL_MPC:
-  num_agents: 4
-  consensus_tolerance: 0.01
-
-CONSENSUS:
-  consensus_iters: 10
-  step_size: 0.5
 
 # ----------------------------------------------------------------------------
 # TASK

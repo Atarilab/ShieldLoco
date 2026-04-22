@@ -560,10 +560,10 @@ class QuadSamplingBasedPlanner(ABC):
 
         return params.replace(exec_plan=exec_plan)
 
-    def quad_noise(self, rng):
+    def quad_noise(self, rng, N=None):
         rng, body_const_rng, body_slope_rng, foot_rng = jax.random.split(rng, 4)
 
-        N = self.num_samples
+        N = N if N is not None else self.num_samples
         H = self.plan_horizon
 
         # --- 3-zone exploration: low / med / high noise multipliers ---
