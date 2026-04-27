@@ -363,6 +363,7 @@ class SafetyManager:
             "dynamic_obstacle_t0": kwargs.get("dynamic_obstacle_t0"),
             "dynamic_obstacle_active": kwargs.get("dynamic_obstacle_active"),
             "dynamic_obstacle_radii": kwargs.get("dynamic_obstacle_radii"),
+            "mocap_obstacle_positions": kwargs.get("mocap_obstacle_positions"),
         }
         current_seq = int(self._shared_state.get("seq", 0)) + 1
         self._shared_state["payload"] = payload
@@ -661,6 +662,12 @@ def _safety_worker_main(
             # task.data = jit_mjx_forward(task.model, task.data)
             
             task_params = task.update_params(task_params, latest_state)
+
+            mocap_positions = latest_state.get("mocap_obstacle_positions")
+            if mocap_positions is not None:
+                task.data = task.data.replace(mocap_pos=jnp.array(mocap_positions))
+                task.update_obstacle_sdf(mocap_positions)
+
             ref_plan_normalized = task.get_reference_plan(
                 ref=latest_state.get("ref"),
                 goal_idx=latest_state.get("goal_idx", 0),

@@ -101,6 +101,8 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.dynamic_obstacle_radii = np.zeros(n, dtype=np.float32)
         self._prev_dynamic_obstacles_any_active = False
 
+        self.mocap_obstacle_positions = None
+
         # Heading command for feet positions
         self.heading_command = 0.0  # Default heading (in radians)
         self.heading_command_lock = threading.RLock()  # Lock for heading command updates
@@ -249,7 +251,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         #     logger=self.logger  # Will be updated when logger is available
         # )
 
-        xml_path_rel_to_pkg = "robots/go2/scene_mjx.xml"
+        xml_path_rel_to_pkg = "robots/go2/scene_mjx_mocap.xml"
         abs_xml_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), xml_path_rel_to_pkg)
         mj_model = mujoco.MjModel.from_xml_path(abs_xml_path)
         self.safety_manager = SafetyManager(
@@ -470,6 +472,8 @@ class RLQuadrupedMPSController(RLControllerBase):
 
             self._update_dynamic_obstacle_predictions(state, current_time)
 
+            self._update_mocap_obstacle_positions()
+
             # update state
             if self.safety_manager.is_running():
                 safety_gait_id = {
@@ -499,6 +503,7 @@ class RLQuadrupedMPSController(RLControllerBase):
                     dynamic_obstacle_t0=self.dynamic_obstacle_t0,
                     dynamic_obstacle_active=self.dynamic_obstacle_active,
                     dynamic_obstacle_radii=self.dynamic_obstacle_radii,
+                    mocap_obstacle_positions=self.mocap_obstacle_positions,
                 )
 
                 plan_info = self.safety_manager.get_latest_plan_info()
@@ -677,6 +682,16 @@ class RLQuadrupedMPSController(RLControllerBase):
             with self._gait_lock:
                 self.generate_future_feet_positions()
         self._prev_dynamic_obstacles_any_active = any_active
+
+    def _update_mocap_obstacle_positions(self):
+        if self.robot.mj_model is None or self.robot.mj_model.data is None:
+            self.mocap_obstacle_positions = None
+            return
+        mocap_data = self.robot.mj_model.data
+        if mocap_data.mocap_pos is not None and len(mocap_data.mocap_pos) > 0:
+            self.mocap_obstacle_positions = np.array(mocap_data.mocap_pos, dtype=np.float32)
+        else:
+            self.mocap_obstacle_positions = None
 
     def _resample_commands(self):
         """Resample the commands for the controller with thread safety."""
