@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict
@@ -249,7 +250,7 @@ class RLQuadrupedMPSController(RLControllerBase):
         # )
 
         xml_path_rel_to_pkg = "robots/go2/scene_mjx.xml"
-        abs_xml_path = '/home/atari/workspace/DOOM/src/' + xml_path_rel_to_pkg
+        abs_xml_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), xml_path_rel_to_pkg)
         mj_model = mujoco.MjModel.from_xml_path(abs_xml_path)
         self.safety_manager = SafetyManager(
             mj_model=mj_model,
@@ -361,25 +362,19 @@ class RLQuadrupedMPSController(RLControllerBase):
         )
 
     def register_commands(self):
-        """Register gait selection as button group."""
+        """Register MPC toggle and movement commands."""
 
         self.command_manager.register_button_command(
-            name="gait",
-            description="Select Gait Pattern",
-            options=["stance", "trot"],
-            default_value="stance",
+            name="mpc",
+            description="MPC Contact Plan",
+            options=["off", "on"],
+            default_value="on" if self.apply_mpc_contact_plan else "off",
         )
         self.command_manager.register_button_command(
             name="move",
             description="Move Robot",
             options=["up", "down", "left", "center", "right", "turn-left", "turn-right"],
             default_value="center",
-        )
-        self.command_manager.register_button_command(
-            name="mpc",
-            description="MPC Contact Plan",
-            options=["off", "on"],
-            default_value="on" if self.apply_mpc_contact_plan else "off",
         )
 
     def set_mode(self):
@@ -1021,49 +1016,33 @@ class RLQuadrupedMPSController(RLControllerBase):
 
     def get_joystick_mappings(self):
         """
-        Define joystick button mappings for gait changes and heading control.
+        Define joystick button mappings for MPC toggle, movement, and heading control.
 
         Returns:
             Dict mapping button names to callback functions.
         """
         return {
-            # Reset to stance
-            "L2-R2": lambda: self.change_commands({"gait": "stance"}),
-            # Normal Gaits
-            "A": lambda: self.change_commands({"gait": "trot"}),
-            "B": lambda: self.change_commands({"gait": "pace"}),
-            "X": lambda: self.change_commands({"gait": "bound"}),
-            "Y": lambda: self.change_commands({"gait": "jump"}),
-            # Crawl Gaits
-            "L2-Y": lambda: self.change_commands({"gait": "crawl-anticlockwise"}),
-            "L2-A": lambda: self.change_commands({"gait": "crawl-clockwise"}),
-            # Pace-Jump Gaits
-            "R1-X": lambda: self.change_commands({"gait": "pace-jump1"}),
-            "R1-B": lambda: self.change_commands({"gait": "pace-jump2"}),
-            # Trot-Jump Gaits
-            "R1-Y": lambda: self.change_commands({"gait": "trot-jump1"}),
-            "R1-A": lambda: self.change_commands({"gait": "trot-jump2"}),
-            # "L1-X": lambda: self.change_commands({"gait": "trot-fly"}),
-            # OOD Gaits
-            "R2-Y": lambda: self.change_commands({"gait": "random1"}),
-            "R2-X": lambda: self.change_commands({"gait": "random2"}),
-            "R2-A": lambda: self.change_commands({"gait": "random3"}),
-            "R2-B": lambda: self.change_commands({"gait": "random4"}),
-            # Step Size
+            # MPC toggle
+            "A": lambda: self.change_commands({"mpc": "on" if not self.apply_mpc_contact_plan else "off"}),
+            # Forward/backward speed
             "up": lambda: self._handle_step_size_change("up"),
             "down": lambda: self._handle_step_size_change("down"),
-            # Lateral Position
+            # Lateral strafe
             "left": lambda: self._handle_lateral_pos_change("left"),
             "right": lambda: self._handle_lateral_pos_change("right"),
-            # Command Duration
-            "L1-up": lambda: self._handle_command_duration_change("increase"),
-            "L1-down": lambda: self._handle_command_duration_change("decrease"),
+            # Heading/turn
+            "Y": lambda: self._handle_heading_change("left"),
+            "B": lambda: self._handle_heading_change("right"),
+            # Reset
             "L1-R1": lambda: self._handle_reset(),
-            # Offset Adjustment
+            # Stance width
             "L1-left": lambda: self._handle_stance_width_change("front", "decrease"),
             "L1-right": lambda: self._handle_stance_width_change("front", "increase"),
             "R1-left": lambda: self._handle_stance_width_change("rear", "decrease"),
             "R1-right": lambda: self._handle_stance_width_change("rear", "increase"),
+            # Command duration
+            "L1-up": lambda: self._handle_command_duration_change("increase"),
+            "L1-down": lambda: self._handle_command_duration_change("decrease"),
         }
 
     """
