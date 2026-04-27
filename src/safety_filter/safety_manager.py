@@ -15,6 +15,28 @@ import traceback
 from controllers.policies.policy import TorchScriptPolicy
 
 
+def _dump_train_data(train_data, output_dir: str, seq: int, seed: int = 0):
+    """Save a QuadAlgTrainData object to disk as a pickle (numpy arrays)."""
+    import pickle
+    from pathlib import Path
+
+    out = Path(output_dir) / f"seed_{seed}"
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"rollout_{seq:06d}.pkl"
+
+    # Convert JAX arrays to numpy for pickle compatibility and smaller files
+    import jax
+
+    def to_np(x):
+        if hasattr(x, "__array__"):
+            return np.array(x)
+        return x
+
+    np_data = jax.tree_util.tree_map(to_np, train_data)
+    with open(path, "wb") as f:
+        pickle.dump(np_data, f)
+
+
 def guard_errors(context: str, *, stop_on_error: bool = True):
     """Decorator to handle repetitive try/except + stop + logging."""
     def decorator(fn):
@@ -79,6 +101,9 @@ def create_planner(alg_name, task, config):
         "safety_weight": config.get("mps_safety_weight", 1.0),
         "collect_data": config.get("mps_collect_data", False),
         "top_fraction": config.get("mps_top_fraction", 0.01),
+        "include_terminal_cost": config.get(
+            "safety_value_planner_include_terminal_cost", True
+        ),
     }
     
     optimizer_params = config.get(alg_name, {})
@@ -589,11 +614,11 @@ def _init_worker_objects(mj_model_path, rl_policy, rl_config):
     alg_name = rl_config.get("mps_alg_name", "MIMPS")
     planner = create_planner(alg_name, task, rl_config)
 
-    random_seed = np.random.randint(0, 2**31)
+    random_seed = int(rl_config.get("seed", np.random.randint(0, 2**31)))
     policy_params = planner.init_params(task_params=task_params, seed=random_seed)
     jit_optimize = jax.jit(planner.optimize)
     jit_dynamics = jax.jit(task.dynamics)
-    return task, task_params, policy_params, jit_optimize, jit_dynamics
+    return task, task_params, policy_params, jit_optimize, jit_dynamics, random_seed
 
 
 # TODO: is it possible to decouple update and opt? might give a bump in speed
@@ -630,11 +655,80 @@ def _safety_worker_main(
 
         rl_policy = TorchScriptPolicy(model_path, device="cuda")
 
-        task, task_params, policy_params, jit_optimize, jit_dynamics = _init_worker_objects(mj_model_path, rl_policy, rl_config)
+        task, task_params, policy_params, jit_optimize, jit_dynamics, random_seed = _init_worker_objects(mj_model_path, rl_policy, rl_config)
+
+        # ------------------------------------------------------------------
+        # Inline safety-value trainer (deterministic, cycle-skipping, no threads)
+        # ------------------------------------------------------------------
+        from safety_filter.quad.safety_value import (
+            InlineSafetyValueTrainer,
+            SafetyValueConfig,
+            compute_nstep_targets,
+        )
+
+        sv_cfg = SafetyValueConfig(
+            use_learned_residual=rl_config.get(
+                "safety_value_use_learned_residual", False
+            ),
+            training_mode=rl_config.get(
+                "safety_value_training_mode", "residual"
+            ),
+            deployment_mode=rl_config.get(
+                "safety_value_deployment_mode", "residual"
+            ),
+            hidden_dim=rl_config.get("safety_value_hidden_dim", 128),
+            use_layer_norm=rl_config.get("safety_value_use_layer_norm", False),
+            use_residual_connection=rl_config.get(
+                "safety_value_use_residual_connection", False
+            ),
+            use_feature_norm=rl_config.get("safety_value_use_feature_norm", False),
+            n_step=rl_config.get("safety_value_n_step", 3),
+            gamma=rl_config.get("safety_value_gamma", 0.99),
+            learning_rate=rl_config.get("safety_value_lr", 3e-4),
+            lr_decay_epochs=rl_config.get("safety_value_num_epochs", 30),
+            batch_size=rl_config.get("safety_value_batch_size", 2048),
+            num_epochs=rl_config.get("safety_value_num_epochs", 30),
+            grad_clip=rl_config.get("safety_value_grad_clip", 1.0),
+            target_clip=rl_config.get("safety_value_target_clip", 5000.0),
+            use_descent_penalty=rl_config.get(
+                "safety_value_use_descent_penalty", False
+            ),
+            descent_penalty_weight=rl_config.get(
+                "safety_value_descent_penalty_weight", 0.1
+            ),
+            use_online_adaptation=rl_config.get(
+                "safety_value_use_online_adaptation", True
+            ),
+            train_every=rl_config.get("safety_value_train_every", 5),
+            n_inner_steps=rl_config.get("safety_value_n_inner_steps", 1),
+            time_budget_ms=rl_config.get("safety_value_time_budget_ms", 5.0),
+            checkpoint_path=rl_config.get("safety_value_checkpoint_path", None),
+        )
+
+        # Push config into the task so terminal_cost knows the architecture
+        task.safety_value_cfg = sv_cfg
+        # Rebuild network with the correct architecture for this run
+        import safety_filter.quad.safety_value as _sv_mod
+        task.safety_value_net = _sv_mod.SafetyValueNet(
+            hidden_dim=sv_cfg.hidden_dim,
+            use_layer_norm=sv_cfg.use_layer_norm,
+            use_residual_connection=sv_cfg.use_residual_connection,
+        )
+
+        sv_trainer = InlineSafetyValueTrainer(cfg=sv_cfg)
+
+        # If a checkpoint was loaded with target stats, inject them into
+        # task_params so terminal_cost can denormalize correctly from step 0.
+        if sv_trainer._target_stats is not None:
+            task_params = task_params.replace(
+                safety_value_params=sv_trainer._params,
+                safety_value_target_stats=sv_trainer._target_stats,
+            )
 
         period = 1.0 / max(rate, 1e-3)
         last_processed_seq = -1
         last_reference_generation_id = None
+        sv_step_counter = 0
         while not stop_event.is_set():
             loop_start = time.perf_counter()
             state_event.wait(timeout=period)
@@ -708,6 +802,20 @@ def _safety_worker_main(
             )
             policy_params = jit_optimize(data_ahead, policy_params, True)
 
+            # Optionally dump raw train_data to disk for offline pre-training.
+            # Throttled: only dump every 5th cycle to avoid IO overhead.
+            data_dir = rl_config.get("safety_value_data_dir")
+            if (
+                data_dir
+                and (latest_seq % 5 == 0)
+                and hasattr(policy_params, 'train_data')
+                and policy_params.train_data is not None
+            ):
+                try:
+                    _dump_train_data(policy_params.train_data, data_dir, latest_seq, random_seed)
+                except Exception as e:
+                    _add_log(shared_result, f"[SAFETY] Data dump failed: {e}")
+
             override = True
             exec_plan = np.asarray(policy_params.exec_plan)
 
@@ -780,6 +888,42 @@ def _safety_worker_main(
                     shared_result["train_data"] = None
             else:
                 shared_result["train_data"] = None
+
+            # Inline training of safety-value residual.
+            # Only fires every ``train_every`` cycles and performs a single
+            # JITted gradient step (~2-5 ms).  No threads, no GIL contention.
+            if (
+                sv_cfg.use_online_adaptation
+                and (sv_step_counter % sv_cfg.train_every == 0)
+                and hasattr(policy_params, 'train_data')
+                and policy_params.train_data is not None
+            ):
+                try:
+                    t0 = time.perf_counter()
+                    features, targets = compute_nstep_targets(
+                        task, policy_params.train_data,
+                        n=rl_config.get("safety_value_n_step", 3),
+                        gamma=rl_config.get("mps_gamma", 0.99),
+                        training_mode=sv_cfg.training_mode,
+                    )
+                    costs_flat = policy_params.train_data.costs.reshape(-1)
+                    if costs_flat.shape[0] != features.shape[0]:
+                        costs_flat = jnp.broadcast_to(costs_flat[:1], (features.shape[0],))
+                    new_sv_params = sv_trainer.maybe_train(
+                        features, targets, costs_flat, sv_step_counter
+                    )
+                    if new_sv_params is not None:
+                        task_params = task_params.replace(
+                            safety_value_params=new_sv_params,
+                            safety_value_target_stats=sv_trainer._target_stats,
+                        )
+                    dt_ms = (time.perf_counter() - t0) * 1000
+                    if sv_step_counter % (sv_cfg.train_every * 10) == 0:
+                        _add_log(shared_result, f"[SAFETY] Inline value train: {dt_ms:.1f}ms")
+                except Exception as e:
+                    _add_log(shared_result, f"[SAFETY] Value training skipped: {e}")
+
+            sv_step_counter += 1
 
             shared_result["plan"] = exec_plan
             shared_result["override"] = override

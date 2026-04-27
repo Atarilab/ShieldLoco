@@ -36,6 +36,7 @@ class QuadAlgTrainData:
     plans: jax.Array
     costs: jax.Array
     constraint_flags: jax.Array  # shape (num_rollouts, H+1, 2): [feet_flag, body_count]
+    heuristic_values: Optional[jax.Array] = None  # shape (num_rollouts, H+1): V_h at each state
 
     optimized: bool = True
 
@@ -114,6 +115,7 @@ class QuadSamplingBasedPlanner(ABC):
         top_fraction: float = 0.01,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
+        include_terminal_cost: bool = True,
     ) -> None:
         """Initialize the MPC controller.
 
@@ -176,6 +178,7 @@ class QuadSamplingBasedPlanner(ABC):
         self.gamma = gamma
         self.p_max = p_max
         self.c_max_decay = c_max_decay
+        self.include_terminal_cost = include_terminal_cost
 
     @staticmethod
     def update_c_max(params, rollouts, p_max, c_max_decay):
@@ -372,11 +375,33 @@ class QuadSamplingBasedPlanner(ABC):
                 constraint_flags_flat, top_indices, axis=0
             )
 
+            # Compute heuristic values for all selected states so that offline
+            # training can ablate between direct and residual modes without
+            # recomputing SDFs.
+            from safety_filter.quad.safety_value import _vectorized_heuristic
+
+            B_sel = states_selected.xpos.shape[0]
+            T_sel = states_selected.xpos.shape[1]
+            xpos_flat = states_selected.xpos.reshape(
+                B_sel * T_sel, *states_selected.xpos.shape[2:]
+            )
+            xquat_flat = states_selected.xquat.reshape(
+                B_sel * T_sel, *states_selected.xquat.shape[2:]
+            )
+            qvel_flat = states_selected.qvel.reshape(
+                B_sel * T_sel, *states_selected.qvel.shape[2:]
+            )
+            heuristic_values = _vectorized_heuristic(
+                self.task, xpos_flat, xquat_flat, qvel_flat
+            )
+            heuristic_values = heuristic_values.reshape(B_sel, T_sel)
+
             train_data = QuadAlgTrainData(
                 states=states_selected,
                 plans=plans_selected,
                 costs=costs_selected,
                 constraint_flags=constraint_flags_selected,
+                heuristic_values=heuristic_values,
                 optimized=True,
             )
 
@@ -498,18 +523,24 @@ class QuadSamplingBasedPlanner(ABC):
             states_stacked,
         )
 
-        terminal_cost = self.dt * self.task.terminal_cost(tp, final_state)
         terminal_flags = self.task.constraint_check(final_state)
-        
+
         # CaT penalty for terminal step uses feet-only flag
         c_max = params.c_max
         terminal_feet = terminal_flags[0]
         terminal_normalized = jnp.clip(terminal_feet / c_max, 0.0, 1.0)
         terminal_term_prob = self.p_max * terminal_normalized
-        
+
         terminal_penalty = self.safety_weight * terminal_term_prob
-        terminal_cost_with_penalty = (terminal_cost + terminal_penalty) * discount
-        
+
+        if self.include_terminal_cost:
+            terminal_cost = self.dt * self.task.terminal_cost(tp, final_state)
+            terminal_cost_with_penalty = (terminal_cost + terminal_penalty) * discount
+        else:
+            # Disable terminal cost in planner optimization.
+            # The heuristic is still stored separately in train_data for training.
+            terminal_cost_with_penalty = terminal_penalty * discount
+
         task_costs = jnp.append(task_costs, terminal_cost_with_penalty)
         constraint_flags = jnp.concatenate([constraint_flags, terminal_flags[None, :]], axis=0)
 
@@ -539,12 +570,14 @@ class QuadSamplingBasedPlanner(ABC):
         dummy_plans = jnp.zeros((B, H, self.task.plan_dim), dtype=jnp.float32)
         dummy_costs = jnp.zeros((B, H + 1), dtype=jnp.float32)
         dummy_constraint_flags = jnp.zeros((B, H + 1, 2), dtype=jnp.float32)
+        dummy_heuristics = jnp.zeros((B, H + 1), dtype=jnp.float32)
 
         return QuadAlgTrainData(
             states=dummy_states,
             plans=dummy_plans,
             costs=dummy_costs,
             constraint_flags=dummy_constraint_flags,
+            heuristic_values=dummy_heuristics,
             optimized=False,
         )
 

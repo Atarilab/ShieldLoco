@@ -1,6 +1,6 @@
 import copy
 from functools import partial
-from typing import Any, Dict, Sequence, Tuple, Callable
+from typing import Any, Dict, Sequence, Tuple, Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +19,10 @@ from safety_filter.quad.foot_projection import (
 )
 
 from flax.struct import dataclass
+
+# Learned safety terminal value (heuristic + residual)
+from safety_filter.quad import safety_value as _sv
+from safety_filter.quad.safety_value import SafetyValueConfig
 
 
 # =============================================================================
@@ -275,9 +279,14 @@ class QuadRLTaskParams(TaskParams):
     dynamic_obstacle_radii: jax.Array = jnp.zeros((0,))
     dynamic_obstacle_active: jax.Array = jnp.zeros((0,), dtype=jnp.bool_)
     # Current foot positions in world frame at start of each planning cycle.
-    # Used by foot_step_cost to penalize large foot displacements that cause
+    # Used by foot_step_cost to penalise large foot displacements that cause
     # the RL policy to take intermediate contacts through obstacles.
     init_foot_positions: jax.Array = jnp.zeros((4, 3))
+
+    # Optional learned safety-value parameters.  When non-None, terminal_cost
+    # uses the heuristic + residual decomposition from safety_value.py.
+    safety_value_params: Any = None
+    safety_value_target_stats: Optional[dict] = None
 
 
 class PhysicsMetaData:
@@ -501,6 +510,20 @@ class QuadRLTask(Task):
             mj_model,
             hazard_prefixes=("obstacle_",),
             min_height=min_obs_h,
+        )
+
+        # =============================================================================
+        # LEARNED SAFETY VALUE (optional)
+        # =============================================================================
+        # Config controls architecture and ablation flags.
+        # Params are injected via task_params.safety_value_params at runtime.
+        self.safety_value_cfg: SafetyValueConfig = SafetyValueConfig(
+            use_learned_residual=False
+        )
+        self.safety_value_net = _sv.SafetyValueNet(
+            hidden_dim=self.safety_value_cfg.hidden_dim,
+            use_layer_norm=self.safety_value_cfg.use_layer_norm,
+            use_residual_connection=self.safety_value_cfg.use_residual_connection,
         )
 
     def make_task_params(self) -> QuadRLTaskParams:
@@ -1019,6 +1042,10 @@ class QuadRLTask(Task):
         n_steps = plan_segment.shape[0]
         feet = self.denormalize(plan_segment).reshape(n_steps, 4, 3)
         deltas = feet[1:] - feet[:-1]   # (n_steps-1, 4, 3)
+
+        # Also penalize the displacement from current feet
+        # deltas = jnp.concatenate([feet[0:1] - task_params.init_foot_positions, deltas], axis=0)
+
         return self.foot_chain_weight * jnp.sum(deltas ** 2)
 
     def foot_path_sdf_cost(
@@ -1174,10 +1201,57 @@ class QuadRLTask(Task):
             (actual_feet - step0_xy) ** 2 + (actual_feet - step1_xy) ** 2
         )
 
+    def terminal_cost_heuristic(
+        self, task_params: QuadRLTaskParams, state: mjx.Data
+    ) -> jax.Array:
+        """Pure SDF-based heuristic terminal cost (no learned component)."""
+        return _sv.compute_heuristic_terminal_cost(self, state)
+
     def terminal_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data
     ) -> jax.Array:
-        return jnp.array(0.0)
+        """Terminal cost with optional learned safety-value component.
+
+        Supports three deployment modes (controlled by ``safety_value_cfg``):
+
+            heuristic  -> V(x) = V_h(x)
+            direct     -> V(x) = V_learned(x)
+            residual   -> V(x) = V_h(x) + Delta(x)
+
+        Falls back to heuristic when ``safety_value_params`` is None.
+        """
+        heuristic = self.terminal_cost_heuristic(task_params, state)
+
+        params = task_params.safety_value_params
+        cfg = self.safety_value_cfg
+        if params is None:
+            return heuristic
+
+        # Backward compatibility: use_learned_residual=False forces heuristic mode
+        if not getattr(cfg, "use_learned_residual", True):
+            return heuristic
+
+        # Determine deployment mode
+        deployment_mode = getattr(cfg, "deployment_mode", "residual")
+        if deployment_mode == "heuristic":
+            return heuristic
+
+        features = _sv._extract_single_features(self, state)
+        prediction_norm = self.safety_value_net.apply(params, features)
+
+        # Denormalize if target stats were saved from offline training
+        t_stats = task_params.safety_value_target_stats
+        if t_stats is not None:
+            prediction_norm = prediction_norm * t_stats["std"] + t_stats["mean"]
+
+        if deployment_mode == "direct":
+            # Network predicts the full terminal value directly
+            return prediction_norm
+
+        # residual mode (default)
+        # Clip so that total terminal cost never goes negative
+        residual = jnp.maximum(prediction_norm, -heuristic)
+        return heuristic + residual
 
     def running_cost(
         self,

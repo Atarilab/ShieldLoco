@@ -36,6 +36,7 @@ class QuadCMPSPlanner(QuadSamplingBasedPlanner):
         top_fraction: float = 0.01,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
+        include_terminal_cost: bool = True,
     ) -> None:
         """Initialize consensus planner.
 
@@ -72,6 +73,7 @@ class QuadCMPSPlanner(QuadSamplingBasedPlanner):
             top_fraction=top_fraction,
             p_max=p_max,
             c_max_decay=c_max_decay,
+            include_terminal_cost=include_terminal_cost,
         )
 
         self.num_samples = num_samples

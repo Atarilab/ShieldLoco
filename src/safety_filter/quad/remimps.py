@@ -91,6 +91,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
         top_fraction: float = 0.01,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
+        include_terminal_cost: bool = True,
         num_replicas: int = 3,
         temp_min: float = 0.1,
         temp_max: float = 2.0,
@@ -111,6 +112,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             top_fraction=top_fraction,
             p_max=p_max,
             c_max_decay=c_max_decay,
+            include_terminal_cost=include_terminal_cost,
         )
 
         if num_replicas < 2:
