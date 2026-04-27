@@ -215,6 +215,39 @@ python3 eval/launch_eval.py --scenario eval/scenarios/scenario_a.yaml --seed 42
 
 > **Note**: Collisions still occur in some scenarios—ongoing work on math and bug fixes.
 
+### Hardware Testing (Real Go2 with Joystick)
+
+#### Terminal 1
+Launch Vicon client for base state estimation
+```bash
+./doom.sh -e
+ros2 launch vicon_receiver client.launch.py
+```
+
+#### Terminal 2
+```bash
+./doom.sh -a
+source setup.sh
+ros2 run master_manager master_node --task rl-mps-real-go2
+```
+
+#### Joystick Workflow
+
+| Sequence | Button | Action |
+|---|---|---|
+| Startup | `Select` | ZERO mode |
+| | `Start` | STAY_DOWN |
+| | `Up` | STAND_UP |
+| | `L1+R1` | RL-MPS (stance) |
+| In RL-MPS | `A` | Toggle MPC on/off |
+| | `Up/Down` | Forward/backward speed |
+| | `Left/Right` | Strafe left/right |
+| | `Y/B` | Turn left/right |
+| | `L1+R1` | Reset to defaults |
+| Shutdown | `Start` | DAMPING |
+
+> **Note**: The safety filter (MPPI) runs on GPU in a separate process. Ensure the container has GPU access (`nvidia-container-toolkit` installed). MPC starts OFF by default — press `A` to enable.
+
 ---
 
 ## 📡 Vicon State Estimation

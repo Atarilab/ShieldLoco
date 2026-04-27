@@ -72,10 +72,10 @@ class BallLauncher:
             geom_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
 
             if body_id < 0 or joint_id < 0 or geom_id < 0:
-                raise ValueError(
-                    f"Ball body/joint/geom '{body_name}'/'{joint_name}'/'{geom_name}' not found in model. "
-                    "Ensure obstacles.xml has the pre-allocated ball bodies."
-                )
+                # No ball bodies in scene — skip dynamic obstacle support
+                if i == 0:
+                    print("[BallLauncher] No ball bodies found in model — dynamic obstacle launcher disabled")
+                break
 
             qpos_adr = mj_model.jnt_qposadr[joint_id]
             qvel_adr = mj_model.jnt_dofadr[joint_id]
