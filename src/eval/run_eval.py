@@ -247,6 +247,8 @@ def run_episode(
         "--log", f"eval_run_{run_id}",
         "--eval-config", os.path.abspath(tmp_scenario),
     ]
+    if tmp_ctrl_cfg is not None:
+        ctrl_cmd.extend(["--ctrl-config", os.path.abspath(tmp_ctrl_cfg)])
 
     # preexec_fn=os.setsid gives each child its own process group so os.killpg
     # reaches all descendants (including the master_node grandchild of ros2 run).
@@ -375,43 +377,11 @@ def parse_episode(
     summary["time_to_goal"] = float(reached_rows[0]["t"]) if reached_rows else None
     summary["episode_duration"] = float(sim_rows[-1]["t"])
 
-    # --- path length and efficiency ---
-    xs = [float(r["x"]) for r in sim_rows]
-    ys = [float(r["y"]) for r in sim_rows]
-    path_len = sum(
-        math.hypot(xs[i] - xs[i-1], ys[i] - ys[i-1])
-        for i in range(1, len(xs))
-    )
-    straight_line = math.hypot(xs[-1] - xs[0], ys[-1] - ys[0])
-    summary["path_length"] = round(path_len, 4)
-    summary["path_efficiency"] = round(straight_line / path_len, 4) if path_len > 0 else None
-
-    # --- speed ---
-    if "vx" in sim_rows[0]:
-        speeds = [math.hypot(float(r["vx"]), float(r["vy"])) for r in sim_rows]
-        summary["mean_speed"] = round(sum(speeds) / len(speeds), 4)
-        summary["max_speed"] = round(max(speeds), 4)
-    else:
-        summary["mean_speed"] = None
-        summary["max_speed"] = None
-
-    # --- heading error ---
-    if "heading_error" in sim_rows[0]:
-        h_errs = [abs(float(r["heading_error"])) for r in sim_rows]
-        summary["mean_abs_heading_error"] = round(sum(h_errs) / len(h_errs), 4)
-    else:
-        summary["mean_abs_heading_error"] = None
-
-    # --- obstacle proximity ---
-    ball_dists = [float(r["ball_dist"]) for r in sim_rows if float(r.get("ball_dist", -1)) >= 0]
-    summary["min_ball_dist"] = round(min(ball_dists), 4) if ball_dists else None
-
     summary["survived"] = summary["constraint_violations"] == 0
 
     # ---------- controller CSV ----------
     ctrl_rows = _read_csv(ctrl_csv)
     if ctrl_rows:
-        # tracking cost (filter any residual NaN strings)
         costs = []
         for r in ctrl_rows:
             try:
@@ -421,37 +391,34 @@ def parse_episode(
             except (ValueError, KeyError):
                 pass
         summary["mean_tracking_cost"] = round(sum(costs) / len(costs), 6) if costs else None
-        summary["total_tracking_cost"] = round(sum(costs), 4) if costs else None
 
-        # MPC engagement rate
-        mpc_vals = [int(r.get("mpc_active", 0)) for r in ctrl_rows]
-        summary["mpc_engagement_rate"] = round(sum(mpc_vals) / len(mpc_vals), 4)
+        opt_costs = []
+        for r in ctrl_rows:
+            try:
+                v = float(r["optimizer_cost"])
+                if math.isfinite(v):
+                    opt_costs.append(v)
+            except (ValueError, KeyError):
+                pass
+        summary["mean_optimizer_cost"] = round(sum(opt_costs) / len(opt_costs), 6) if opt_costs else None
 
-        # Replanning rate: count unique plan_seq transitions per second
-        seqs = [int(r["plan_seq"]) for r in ctrl_rows if r.get("plan_seq", "") != ""]
-        replan_events = sum(1 for i in range(1, len(seqs)) if seqs[i] != seqs[i-1])
-        ep_dur = float(ctrl_rows[-1]["t"]) if ctrl_rows else 1.0
-        summary["replanning_rate_hz"] = round(replan_events / ep_dur, 4) if ep_dur > 0 else None
-
-        # Velocity stats from controller (body-frame forward velocity)
-        if "vel_x" in ctrl_rows[0]:
-            fwd_vels = [float(r["vel_x"]) for r in ctrl_rows]
-            summary["mean_forward_vel"] = round(sum(fwd_vels) / len(fwd_vels), 4)
-
-        # Height stability (std dev of base height during episode)
-        if "height" in ctrl_rows[0]:
-            heights = [float(r["height"]) for r in ctrl_rows]
-            mean_h = sum(heights) / len(heights)
-            std_h = math.sqrt(sum((h - mean_h)**2 for h in heights) / len(heights))
-            summary["mean_height"] = round(mean_h, 4)
-            summary["height_std"] = round(std_h, 4)
+        opt_times = []
+        for r in ctrl_rows:
+            try:
+                v = float(r["opt_elapsed_ms"])
+                if math.isfinite(v):
+                    opt_times.append(v)
+            except (ValueError, KeyError):
+                pass
+        summary["mean_opt_time_ms"] = round(sum(opt_times) / len(opt_times), 2) if opt_times else None
+        summary["max_opt_time_ms"] = round(max(opt_times), 2) if opt_times else None
 
         summary["num_ctrl_steps"] = len(ctrl_rows)
     else:
         summary["mean_tracking_cost"] = None
-        summary["total_tracking_cost"] = None
-        summary["mpc_engagement_rate"] = None
-        summary["replanning_rate_hz"] = None
+        summary["mean_optimizer_cost"] = None
+        summary["mean_opt_time_ms"] = None
+        summary["max_opt_time_ms"] = None
 
     return summary
 

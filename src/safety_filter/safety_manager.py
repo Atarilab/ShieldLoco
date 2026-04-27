@@ -34,9 +34,10 @@ def guard_errors(context: str, *, stop_on_error: bool = True):
 
 PLANNER_REGISTRY = {
     "MIMPS": "QuadMIMPSPlanner",
-    "CEM": "QuadCEMPSlanner",
+    "CEMPS": "QuadCEMPSPlanner",
     "DIAL_MPC": "QuadDPMSPlanner",
     "CONSENSUS": "QuadCMPSPlanner",
+    "REMIMPS": "QuadREMIMPSPlanner",
 }
 
 
@@ -55,12 +56,14 @@ def create_planner(alg_name, task, config):
     from .quad.cemps import QuadCEMPSPlanner
     from .quad.dmps import QuadDPMSPlanner
     from .quad.cmps import QuadCMPSPlanner
-    
+    from .quad.remimps import QuadREMIMPSPlanner
+
     registry = {
         "MIMPS": QuadMIMPSPlanner,
         "CEMPS": QuadCEMPSPlanner,
         "DMPS": QuadDPMSPlanner,
         "CMPS": QuadCMPSPlanner,
+        "REMIMPS": QuadREMIMPSPlanner,
     }
     
     if alg_name not in registry:
@@ -668,10 +671,25 @@ def _safety_worker_main(
                 # Reference trajectory changed (e.g. step size or heading command).
                 # Reset warm-start to the new reference so MPPI doesn't spend several
                 # 300ms cycles converging from the old stale plan.
-                policy_params = policy_params.replace(  # type: ignore
-                    best_plan=ref_plan_normalized,
-                    mean=jnp.zeros_like(policy_params.mean),
-                )
+                #
+                # For REMIMPS we must also reset the internal per-replica arrays.
+                if hasattr(policy_params, "mean_replicas"):
+                    K = policy_params.mean_replicas.shape[0]
+                    best_plans = jnp.repeat(
+                        ref_plan_normalized[None, :, :], K, axis=0
+                    )
+                    means = jnp.zeros_like(best_plans)
+                    policy_params = policy_params.replace(  # type: ignore
+                        best_plan=ref_plan_normalized,
+                        mean=means[0],
+                        mean_replicas=means,
+                        best_plan_replicas=best_plans,
+                    )
+                else:
+                    policy_params = policy_params.replace(  # type: ignore
+                        best_plan=ref_plan_normalized,
+                        mean=jnp.zeros_like(policy_params.mean),
+                    )
                 last_reference_generation_id = current_generation_id
 
             policy_params = update_params(
@@ -694,6 +712,8 @@ def _safety_worker_main(
             exec_plan = np.asarray(policy_params.exec_plan)
 
             _add_log(shared_result, f"[SAFETY] Optimization completed: exec_plan shape={exec_plan.shape}, override={override}")
+
+            best_costs = None
 
             # Share train_data COM trajectory if available
             if hasattr(policy_params, 'train_data') and policy_params.train_data is not None:
@@ -766,10 +786,15 @@ def _safety_worker_main(
             shared_result["seq"] = latest_seq
             shared_result["reference_generation_id"] = latest_state.get("reference_generation_id")
             shared_result["reference_step_seq"] = latest_state.get("reference_step_seq")
-            
+
+            # Share best optimizer cost for eval logging
+            if best_costs is not None:
+                shared_result["best_optimizer_cost"] = float(np.asarray(best_costs).sum())
+
             _add_log(shared_result, f"[SAFETY] === Result Summary === seq={latest_seq}, override={override}, plan_shape={exec_plan.shape}")
 
             elapsed = time.perf_counter() - loop_start
+            shared_result["opt_elapsed_ms"] = float(elapsed * 1000)
             _add_log(shared_result, f"[SAFETY] Optimization elapsed time: {elapsed*1000:.2f}ms (target period: {period*1000:.2f}ms)")
             sleep_time = max(0.0, period - elapsed)
             if sleep_time > 0:

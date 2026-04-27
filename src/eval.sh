@@ -28,14 +28,15 @@ BASE_SEED=42
 # ---------------------------------------------------------------------------
 # Seed-only experiment (edit NAME and OUT, keep sweep commented)
 # ---------------------------------------------------------------------------
-NAME="go2_mimps"
+NAME="go2"
 OUT="results/${NAME}"
 
 # ---------------------------------------------------------------------------
 # Sweep experiment (uncomment sweep section, edit SWEEP_DIR and sweep axes)
 # ---------------------------------------------------------------------------
-# SWEEP_DIR="results/go2_mimps_sweep"    # parent dir for all sweep conditions
+SWEEP_DIR="results/go2_sweep_contact_policy_latest"    # parent dir for all sweep conditions
 # SWEEP="mps_safety_weight=10,100,1000 projection_clearance=0.08 body_sdf_margin=0.1,0.2,0.3"
+SWEEP="mps_alg_name=MIMPS,REMIMPS,CEMPS plan_lim=0.25,0.3,0.35 mps_iterations=1,2,3"
 
 # ---------------------------------------------------------------------------
 

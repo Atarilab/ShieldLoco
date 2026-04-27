@@ -61,6 +61,7 @@ async def main_async(args=None):
     parser.add_argument("--debug", action="store_true", help="Show debug logs")
     parser.add_argument("--ui", action="store_true", help="Enable the Robot Control UI")
     parser.add_argument("--eval-config", type=str, default=None, help="Path to eval scenario YAML")
+    parser.add_argument("--ctrl-config", type=str, default=None, help="Path to controller config YAML (overrides TASK_CONFIG)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (numpy, torch, python random)")
 
     args = parser.parse_args()
@@ -81,7 +82,9 @@ async def main_async(args=None):
         logger.info("Starting robot controller for task: %s", args.task)
 
         # Load configurations
-        configs = await initialize_robot_controller(args.task, logger)
+        configs = await initialize_robot_controller(
+            args.task, logger, controller_config_override=args.ctrl_config
+        )
 
         # Add debug flag to configs
         configs["debug"] = args.debug

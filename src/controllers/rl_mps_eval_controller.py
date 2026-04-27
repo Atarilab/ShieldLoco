@@ -13,6 +13,9 @@ import time
 from dataclasses import dataclass, field
 from typing import IO, Optional
 
+import numpy as np
+import torch
+
 from controllers.rl_mps_controller import RLQuadrupedMPSController
 
 
@@ -131,13 +134,14 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
         self.eval_m.writer = csv.DictWriter(
             self.eval_m.file,
             fieldnames=["t", "vel_x", "vel_y", "height",
-                        "tracking_cost", "plan_seq", "mpc_active"],
+                        "tracking_cost", "plan_seq", "mpc_active",
+                        "optimizer_cost", "opt_elapsed_ms"],
         )
         self.eval_m.writer.writeheader()
 
     def _eval_log_step(self, state):
         """Write one row to the controller metric CSV. Writes done_file on timeout."""
-        import os, torch
+        import os
         t = time.time() - self.eval_m.start_time
         if t > self.eval_cfg.max_time and not os.path.exists(self.eval_cfg.done_file):
             self.eval_m.file.flush()
@@ -148,6 +152,19 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
 
         diff = self.future_feet_positions_w - self.reference_feet_positions_w
         tracking_cost = float(torch.nan_to_num(diff ** 2, nan=0.0).sum())
+
+        # Optimizer cost and timing from safety worker
+        optimizer_cost = 0.0
+        opt_elapsed_ms = 0.0
+        train_data = self.safety_manager.get_train_data()
+        if train_data is not None and "costs" in train_data:
+            costs = np.asarray(train_data["costs"])
+            if costs.ndim == 1:
+                optimizer_cost = float(costs.sum())
+            elif costs.ndim == 2:
+                optimizer_cost = float(costs.sum(axis=1).min())
+        if self.safety_manager._shared_result is not None:
+            opt_elapsed_ms = float(self.safety_manager._shared_result.get("opt_elapsed_ms", 0.0))
 
         # Robot state for paper metrics
         lin_vel = state.get("robot/base_lin_vel_b", [0.0, 0.0, 0.0])
@@ -161,6 +178,8 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
             "tracking_cost": f"{tracking_cost:.6f}",
             "plan_seq": self.safety_manager._last_result_seq,
             "mpc_active": int(self.apply_mpc_contact_plan),
+            "optimizer_cost": f"{optimizer_cost:.6f}",
+            "opt_elapsed_ms": f"{opt_elapsed_ms:.2f}",
         })
         # Flush periodically (every ~1 s at 200 Hz = 200 steps)
         if self.counter % 200 == 0:

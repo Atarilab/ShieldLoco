@@ -29,17 +29,12 @@ def _read_csv(path: str) -> list[dict]:
 
 # ── Metrics shown in the console table and written to aggregated.csv ──────────
 METRICS = [
-    ("goal_reached",          "Goal%",       "bool"),
-    ("time_to_goal",          "T_goal(s)",   "float"),
-    ("constraint_violations", "Collisions",  "float"),
-    ("foot_collision_events", "FootLanding", "float"),
-    ("foot_collision_events_sdf", "FootSDF", "float"),
-    ("mean_tracking_cost",    "Track.Cost",  "float"),
-    ("path_efficiency",       "PathEff",     "float"),
-    ("mean_speed",            "Speed(m/s)",  "float"),
-    ("min_ball_dist",         "BallDist",    "float"),
-    ("mean_abs_heading_error","HeadErr",     "float"),
-    ("height_std",            "HgtStd",      "float"),
+    ("constraint_violations",   "Collisions",    "float"),
+    ("foot_collision_events",   "FootLanding",   "float"),
+    ("foot_collision_events_sdf", "FootSDF",     "float"),
+    ("mean_tracking_cost",      "Track.Cost",    "float"),
+    ("mean_optimizer_cost",     "Opt.Cost",      "float"),
+    ("mean_opt_time_ms",        "OptTime(ms)",   "float"),
 ]
 
 METRIC_KEYS = [m[0] for m in METRICS]
@@ -129,33 +124,36 @@ def _parse_run_from_dir(run_dir: str) -> list[dict]:
                     except (ValueError, KeyError):
                         pass
                 row["mean_tracking_cost"] = round(sum(costs) / len(costs), 6) if costs else None
-                row["total_tracking_cost"] = round(sum(costs), 4) if costs else None
-                mpc_vals = [int(r.get("mpc_active", 0)) for r in ctrl_rows]
-                row["mpc_engagement_rate"] = round(sum(mpc_vals) / len(mpc_vals), 4)
-                seqs = [int(r["plan_seq"]) for r in ctrl_rows if r.get("plan_seq", "") != ""]
-                replan_events = sum(1 for i in range(1, len(seqs)) if seqs[i] != seqs[i-1])
-                ep_dur = float(ctrl_rows[-1]["t"]) if ctrl_rows else 1.0
-                row["replanning_rate_hz"] = round(replan_events / ep_dur, 4) if ep_dur > 0 else None
-                if "vel_x" in ctrl_rows[0]:
-                    fwd_vels = [float(r["vel_x"]) for r in ctrl_rows]
-                    row["mean_forward_vel"] = round(sum(fwd_vels) / len(fwd_vels), 4)
-                if "height" in ctrl_rows[0]:
-                    heights = [float(r["height"]) for r in ctrl_rows]
-                    mean_h = sum(heights) / len(heights)
-                    std_h = math.sqrt(sum((h - mean_h)**2 for h in heights) / len(heights))
-                    row["mean_height"] = round(mean_h, 4)
-                    row["height_std"] = round(std_h, 4)
+
+                opt_costs = []
+                for r in ctrl_rows:
+                    try:
+                        v = float(r["optimizer_cost"])
+                        if math.isfinite(v):
+                            opt_costs.append(v)
+                    except (ValueError, KeyError):
+                        pass
+                row["mean_optimizer_cost"] = round(sum(opt_costs) / len(opt_costs), 6) if opt_costs else None
+
+                opt_times = []
+                for r in ctrl_rows:
+                    try:
+                        v = float(r["opt_elapsed_ms"])
+                        if math.isfinite(v):
+                            opt_times.append(v)
+                    except (ValueError, KeyError):
+                        pass
+                row["mean_opt_time_ms"] = round(sum(opt_times) / len(opt_times), 2) if opt_times else None
+
                 row["num_ctrl_steps"] = len(ctrl_rows)
             else:
                 row["mean_tracking_cost"] = None
-                row["total_tracking_cost"] = None
-                row["mpc_engagement_rate"] = None
-                row["replanning_rate_hz"] = None
+                row["mean_optimizer_cost"] = None
+                row["mean_opt_time_ms"] = None
         else:
             row["mean_tracking_cost"] = None
-            row["total_tracking_cost"] = None
-            row["mpc_engagement_rate"] = None
-            row["replanning_rate_hz"] = None
+            row["mean_optimizer_cost"] = None
+            row["mean_opt_time_ms"] = None
 
         results.append(row)
     return results
@@ -202,20 +200,12 @@ def generate_stub_results(results_dir: str, expected_runs: int) -> tuple[list[di
                 "overrides": overrides,
                 "_source": run_dir,
                 "error": "incomplete_run",
-                "goal_reached": False,
-                "time_to_goal": None,
                 "constraint_violations": None,
                 "foot_collision_events": None,
                 "foot_collision_events_sdf": None,
                 "mean_tracking_cost": None,
-                "path_efficiency": None,
-                "mean_speed": None,
-                "min_ball_dist": None,
-                "mean_abs_heading_error": None,
-                "height_std": None,
-                "survived": None,
-                "mpc_engagement_rate": None,
-                "replanning_rate_hz": None,
+                "mean_optimizer_cost": None,
+                "mean_opt_time_ms": None,
             }
             stubs.append(stub)
     return completed, stubs
@@ -372,7 +362,7 @@ def print_best(groups: dict[tuple, list[dict]], experiment_name: str | None = No
             if not vals:
                 continue
             mu = statistics.mean(vals)
-            higher_better = mkey in ("goal_reached", "path_efficiency")
+            higher_better = False
             if best_val is None or (mu > best_val if higher_better else mu < best_val):
                 best_val = mu
                 best_key = key

@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
@@ -8,17 +8,31 @@ from tasks.task_configs import TASK_CONFIG
 from utils.config_loader import load_config
 
 
-async def initialize_robot_controller(task: str, logger: logging.Logger) -> Dict:
-    """Initialize robot controller configurations."""
+async def initialize_robot_controller(
+    task: str,
+    logger: logging.Logger,
+    controller_config_override: Optional[str] = None,
+) -> Dict:
+    """Initialize robot controller configurations.
+
+    Args:
+        task: Task name registered in TASK_CONFIG.
+        logger: Logger instance.
+        controller_config_override: Optional path to a controller config YAML
+            that overrides the default TASK_CONFIG entry. Used by eval sweeps.
+    """
     if task not in TASK_CONFIG:
         logger.error(f"Unknown task: {task}")
         raise ValueError(f"Unknown task: {task}")
 
     task_configs = TASK_CONFIG[task]
-    logger.info("Configurations loaded successfully")
+    controller_cfg_path = controller_config_override or task_configs["controller"]
+    logger.info(
+        "Configurations loaded successfully (controller: %s)", controller_cfg_path
+    )
 
     return {
-        "controller_config": load_config(task_configs["controller"]),
+        "controller_config": load_config(controller_cfg_path),
         "robot_interface_config": load_config(task_configs["robot_interface"]),
     }
 

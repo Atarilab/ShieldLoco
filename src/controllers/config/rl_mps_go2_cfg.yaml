@@ -81,12 +81,12 @@ transition_duration: 0
 # ----------------------------------------------------------------------------
 # OPTIMIZER
 # ----------------------------------------------------------------------------
-mps_alg_name: "MIMPS"  # MIMPS, CEM, DIAL_MPC, CONSENSUS
+mps_alg_name: "CEMPS"  # MIMPS, REMIMPS, CEMPS, DMPS, CMPS
 
 # Common parameters (all optimizers)
-mps_num_samples: 800
+mps_num_samples: 1200
 mps_plan_horizon: *horizon_length
-mps_iterations: 2
+mps_iterations: 1
 mps_gamma: 0.99
 mps_safety_weight: 10
 mps_collect_data: true
@@ -98,18 +98,21 @@ MIMPS:
   noise_level: 0.6
   temperature: 1
 
-CEM:
+REMIMPS:
+  # Replica Exchange MIMPS: K replicas at different temperatures
+  num_replicas: 10
+  temp_min: 0.01       # Coldest replica (exploitation)
+  temp_max: 1.0        # Hottest replica (exploration)
+  swap_every: 1        # Propose swaps every N iterations
+  # Noise level applies to coldest; hot replicas scale automatically
+  noise_level: 0.6
+  temperature: 1       # Not used directly (replicas have individual temps)
+
+CEMPS:
+  noise_level: 0.6
   elite_fraction: 0.1
-  max_iters: 5
   cross_entropy_decay: 0.8
 
-DIAL_MPC:
-  num_agents: 4
-  consensus_tolerance: 0.01
-
-CONSENSUS:
-  consensus_iters: 10
-  step_size: 0.5
 
 # ----------------------------------------------------------------------------
 # TASK
@@ -167,7 +170,7 @@ foot_step_weight: 0.0
 #   njmax = PER-WORLD efc rows (NOT scaled by num_samples)
 # Empirical peaks: ~23 contacts/world, ~161 efc rows/world
 mps_ncon_per_world: 32   # per-world budget; total = 32 * 400 = 12800
-mps_njmax: 2048          # per-world; (400, 2048, 18) × 4 bytes = 59 MB after vmap; raised from 512 for chaotic contact geometry
+mps_njmax: 2100          # per-world; (400, 2048, 18) × 4 bytes = 59 MB after vmap; raised from 512 for chaotic contact geometry
 
 # MuJoCo solver settings (reduced from defaults for speed)
 physics_iterations: 4      # Newton solver iters (default 8)
