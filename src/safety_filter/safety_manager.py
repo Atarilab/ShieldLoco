@@ -104,8 +104,8 @@ def create_planner(alg_name, task, config):
         "momentum": config.get("mps_momentum", 0.5),
         "use_momentum": config.get("mps_use_momentum", True),
         "include_terminal_cost": config.get(
-            "safety_value_planner_include_terminal_cost", True
-        ),
+            "safety_value_mode", "heuristic"
+        ) != "off",
     }
     
     optimizer_params = config.get(alg_name, {})
@@ -673,77 +673,42 @@ def _safety_worker_main(
         task, task_params, policy_params, jit_optimize, jit_dynamics, jit_mjx_forward, random_seed = _init_worker_objects(mj_model_path, rl_policy, rl_config)
 
         # ------------------------------------------------------------------
-        # Inline safety-value trainer (deterministic, cycle-skipping, no threads)
+        # Safety-value setup (only for modes that use a learned network)
         # ------------------------------------------------------------------
-        from safety_filter.quad.safety_value import (
-            InlineSafetyValueTrainer,
-            SafetyValueConfig,
-            compute_nstep_targets,
-        )
+        sv_mode = rl_config.get("safety_value_mode", "heuristic")
+        task.safety_value_mode = sv_mode
 
-        sv_cfg = SafetyValueConfig(
-            use_learned_residual=rl_config.get(
-                "safety_value_use_learned_residual", False
-            ),
-            training_mode=rl_config.get(
-                "safety_value_training_mode", "residual"
-            ),
-            deployment_mode=rl_config.get(
-                "safety_value_deployment_mode", "residual"
-            ),
-            hidden_dim=rl_config.get("safety_value_hidden_dim", 128),
-            use_layer_norm=rl_config.get("safety_value_use_layer_norm", False),
-            use_residual_connection=rl_config.get(
-                "safety_value_use_residual_connection", False
-            ),
-            use_feature_norm=rl_config.get("safety_value_use_feature_norm", False),
-            n_step=rl_config.get("safety_value_n_step", 3),
-            gamma=rl_config.get("safety_value_gamma", 0.99),
-            learning_rate=rl_config.get("safety_value_lr", 3e-4),
-            lr_decay_epochs=rl_config.get("safety_value_num_epochs", 30),
-            batch_size=rl_config.get("safety_value_batch_size", 2048),
-            num_epochs=rl_config.get("safety_value_num_epochs", 30),
-            grad_clip=rl_config.get("safety_value_grad_clip", 1.0),
-            target_clip=rl_config.get("safety_value_target_clip", 5000.0),
-            use_descent_penalty=rl_config.get(
-                "safety_value_use_descent_penalty", False
-            ),
-            descent_penalty_weight=rl_config.get(
-                "safety_value_descent_penalty_weight", 0.1
-            ),
-            use_online_adaptation=rl_config.get(
-                "safety_value_use_online_adaptation", True
-            ),
-            train_every=rl_config.get("safety_value_train_every", 5),
-            n_inner_steps=rl_config.get("safety_value_n_inner_steps", 1),
-            time_budget_ms=rl_config.get("safety_value_time_budget_ms", 5.0),
-            checkpoint_path=rl_config.get("safety_value_checkpoint_path", None),
-        )
-
-        # Push config into the task so terminal_cost knows the architecture
-        task.safety_value_cfg = sv_cfg
-        # Rebuild network with the correct architecture for this run
-        import safety_filter.quad.safety_value as _sv_mod
-        task.safety_value_net = _sv_mod.SafetyValueNet(
-            hidden_dim=sv_cfg.hidden_dim,
-            use_layer_norm=sv_cfg.use_layer_norm,
-            use_residual_connection=sv_cfg.use_residual_connection,
-        )
-
-        sv_trainer = InlineSafetyValueTrainer(cfg=sv_cfg)
-
-        # If a checkpoint was loaded with target stats, inject them into
-        # task_params so terminal_cost can denormalize correctly from step 0.
-        if sv_trainer._target_stats is not None:
-            task_params = task_params.replace(
-                safety_value_params=sv_trainer._params,
-                safety_value_target_stats=sv_trainer._target_stats,
+        if sv_mode in ("direct", "residual"):
+            # Create network with correct architecture
+            sv_hidden_dim = rl_config.get("safety_value_hidden_dim", 256)
+            sv_use_layer_norm = rl_config.get("safety_value_use_layer_norm", False)
+            import safety_filter.quad.safety_value as _sv_mod
+            task.safety_value_net = _sv_mod.SafetyValueNet(
+                hidden_dim=sv_hidden_dim,
+                use_layer_norm=sv_use_layer_norm,
             )
+
+            # Load pre-trained checkpoint
+            from pathlib import Path
+            from safety_filter.quad.safety_value import load_checkpoint
+
+            ckpt = rl_config.get("safety_value_checkpoint_path")
+            if ckpt is not None and Path(ckpt).is_file():
+                sv_params = load_checkpoint(ckpt)
+                task_params = task_params.replace(
+                    safety_value_params=sv_params,
+                )
+            else:
+                print(
+                    f"[WORKER] checkpoint not found for mode='{sv_mode}'. "
+                    "Falling back to heuristic.",
+                    flush=True,
+                )
+                task.safety_value_mode = "heuristic"
 
         period = 1.0 / max(rate, 1e-3)
         last_processed_seq = -1
         last_reference_generation_id = None
-        sv_step_counter = 0
         while not stop_event.is_set():
             loop_start = time.perf_counter()
             state_event.wait(timeout=period)
@@ -907,42 +872,6 @@ def _safety_worker_main(
                     shared_result["train_data"] = None
             else:
                 shared_result["train_data"] = None
-
-            # Inline training of safety-value residual.
-            # Only fires every ``train_every`` cycles and performs a single
-            # JITted gradient step (~2-5 ms).  No threads, no GIL contention.
-            if (
-                sv_cfg.use_online_adaptation
-                and (sv_step_counter % sv_cfg.train_every == 0)
-                and hasattr(policy_params, 'train_data')
-                and policy_params.train_data is not None
-            ):
-                try:
-                    t0 = time.perf_counter()
-                    features, targets = compute_nstep_targets(
-                        task, policy_params.train_data,
-                        n=rl_config.get("safety_value_n_step", 3),
-                        gamma=rl_config.get("mps_gamma", 0.99),
-                        training_mode=sv_cfg.training_mode,
-                    )
-                    costs_flat = policy_params.train_data.costs.reshape(-1)
-                    if costs_flat.shape[0] != features.shape[0]:
-                        costs_flat = jnp.broadcast_to(costs_flat[:1], (features.shape[0],))
-                    new_sv_params = sv_trainer.maybe_train(
-                        features, targets, costs_flat, sv_step_counter
-                    )
-                    if new_sv_params is not None:
-                        task_params = task_params.replace(
-                            safety_value_params=new_sv_params,
-                            safety_value_target_stats=sv_trainer._target_stats,
-                        )
-                    dt_ms = (time.perf_counter() - t0) * 1000
-                    if sv_step_counter % (sv_cfg.train_every * 10) == 0:
-                        _add_log(shared_result, f"[SAFETY] Inline value train: {dt_ms:.1f}ms")
-                except Exception as e:
-                    _add_log(shared_result, f"[SAFETY] Value training skipped: {e}")
-
-            sv_step_counter += 1
 
             shared_result["plan"] = exec_plan
             shared_result["override"] = override

@@ -87,7 +87,7 @@ mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, DMPS, CMPS
 mps_num_samples: 1200
 mps_plan_horizon: *horizon_length
 mps_iterations: 1
-mps_gamma: 0.99
+mps_gamma: &mps_gamma 0.99
 mps_safety_weight: 10
 mps_collect_data: true
 mps_top_fraction: 0.3
@@ -205,89 +205,37 @@ ball_launch_height: [6.0, 9.0]    # [min, max] meters
 ball_launch_speed: [0.5, 2.0]    # [min, max] m/s (lobbed arc)
 
 # ----------------------------------------------------------------------------
-# LEARNED SAFETY TERMINAL VALUE FUNCTION  (ablation-friendly)
+# LEARNED SAFETY TERMINAL VALUE FUNCTION
 # ----------------------------------------------------------------------------
 #
-# THREE-STAGE PIPELINE:  collect -> train -> deploy
+# Single switch controlling everything:
+#   "off"       – no terminal cost in planner
+#   "heuristic" – SDF heuristic only (no network loaded)
+#   "direct"    – learned V(x) net replaces heuristic
+#   "residual"  – learned Delta(x) net corrects heuristic
 #
-# Each stage has an independently toggleable mode so you can run clean
-# ablations, e.g.:
-#   - Collect without terminal cost, train residual, deploy residual
-#   - Collect without terminal cost, train direct,   deploy direct
-#   - Collect with terminal cost,    train residual, deploy residual
-#   - Collect with terminal cost,    train direct,   deploy direct
-#   - Any of the above but deploy heuristic-only for A/B comparison
+# Training follows deployment mode automatically.
+#   direct   -> train targets = n-step return
+#   residual -> train targets = n-step return - V_h(x_t)
 #
-# Stage 1: DATA COLLECTION (planner behaviour)
-# ---------------------------------------------------------------------------
-# When ``planner_include_terminal_cost`` is FALSE the MPPI objective uses
-# ONLY running costs (tracking + safety penalties).  The SDF heuristic is
-# still computed and stored in every rollout so that offline training can
-# use it for bootstrapping or residual subtraction.
-#
-# Disabling terminal cost in the planner lets you learn from a policy that
-# does NOT already have a strong prior baked into its optimization, which
-# can expose signal that a residual learned on heuristic-biased data misses.
-
-safety_value_planner_include_terminal_cost: false   # false = planner ignores terminal cost
-
-# Stage 2: TRAINING (what the network learns)
-# ---------------------------------------------------------------------------
-#   direct   -> network predicts V(x) directly.
-#               Target = n-step return (heuristic used only for bootstrap).
-#   residual -> network predicts Delta(x) = V(x) - V_h(x).
-#               Target = n-step return - V_h(x_t).
-
-safety_value_training_mode: "direct"   # "direct" | "residual"
-
-# Stage 3: DEPLOYMENT (how the planner uses the network)
-# ---------------------------------------------------------------------------
-#   heuristic -> V(x) = V_h(x)                (ignore network; ablation baseline)
-#   direct    -> V(x) = network(x)            (learned replaces heuristic)
-#   residual  -> V(x) = V_h(x) + network(x)   (learned corrects heuristic)
-
-safety_value_deployment_mode: "direct"   # "heuristic" | "direct" | "residual"
-
-# Backward-compatibility master switch.
-# Setting this to false forces deployment_mode = "heuristic" regardless of
-# the value above, and disables online adaptation.
-safety_value_use_learned_residual: false
+safety_value_mode: "off"   # "off" | "heuristic" | "direct" | "residual"
 
 # ---- Network architecture --------------------------------------------------
 safety_value_hidden_dim: 256
-safety_value_use_layer_norm: true
-safety_value_use_residual_connection: false
-safety_value_use_feature_norm: true
+safety_value_use_layer_norm: false
+safety_value_use_feature_norm: false
 
 # ---- Training hyperparameters ----------------------------------------------
 safety_value_n_step: *horizon_length
-safety_value_gamma: 0.99
+safety_value_gamma: *mps_gamma
 safety_value_lr: 1e-4
 safety_value_batch_size: 4096
-safety_value_num_epochs: 1500
+safety_value_num_epochs: 13500
 safety_value_grad_clip: 100.0
 safety_value_target_clip: 5000.0
 
-# Descent penalty (Baltussen et al.) — DISABLED BY DEFAULT.
-# See safety_value.py module docstring for why this is experimental.
-safety_value_use_descent_penalty: false
-safety_value_descent_penalty_weight: 0.1
-
-# Online inline adaptation
-safety_value_use_online_adaptation: false
-safety_value_train_every: 5
-safety_value_n_inner_steps: 1
-safety_value_time_budget_ms: 5.0
-
 # Warm-start from pre-trained checkpoint (optional)
-safety_value_checkpoint_path: "logs/safety_value_checkpoint"
+safety_value_checkpoint_path: "safety_filter/quad/safety_value_checkpoint"
 
 # Dump MPPI rollouts to disk for offline pre-training (optional)
-safety_value_data_dir: "logs/safety_value_rollouts"
-
-# ---- Reserved for future use ----
-# Dynamic obstacle cost parameters (currently handled via SDF projection)
-# dynamic_obs_cost_weight: 2000.0
-# dynamic_obs_cost_scale: 0.8
-# mpc_latency_compensation: 1.3
-# dpcbf_k: 100
+safety_value_data_dir: null # null | "logs/safety_value_rollouts"

@@ -1,56 +1,19 @@
-"""Safety terminal value function: structured heuristic + learned residual.
+"""Safety terminal value function: heuristic + learned residual.
 
 Decomposition:  V(x) = V_heuristic(x) + Delta(x)
 
-V_heuristic  : analytic SDF-based prior, zero parameters, scene-invariant.
-Delta        : small Flax MLP residual, trained on MPPI rollout data.
+V_heuristic: analytic SDF-based prior, zero parameters, scene-invariant.
+Delta: small Flax MLP, trained on MPPI rollout data.
 
-The residual target is n-step return minus heuristic:
-    Delta_target(x_t) = [ sum_{k=t}^{t+n} gamma^{k-t} c_k + gamma^n V_h(x_{t+n}) ]
-                        - V_h(x_t)
-
-This is n-step TD learning on the residual.  The heuristic provides a strong
-prior so the network only learns what the analytic model misses.
-
-------------------------------------------------------------------------
-ABLATION DESIGN
-------------------------------------------------------------------------
-Every learnable enhancement is guarded by a flag in ``SafetyValueConfig``
-so you can toggle it systematically:
-
-    use_learned_residual      – baseline: heuristic-only when False
-    use_feature_norm          – normalize input features per-batch
-    use_layer_norm            – LayerNorm in the MLP
-    use_residual_connection   – skip connection in the MLP
-    use_descent_penalty       – Baltussen-style soft descent penalty
-    use_online_adaptation     – inline SGD updates during deployment
-    n_step                    – TD target horizon (1, 3, 5, ...)
-    hidden_dim                – MLP width (32, 64, 128, ...)
-
-Recommended ablation protocol:
-    1. Heuristic-only  (use_learned_residual=False)
-    2. Residual, all bells off
-    3. + feature_norm
-    4. + layer_norm
-    5. + residual_connection
-    6. + descent_penalty   (usually hurts; see note below)
-    7. + online_adaptation
-
-NOTE ON THE DESCENT PENALTY
----------------------------
-Baltussen et al. (CDC 2025) enforce a Lyapunov-style descent condition
-    V(x_{t+1}) - V(x_t) <= -cost_t
-via scenario optimization.  This is rigorous for **stabilization to a fixed
-origin**.  DoomMPC is **trajectory tracking through changing obstacle scenes**;
-the "value" is cost-to-go, not a stabilizing Lyapunov function.  Enforcing
-descent can conflict with the residual learning the true cost-to-go geometry.
-Therefore the penalty is **disabled by default** and should be treated as an
-experimental ablation only.
+Controlled by ``safety_value_mode`` in config:
+    "off"       – no terminal cost, planner ignores value
+    "heuristic" – SDF heuristic only (no network)
+    "direct"    – learned V(x) net replaces heuristic
+    "residual"  – learned Delta(x) net corrects heuristic
 """
 
 from typing import Tuple, Any, Optional
 from dataclasses import dataclass
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -70,64 +33,27 @@ from safety_filter.quad.foot_projection import (
 
 @dataclass
 class SafetyValueConfig:
-    """Hyper-parameters for the learned safety terminal value.
+    """Safety terminal value hyperparameters."""
 
-    Every field is a single toggle/dial so you can run clean ablations.
-    """
+    mode: str = "heuristic"  # "off" | "heuristic" | "direct" | "residual"
 
-    # ---- Master switch (backward compatibility) -----------------------------
-    use_learned_residual: bool = True
-    """If False, terminal_cost() always returns the heuristic."""
-
-    # ---- Training mode -------------------------------------------------------
-    training_mode: str = "residual"
-    """How to form training targets.
-
-    ``direct``   -> network predicts V(x) directly.
-                    Target = n-step return (bootstrapped with heuristic).
-    ``residual`` -> network predicts Delta(x) = V(x) - V_h(x).
-                    Target = n-step return - V_h(x_t).
-    """
-
-    # ---- Deployment mode -----------------------------------------------------
-    deployment_mode: str = "residual"
-    """How to combine network output with heuristic at inference.
-
-    ``heuristic`` -> V(x) = V_h(x)  (ignore network).
-    ``direct``    -> V(x) = network(x).
-    ``residual``  -> V(x) = V_h(x) + network(x).
-    """
-
-    # ---- Network architecture ------------------------------------------------
+    # Network architecture
     hidden_dim: int = 128
     use_layer_norm: bool = False
-    use_residual_connection: bool = False
 
-    # ---- Training ------------------------------------------------------------
+    # Feature preprocessing
+    use_feature_norm: bool = False
+
+    # Training
     n_step: int = 3
     gamma: float = 0.99
     learning_rate: float = 3e-4
-    lr_decay_epochs: int = 30    # cosine decay to 0 over this many epochs
     batch_size: int = 256
-    num_epochs: int = 30         # offline pre-training only
-    grad_clip: float = 1.0       # global norm clipping
-    target_clip: float = 5000.0  # clip residual targets to this range
+    num_epochs: int = 30
+    grad_clip: float = 1.0
+    target_clip: float = 5000.0
 
-    # ---- Feature preprocessing -----------------------------------------------
-    use_feature_norm: bool = False
-
-    # ---- Descent penalty (Baltussen et al.) ----------------------------------
-    # WARNING: see module docstring.  Default OFF.
-    use_descent_penalty: bool = False
-    descent_penalty_weight: float = 0.1
-
-    # ---- Online inline adaptation --------------------------------------------
-    use_online_adaptation: bool = True
-    train_every: int = 5
-    n_inner_steps: int = 1
-    time_budget_ms: float = 5.0
-
-    # ---- Warm-start from checkpoint ------------------------------------------
+    # Checkpoint for warm-start
     checkpoint_path: Optional[str] = None
 
 
@@ -137,11 +63,10 @@ class SafetyValueConfig:
 
 
 class SafetyValueNet(nn.Module):
-    """Tiny MLP for the residual Delta(x)."""
+    """Two-hidden-layer MLP for V(x) or Delta(x)."""
 
     hidden_dim: int = 128
     use_layer_norm: bool = False
-    use_residual_connection: bool = False
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -149,20 +74,10 @@ class SafetyValueNet(nn.Module):
         if self.use_layer_norm:
             h = nn.LayerNorm()(h)
         h = nn.relu(h)
-
-        if self.use_residual_connection:
-            residual = h
-            h = nn.Dense(self.hidden_dim)(h)
-            if self.use_layer_norm:
-                h = nn.LayerNorm()(h)
-            h = nn.relu(h)
-            h = h + residual
-        else:
-            h = nn.Dense(self.hidden_dim)(h)
-            if self.use_layer_norm:
-                h = nn.LayerNorm()(h)
-            h = nn.relu(h)
-
+        h = nn.Dense(self.hidden_dim)(h)
+        if self.use_layer_norm:
+            h = nn.LayerNorm()(h)
+        h = nn.relu(h)
         out = nn.Dense(1)(h)
         return out.squeeze()
 
@@ -326,7 +241,7 @@ def normalize_features(
 
 
 def _vectorized_heuristic(task, xpos, xquat, qvel) -> jnp.ndarray:
-    """Vectorized heuristic over a batch of states."""
+    """Vectorized SDF heuristic over a batch of states."""
     N = xpos.shape[0]
     base_xy = xpos[:, task.base_body_id, :2]
 
@@ -353,7 +268,7 @@ def _vectorized_heuristic(task, xpos, xquat, qvel) -> jnp.ndarray:
 
 
 def compute_heuristic_terminal_cost(task, state) -> jnp.ndarray:
-    """Scalar heuristic terminal cost."""
+    """Scalar SDF heuristic terminal cost."""
     if task.obstacle_sdf.num_obstacles == 0:
         return jnp.array(0.0)
 
@@ -383,22 +298,16 @@ def compute_heuristic_terminal_cost(task, state) -> jnp.ndarray:
 def compute_nstep_targets(
     task,
     train_data: Any,
-    n: int = 3,
-    gamma: float = 0.99,
-    training_mode: str = "residual",
+    cfg: SafetyValueConfig,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Compute n-step TD training targets from MPPI rollout data.
 
-    Supports two training modes:
+    mode="direct"   -> target = n-step return (network predicts V(x) directly)
+    mode="residual" -> target = n-step return - V_h(x_t) (network predicts Delta)
 
-        ``direct``   -> target = G_t^{(n)}  (network predicts V(x) directly)
-        ``residual`` -> target = G_t^{(n)} - V_h(x_t)  (network predicts residual)
-
-    where  G_t^{(n)} = sum_{k=t}^{t+n-1} gamma^{k-t} c_k + gamma^n * V_h(x_{t+n}).
-
-    If ``train_data.heuristic_values`` is present (new data format), it is used
-    directly; otherwise heuristics are recomputed from the stored states for
-    backward compatibility with old rollout pickles.
+    If ``train_data.heuristic_values`` is present, it is used directly;
+    otherwise heuristics are recomputed from stored states for backward
+    compatibility with old rollout pickles.
 
     Returns:
         features: (N, 39)
@@ -407,7 +316,7 @@ def compute_nstep_targets(
     B, H_plus_1 = train_data.costs.shape
     costs = train_data.costs  # (B, H+1)
 
-    # Flatten batch × time so vectorized extractors see (N, ...) not (B, T, ...)
+    # Flatten batch x time so vectorized extractors see (N, ...) not (B, T, ...)
     xpos = train_data.states.xpos          # (B, T, nbody, 3)
     xquat = train_data.states.xquat        # (B, T, nbody, 4)
     qvel = train_data.states.qvel          # (B, T, nv)
@@ -430,16 +339,15 @@ def compute_nstep_targets(
         heuristics_flat = _vectorized_heuristic(task, xpos_flat, xquat_flat, qvel_flat)
         heuristics = heuristics_flat.reshape(B, H_plus_1)
 
-    # NOTE: costs[k] in train_data are already pre-discounted by gamma^k
-    # in the planner (see get_rollouts: effective_cost = ... * discount).
-    # To recover the standard n-step TD target we must divide by gamma^t.
+    n = cfg.n_step
+    gamma = cfg.gamma
     targets = jnp.zeros((B, H_plus_1))
 
     for t in range(H_plus_1):
         end = min(t + n, H_plus_1)
 
         # costs[t:end] already contain gamma^{t+j} factors.
-        # Summing and dividing by gamma^t gives sum_j raw_{t+j} * gamma^j * dt.
+        # Summing and dividing by gamma^t recovers sum_j raw_{t+j} * gamma^j.
         step_sum = jnp.sum(costs[:, t:end], axis=1) / (gamma ** t)
 
         if t + n < H_plus_1:
@@ -449,7 +357,7 @@ def compute_nstep_targets(
 
         nstep_return = step_sum + bootstrap
 
-        if training_mode == "direct":
+        if cfg.mode == "direct":
             targets = targets.at[:, t].set(nstep_return)
         else:
             # residual mode (default)
@@ -471,38 +379,23 @@ def _build_network(cfg: SafetyValueConfig):
     return SafetyValueNet(
         hidden_dim=cfg.hidden_dim,
         use_layer_norm=cfg.use_layer_norm,
-        use_residual_connection=cfg.use_residual_connection,
     )
 
 
 def init_network(rng: jax.Array, feature_dim: int, cfg: SafetyValueConfig):
-    """Initialize the residual network and return (params, apply_fn)."""
+    """Initialize the network and return (params, apply_fn)."""
     net = _build_network(cfg)
     dummy = jnp.ones((1, feature_dim))
     params = net.init(rng, dummy)
     return params, net.apply
 
 
-def compute_descent_penalty(
-    apply_fn, params, features: jnp.ndarray, costs: jnp.ndarray
-) -> jnp.ndarray:
-    """Soft descent penalty (Baltussen et al., CDC 2025).
-
-    Penalizes  V(x_{t+1}) - V(x_t) + cost_t > 0  along consecutive samples.
-    See module docstring for why this is experimental.
-    """
-    preds = apply_fn(params, features)
-    delta_v = preds[1:] - preds[:-1]
-    violation = delta_v + costs[:-1]
-    return jnp.mean(jax.nn.relu(violation))
-
-
 def make_train_step(apply_fn, cfg: SafetyValueConfig):
-    """Build a JITted training step with gradient clipping and constant LR.
+    """Build a JITted training step with gradient clipping.
 
     Returns:
         train_step: JITted function (params, opt_state, features, targets, costs)
-        optimizer:  optax.GradientTransformation (caller must init with optimizer.init(params))
+        optimizer:  optax.GradientTransformation
     """
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),
@@ -513,12 +406,7 @@ def make_train_step(apply_fn, cfg: SafetyValueConfig):
     def train_step(params, opt_state, features, targets, costs):
         def loss_fn(p):
             preds = apply_fn(p, features)
-            mse = jnp.mean((preds - targets) ** 2)
-
-            if cfg.use_descent_penalty and cfg.descent_penalty_weight > 0.0:
-                descent = compute_descent_penalty(apply_fn, p, features, costs)
-                return mse + cfg.descent_penalty_weight * descent
-            return mse
+            return jnp.mean((preds - targets) ** 2)
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -528,75 +416,14 @@ def make_train_step(apply_fn, cfg: SafetyValueConfig):
     return train_step, optimizer
 
 
-def train_safety_value(
-    task,
-    train_data: Any,
-    cfg: SafetyValueConfig,
-    rng_key: Optional[jax.Array] = None,
-) -> Tuple[Any, Any, Optional[dict]]:
-    """Train the residual network on a batch of MPPI rollouts.
-
-    Returns:
-        params    : trained Flax parameters
-        apply_fn  : network apply function
-        stats     : feature normalization statistics (or None)
-    """
-    rng = rng_key if rng_key is not None else jax.random.PRNGKey(0)
-
-    features, targets = compute_nstep_targets(
-        task,
-        train_data,
-        n=cfg.n_step,
-        gamma=cfg.gamma,
-        training_mode=cfg.training_mode,
-    )
-
-    feat_stats = None
-    if cfg.use_feature_norm:
-        features, feat_stats = normalize_features(features)
-
-    N = features.shape[0]
-    params, apply_fn = init_network(rng, features.shape[-1], cfg)
-    train_step, optimizer = make_train_step(apply_fn, cfg)
-    opt_state = optimizer.init(params)
-
-    costs = train_data.costs.reshape(-1)
-    if costs.shape[0] != N:
-        costs = jnp.broadcast_to(costs[:1], (N,))
-
-    for epoch in range(cfg.num_epochs):
-        rng, subrng = jax.random.split(rng)
-        perm = jax.random.permutation(subrng, N)
-        features_shuf = features[perm]
-        targets_shuf = targets[perm]
-        costs_shuf = costs[perm]
-
-        epoch_loss = 0.0
-        num_batches = 0
-        for i in range(0, N, cfg.batch_size):
-            end = min(i + cfg.batch_size, N)
-            f_batch = features_shuf[i:end]
-            t_batch = targets_shuf[i:end]
-            c_batch = costs_shuf[i:end]
-            params, opt_state, loss = train_step(
-                params, opt_state, f_batch, t_batch, c_batch
-            )
-            epoch_loss += float(loss)
-            num_batches += 1
-
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch:3d} | loss = {epoch_loss / num_batches:.4f}")
-
-    preds = apply_fn(params, features)
-    final_mse = float(jnp.mean((preds - targets) ** 2))
-    print(f"Final MSE = {final_mse:.4f}")
-
-    return params, apply_fn, feat_stats
-
-
 # =============================================================================
 # SERIALISATION HELPERS
 # =============================================================================
+
+
+import numpy as np
+from pathlib import Path
+from flax.serialization import msgpack_serialize, msgpack_restore
 
 
 def params_to_dict(params):
@@ -607,11 +434,6 @@ def params_to_dict(params):
 def params_from_dict(d):
     """Restore Flax params from a plain dict."""
     return jax.tree_util.tree_map(lambda x: jnp.asarray(x), d)
-
-
-import numpy as np
-from pathlib import Path
-from flax.serialization import msgpack_serialize, msgpack_restore
 
 
 def save_checkpoint(params, path: str):
@@ -636,140 +458,3 @@ def load_feature_stats(path: str) -> dict:
     """Load feature normalization stats."""
     data = np.load(path)
     return {"mean": jnp.asarray(data["mean"]), "std": jnp.asarray(data["std"])}
-
-
-def normalize_targets(targets: jnp.ndarray) -> Tuple[jnp.ndarray, dict]:
-    """Standardize targets to zero mean / unit variance."""
-    mean = jnp.mean(targets)
-    std = jnp.std(targets) + 1e-6
-    return (targets - mean) / std, {"mean": mean, "std": std}
-
-
-def denormalize_targets(targets_norm: jnp.ndarray, stats: dict) -> jnp.ndarray:
-    """Convert standardized targets back to original scale."""
-    return targets_norm * stats["std"] + stats["mean"]
-
-
-# =============================================================================
-# INLINE TRAINER (deterministic, cycle-skipping, JIT, zero threads)
-# =============================================================================
-
-
-class InlineSafetyValueTrainer:
-    """Inline trainer that performs a tiny number of JITted gradient steps.
-
-    No Python threads.  Training happens on the same GPU stream as MPPI,
-    but only every ``cfg.train_every`` planning cycles.
-    """
-
-    def __init__(self, cfg: SafetyValueConfig):
-        self.cfg = cfg
-        rng = jax.random.PRNGKey(0)
-
-        self._feat_stats: Optional[dict] = None
-        self._target_stats: Optional[dict] = None
-
-        ckpt = cfg.checkpoint_path
-        if ckpt is not None and Path(ckpt).is_file():
-            self._params = load_checkpoint(ckpt)
-            net = _build_network(cfg)
-            self._apply_fn = lambda p, x: net.apply(p, x)
-            # Load pre-computed feature stats if they exist next to checkpoint
-            stats_path = str(Path(ckpt).with_suffix(".stats.npz"))
-            if Path(stats_path).exists():
-                self._feat_stats = load_feature_stats(stats_path)
-            # Load target normalization stats if present
-            target_stats_path = str(Path(ckpt).with_suffix(".targets.npz"))
-            if Path(target_stats_path).exists():
-                data = np.load(target_stats_path)
-                self._target_stats = {
-                    "mean": float(data["mean"]),
-                    "std": float(data["std"]),
-                }
-        else:
-            if ckpt is not None and not Path(ckpt).exists():
-                print(
-                    f"[InlineSafetyValueTrainer] WARNING: checkpoint_path='{ckpt}' "
-                    "does not exist.  Falling back to random initialization.",
-                    flush=True,
-                )
-            self._params, self._apply_fn = init_network(rng, 39, cfg)
-
-        self._optimizer = optax.chain(
-            optax.clip_by_global_norm(cfg.grad_clip),
-            optax.adam(cfg.learning_rate),
-        )
-        self._opt_state = self._optimizer.init(self._params)
-        self._rng = rng
-        self._jit_step = jax.jit(self._make_step_fn())
-
-    def _make_step_fn(self):
-        def _step(params_opt, features, targets, costs):
-            params, opt_state = params_opt
-
-            def loss_fn(p):
-                preds = self._apply_fn(p, features)
-                mse = jnp.mean((preds - targets) ** 2)
-
-                if self.cfg.use_descent_penalty and self.cfg.descent_penalty_weight > 0.0:
-                    descent = compute_descent_penalty(
-                        self._apply_fn, p, features, costs
-                    )
-                    return mse + self.cfg.descent_penalty_weight * descent
-                return mse
-
-            loss, grads = jax.value_and_grad(loss_fn)(params)
-            updates, opt_state = self._optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            return (params, opt_state), loss
-
-        return _step
-
-    def maybe_train(
-        self,
-        features: jnp.ndarray,
-        targets: jnp.ndarray,
-        costs: jnp.ndarray,
-        step_counter: int,
-    ) -> Optional[Any]:
-        """Conditionally train and return updated params, or None."""
-        if not self.cfg.use_online_adaptation:
-            return None
-        if step_counter % self.cfg.train_every != 0:
-            return None
-
-        N = features.shape[0]
-        if N == 0:
-            return None
-
-        if self.cfg.use_feature_norm:
-            features, self._feat_stats = normalize_features(
-                features, self._feat_stats
-            )
-
-        # Online target normalization: compute mean/std from current batch if
-        # we don't have offline pre-computed stats.  This centers targets so
-        # the network learns pattern, not mean-fighting.
-        if self._target_stats is None:
-            t_mean = float(jnp.mean(targets))
-            t_std = float(jnp.std(targets)) + 1e-6
-            self._target_stats = {"mean": t_mean, "std": t_std}
-        targets_norm = (targets - self._target_stats["mean"]) / self._target_stats["std"]
-
-        self._rng, subrng = jax.random.split(self._rng)
-        perm = jax.random.permutation(subrng, N)
-        end = min(self.cfg.batch_size, N)
-        fb = features[perm[:end]]
-        tb = targets_norm[perm[:end]]
-        cb = costs[perm[:end]]
-
-        for _ in range(self.cfg.n_inner_steps):
-            (self._params, self._opt_state), _ = self._jit_step(
-                (self._params, self._opt_state), fb, tb, cb
-            )
-
-        return self._params
-
-    def get_params(self) -> Any:
-        """Return the current params without training."""
-        return self._params

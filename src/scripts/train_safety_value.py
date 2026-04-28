@@ -3,16 +3,17 @@
 
 Usage:
     # Use config file as source of truth (recommended)
-    python scripts/train_safety_value.py \
-        --config controllers/config/rl_mps_go2_cfg.yaml \
-        --data-dir data/safety_value_rollouts/ \
+    python scripts/train_safety_value.py \\
+        --config controllers/config/rl_mps_go2_cfg.yaml \\
+        --data-dir data/safety_value_rollouts/ \\
         --output checkpoints/safety_value_pretrain.msgpack
 
     # Override specific hyperparameters via CLI
-    python scripts/train_safety_value.py \
-        --config controllers/config/rl_mps_go2_cfg.yaml \
-        --data-dir data/safety_value_rollouts/ \
-        --num-epochs 50 \
+    python scripts/train_safety_value.py \\
+        --config controllers/config/rl_mps_go2_cfg.yaml \\
+        --data-dir data/safety_value_rollouts/ \\
+        --mode direct \\
+        --num-epochs 50 \\
         --lr 1e-4
 
 The script reads all safety_value_* hyperparameters from the config file.
@@ -37,32 +38,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from safety_filter.quad.safety_value import (
     SafetyValueConfig,
     compute_nstep_targets,
-    denormalize_targets,
     init_network,
     make_train_step,
     normalize_features,
-    normalize_targets,
     save_checkpoint,
     save_feature_stats,
 )
 from safety_filter.quad.task import QuadRLTask
-
-
-def _config_or_arg(rl_config: dict, key: str, arg_value, arg_default):
-    """Return CLI arg if user provided it, else read from config file.
-
-    Distinguishes "user didn't pass this arg" (arg_value == arg_default for
-    non-booleans) from "user explicitly wants the default". For booleans we
-    just use config as source of truth unless the flag was passed.
-    """
-    # argparse stores action="store_true" booleans as True/False.
-    # We can't distinguish "not passed" from "False" for booleans, so we
-    # always prefer config for booleans unless we use a sentinel.  Instead,
-    # we treat the config as authoritative and only CLI overrides for
-    # non-boolean numeric / string args.
-    if arg_value is not None and arg_value != arg_default:
-        return arg_value
-    return rl_config.get(key)
 
 
 def parse_args():
@@ -76,6 +58,9 @@ def parse_args():
                    default="logs/checkpoints/safety_value_pretrain.msgpack")
 
     # Override arguments — all default to None so we know when user provided them.
+    p.add_argument("--mode", type=str, default=None,
+                   choices=["direct", "residual"],
+                   help="Training mode (default: from config file)")
     p.add_argument("--num-epochs", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--batch-size", type=int, default=None)
@@ -84,13 +69,8 @@ def parse_args():
     p.add_argument("--hidden-dim", type=int, default=None)
     p.add_argument("--layer-norm", action="store_true", default=False)
     p.add_argument("--no-layer-norm", action="store_true", default=False)
-    p.add_argument("--residual-conn", action="store_true", default=False)
-    p.add_argument("--no-residual-conn", action="store_true", default=False)
     p.add_argument("--feature-norm", action="store_true", default=False)
     p.add_argument("--no-feature-norm", action="store_true", default=False)
-    p.add_argument("--training-mode", type=str, default=None,
-                   choices=["direct", "residual"])
-    p.add_argument("--descent-penalty", type=float, default=None)
     p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--target-clip", type=float, default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -104,13 +84,11 @@ def build_config(rl_config: dict, args) -> SafetyValueConfig:
     """Build SafetyValueConfig from config file, allowing CLI overrides."""
 
     def _get(key, arg, default):
-        """Priority: CLI arg > config file > code default."""
         if arg is not None:
             return arg
         return rl_config.get(key, default)
 
     def _bool(key, enable_flag, disable_flag, default):
-        """Handle boolean overrides with both --flag and --no-flag."""
         if enable_flag:
             return True
         if disable_flag:
@@ -118,15 +96,10 @@ def build_config(rl_config: dict, args) -> SafetyValueConfig:
         return rl_config.get(key, default)
 
     return SafetyValueConfig(
-        use_learned_residual=True,  # always true for offline training
-        training_mode=_get("safety_value_training_mode", args.training_mode, "residual"),
-        deployment_mode="residual",  # offline training does not deploy
+        mode=_get("safety_value_mode", args.mode, "residual"),
         hidden_dim=int(_get("safety_value_hidden_dim", args.hidden_dim, 128)),
         use_layer_norm=_bool(
             "safety_value_use_layer_norm", args.layer_norm, args.no_layer_norm, False
-        ),
-        use_residual_connection=_bool(
-            "safety_value_use_residual_connection", args.residual_conn, args.no_residual_conn, False
         ),
         use_feature_norm=_bool(
             "safety_value_use_feature_norm", args.feature_norm, args.no_feature_norm, False
@@ -138,12 +111,6 @@ def build_config(rl_config: dict, args) -> SafetyValueConfig:
         num_epochs=int(_get("safety_value_num_epochs", args.num_epochs, 30)),
         grad_clip=float(_get("safety_value_grad_clip", args.grad_clip, 1.0)),
         target_clip=float(_get("safety_value_target_clip", args.target_clip, 5000.0)),
-        use_descent_penalty=_get("safety_value_use_descent_penalty", None, False)
-        if args.descent_penalty is None
-        else (args.descent_penalty > 0.0),
-        descent_penalty_weight=float(_get(
-            "safety_value_descent_penalty_weight", args.descent_penalty, 0.1
-        )),
     )
 
 
@@ -189,11 +156,10 @@ def main():
     print("=" * 60)
     print(f"Config file: {args.config}")
     print(f"Data dir: {args.data_dir}")
-    print(f"Training mode: {cfg.training_mode}")
+    print(f"Mode: {cfg.mode}")
     print(f"Epochs: {cfg.num_epochs} | LR: {cfg.learning_rate} | Batch: {cfg.batch_size}")
     print(f"N-step: {cfg.n_step} | Gamma: {cfg.gamma}")
-    print(f"Descent penalty: {cfg.descent_penalty_weight if cfg.use_descent_penalty else 0.0}")
-    print(f"Hidden dim: {cfg.hidden_dim} | LayerNorm: {cfg.use_layer_norm} | Residual: {cfg.use_residual_connection}")
+    print(f"Hidden dim: {cfg.hidden_dim} | LayerNorm: {cfg.use_layer_norm}")
     print(f"Feature norm: {cfg.use_feature_norm}")
     print("=" * 60)
 
@@ -218,7 +184,7 @@ def main():
     import hashlib
     cache_key_str = (
         f"{args.data_dir}:{args.filter_seed}:{cfg.n_step}:{cfg.gamma}:"
-        f"{cfg.use_feature_norm}:{len(rollout_data)}:{cfg.training_mode}"
+        f"{cfg.use_feature_norm}:{len(rollout_data)}:{cfg.mode}"
     )
     cache_key = hashlib.md5(cache_key_str.encode()).hexdigest()
     cache_dir = Path(args.cache_dir)
@@ -266,8 +232,7 @@ def main():
                 ),
             )
             features_chunk, targets_chunk = compute_nstep_targets(
-                task, batched_data, n=cfg.n_step, gamma=cfg.gamma,
-                training_mode=cfg.training_mode,
+                task, batched_data, cfg,
             )
             costs_chunk = batched_data.costs.reshape(-1)
             if costs_chunk.shape[0] != features_chunk.shape[0]:
@@ -325,12 +290,6 @@ def main():
     n_clipped = int(jnp.sum((targets <= -cfg.target_clip) | (targets >= cfg.target_clip)))
     if n_clipped > 0:
         print(f"  {n_clipped} samples hit clip boundary ({n_clipped/targets.shape[0]*100:.2f}%)")
-
-    targets, target_stats = normalize_targets(targets)
-    print(
-        f"  Target normalized: mean={target_stats['mean']:.2f} "
-        f"std={target_stats['std']:.2f}"
-    )
 
     feat_stats = None
     if cfg.use_feature_norm:
@@ -423,8 +382,7 @@ def main():
     print(f"\nFinal validation  MSE={val_mse:.2f} RMSE={val_rmse:.2f} R²={val_r2:.4f}")
     print(f"Best validation R² during training: {best_val_r2:.4f}")
 
-    preds_val_norm = apply_fn(params, f_val)
-    preds_val = denormalize_targets(preds_val_norm, target_stats)
+    preds_val = apply_fn(params, f_val)
     print(
         f"Residual range on val: [{float(jnp.min(preds_val)):.2f}, "
         f"{float(jnp.max(preds_val)):.2f}]"
@@ -438,10 +396,6 @@ def main():
         stats_path = str(Path(args.output).with_suffix(".stats.npz"))
         save_feature_stats(feat_stats, stats_path)
         print(f"Feature stats saved to {stats_path}")
-
-    target_stats_path = str(Path(args.output).with_suffix(".targets.npz"))
-    np.savez(target_stats_path, mean=float(target_stats["mean"]), std=float(target_stats["std"]))
-    print(f"Target stats saved to {target_stats_path}")
 
 
 if __name__ == "__main__":
