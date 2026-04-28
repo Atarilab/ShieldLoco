@@ -40,6 +40,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         gamma: float = 0.99,
         safety_weight: float = 1e3,
         collect_data: bool = False,
+        use_momentum: bool = False,
+        momentum: float = 0.5,
         top_fraction: float = 0.01,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
@@ -77,6 +79,8 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             safety_weight=safety_weight,
             collect_data=collect_data,
             top_fraction=top_fraction,
+            use_momentum=use_momentum,
+            momentum=momentum,
             p_max=p_max,
             c_max_decay=c_max_decay,
             include_terminal_cost=include_terminal_cost,
@@ -92,6 +96,9 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         self.safety_weight = safety_weight
         self.collect_data = collect_data
         self.top_fraction = top_fraction
+
+        self.use_momentum = use_momentum
+        self.momentum = momentum
 
     def update_with_plan(self, state, params):
         def _optimize_scan_body(params, _):
@@ -149,6 +156,14 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         new_best = rollouts.plans[jnp.argmin(costs)]
 
+        if self.use_momentum:
+            # S Sanokowski, et. al. formulation
+            new_mean = new_mean + (self.momentum / (1 - self.momentum)) * (params.mean - new_mean)
+
+            # TODO: add variance updates to MPPI and Replica Exchange
+            # Select alpha < (self.momentum + 1) to avoid singularities
+            # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
+        
         return params.replace(
             mean=new_mean,
             best_plan=new_best,

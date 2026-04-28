@@ -66,6 +66,8 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
         safety_weight: float = 1e3,
         collect_data: bool = False,
         top_fraction: float = 0.01,
+        use_momentum: bool = False,
+        momentum: float = 0.5,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
@@ -103,6 +105,8 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
             safety_weight=safety_weight,
             collect_data=collect_data,
             top_fraction=top_fraction,
+            use_momentum=use_momentum,
+            momentum=momentum,
             p_max=p_max,
             c_max_decay=c_max_decay,
             include_terminal_cost=include_terminal_cost,
@@ -217,13 +221,29 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
 
         new_std = jnp.maximum(new_std, 1e-6)
 
-        decayed_std = self.cross_entropy_decay * new_std + (1 - self.cross_entropy_decay) * self.noise_level
+
+        if self.use_momentum:
+            # S Sanokowski, et. al. formulation
+            new_mean = new_mean + (self.momentum / (1 - self.momentum)) * (params.mean - new_mean)
+
+            # Select alpha < (self.momentum + 1) to avoid singularities
+            # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
+
+            new_variance = new_std ** 2
+            old_variance = params.std ** 2
+            
+            alpha = (self.momentum + 1) * 0.1
+
+            new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (old_variance - new_variance) + alpha * new_variance)
+            new_std = jnp.sqrt(jnp.maximum(new_variance, 1e-6))
+        else:
+            new_std = self.cross_entropy_decay * new_std + (1 - self.cross_entropy_decay) * self.noise_level
 
         new_best = plans[jnp.argmin(costs)]
 
         return params.replace(
             mean=new_mean,
-            std=decayed_std,
+            std=new_std,
             best_plan=new_best,
         )
 

@@ -101,6 +101,8 @@ def create_planner(alg_name, task, config):
         "safety_weight": config.get("mps_safety_weight", 1.0),
         "collect_data": config.get("mps_collect_data", False),
         "top_fraction": config.get("mps_top_fraction", 0.01),
+        "momentum": config.get("mps_momentum", 0.5),
+        "use_momentum": config.get("mps_use_momentum", True),
         "include_terminal_cost": config.get(
             "safety_value_planner_include_terminal_cost", True
         ),
@@ -765,7 +767,7 @@ def _safety_worker_main(
                 time=jnp.asarray(latest_state.get("time")),
             )
             # Refresh derived kinematics/contact fields after injecting raw state.
-            task.data = jit_mjx_forward(task.model, task.data)
+            # task.data = jit_mjx_forward(task.model, task.data)
             
             task_params = task.update_params(task_params, latest_state)
 
@@ -833,7 +835,7 @@ def _safety_worker_main(
             override = True
             exec_plan = np.asarray(policy_params.exec_plan)
 
-            _add_log(shared_result, f"[SAFETY] Optimization completed: exec_plan shape={exec_plan.shape}, override={override}")
+            # _add_log(shared_result, f"[SAFETY] Optimization completed: exec_plan shape={exec_plan.shape}, override={override}")
 
             best_costs = None
 
@@ -845,7 +847,7 @@ def _safety_worker_main(
 
                 if qpos_traj.ndim == 3 and qpos_traj.shape[0] > 0:
                     if costs_traj.ndim > 1:
-                        _add_log(shared_result, f"[SAFETY] WARNING: costs_traj is multidimensional {costs_traj.shape}, using axis=0 argmin")
+                        # _add_log(shared_result, f"[SAFETY] WARNING: costs_traj is multidimensional {costs_traj.shape}, using axis=0 argmin")
                         best_idx = np.argmin(costs_traj, axis=0)[0]
                         if best_idx >= qpos_traj.shape[0]:
                             best_idx = 0
@@ -855,7 +857,7 @@ def _safety_worker_main(
                             constraint_traj[best_idx] if constraint_traj.ndim > 1 else constraint_traj
                         )
                     elif costs_traj.shape[0] != qpos_traj.shape[0]:
-                        _add_log(shared_result, f"[SAFETY] WARNING: costs_traj size ({costs_traj.shape[0]}) != qpos_traj size ({qpos_traj.shape[0]}), skipping best_qpos selection")
+                        # _add_log(shared_result, f"[SAFETY] WARNING: costs_traj size ({costs_traj.shape[0]}) != qpos_traj size ({qpos_traj.shape[0]}), skipping best_qpos selection")
                         best_qpos = None
                         best_costs = None
                         best_constraints = None
@@ -867,17 +869,20 @@ def _safety_worker_main(
                             constraint_traj[best_idx] if constraint_traj.ndim >= 2 else constraint_traj
                         )
                     
-                    if best_costs is not None:
-                        _add_log(shared_result, f"[SAFETY] Best costs: min={best_costs.min():.4f}, max={best_costs.max():.4f}, mean={best_costs.mean():.4f}, sum={best_costs.sum():.4f}")
-                    if best_constraints is not None:
-                        violations = np.sum(best_constraints > 0)
-                        total_constraints = best_constraints.shape[0] * best_constraints.shape[1]
-                        _add_log(shared_result, f"[SAFETY] Best constraints: violations={violations}/{total_constraints}, max_val={best_constraints.max():.4f}")
-                    # Distribution of constraint_sums across all top-B samples
-                    if constraint_traj.ndim == 2:
-                        c_sums = constraint_traj.sum(axis=1)
-                        n_safe = int(np.sum(c_sums == 0))
-                        _add_log(shared_result, f"[SAFETY] Top-B constraint_sums: min={c_sums.min():.1f}, mean={c_sums.mean():.1f}, max={c_sums.max():.1f}, n_safe={n_safe}/{len(c_sums)}")
+                    # if best_costs is not None:
+                    #     _add_log(shared_result, f"[SAFETY] Best costs: min={best_costs.min():.4f}, max={best_costs.max():.4f}, mean={best_costs.mean():.4f}, sum={best_costs.sum():.4f}")
+
+                    # if best_constraints is not None:
+                    #     violations = np.sum(best_constraints > 0)
+                    #     total_constraints = best_constraints.shape[0] * best_constraints.shape[1]
+                    #     _add_log(shared_result, f"[SAFETY] Best constraints: violations={violations}/{total_constraints}, max_val={best_constraints.max():.4f}")
+
+                    # # Distribution of constraint_sums across all top-B samples
+                    # if constraint_traj.ndim == 2:
+                    #     c_sums = constraint_traj.sum(axis=1)
+                    #     n_safe = int(np.sum(c_sums == 0))
+                    #     _add_log(shared_result, f"[SAFETY] Top-B constraint_sums: min={c_sums.min():.1f}, mean={c_sums.mean():.1f}, max={c_sums.max():.1f}, n_safe={n_safe}/{len(c_sums)}")
+
                 elif qpos_traj.ndim == 2:
                     best_qpos = qpos_traj
                     best_costs = costs_traj if costs_traj.ndim == 1 else None
@@ -949,7 +954,7 @@ def _safety_worker_main(
             if best_costs is not None:
                 shared_result["best_optimizer_cost"] = float(np.asarray(best_costs).sum())
 
-            _add_log(shared_result, f"[SAFETY] === Result Summary === seq={latest_seq}, override={override}, plan_shape={exec_plan.shape}")
+            # _add_log(shared_result, f"[SAFETY] === Result Summary === seq={latest_seq}, override={override}, plan_shape={exec_plan.shape}")
 
             elapsed = time.perf_counter() - loop_start
             shared_result["opt_elapsed_ms"] = float(elapsed * 1000)

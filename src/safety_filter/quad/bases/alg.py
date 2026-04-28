@@ -113,6 +113,8 @@ class QuadSamplingBasedPlanner(ABC):
         safety_weight: float = 1e3,
         collect_data: bool = False,
         top_fraction: float = 0.01,
+        use_momentum: bool = False,
+        momentum: float = 0.5,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
@@ -175,6 +177,8 @@ class QuadSamplingBasedPlanner(ABC):
         self.safety_weight = safety_weight
         self.collect_data = collect_data
         self.top_fraction = top_fraction
+        self.use_momentum = use_momentum
+        self.momentum = momentum
         self.gamma = gamma
         self.p_max = p_max
         self.c_max_decay = c_max_decay

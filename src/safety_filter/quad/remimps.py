@@ -89,6 +89,8 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
         safety_weight: float = 1e3,
         collect_data: bool = False,
         top_fraction: float = 0.01,
+        use_momentum: bool = False,
+        momentum: float = 0.5,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
@@ -110,6 +112,8 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             safety_weight=safety_weight,
             collect_data=collect_data,
             top_fraction=top_fraction,
+            use_momentum=use_momentum,
+            momentum=momentum,
             p_max=p_max,
             c_max_decay=c_max_decay,
             include_terminal_cost=include_terminal_cost,
@@ -390,6 +394,15 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
                 new_mean_k = jnp.sum(
                     weights[:, None, None] * increments, axis=0
                 )
+
+
+                if self.use_momentum:
+                    # S Sanokowski, et. al. formulation
+                    new_mean_k = new_mean_k + (self.momentum / (1 - self.momentum)) * (params_iter.mean_replicas[k] - new_mean_k)
+
+                    # TODO: add variance updates to MPPI and Replica Exchange
+                    # Select alpha < (self.momentum + 1) to avoid singularities
+                    # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
 
                 # Best plan for warm-starting
                 best_idx = jnp.argmin(costs_k)
