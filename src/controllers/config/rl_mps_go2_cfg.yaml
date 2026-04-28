@@ -81,7 +81,7 @@ transition_duration: 0
 # ----------------------------------------------------------------------------
 # OPTIMIZER
 # ----------------------------------------------------------------------------
-mps_alg_name: "CEMPS"  # MIMPS, REMIMPS, CEMPS, DMPS, CMPS
+mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, DMPS, CMPS
 
 # Common parameters (all optimizers)
 mps_num_samples: 1200
@@ -90,7 +90,7 @@ mps_iterations: 1
 mps_gamma: 0.99
 mps_safety_weight: 10
 mps_collect_data: true
-mps_top_fraction: 0.02
+mps_top_fraction: 0.3
 mps_policy_decimation: 1
 
 # Optimizer-specific parameters
@@ -139,7 +139,7 @@ projection_iters: 3          # Active-set QP iterations
 
 # Foot chain cost: penalizes step-to-step displacement (shuffling regularizer)
 # Weight guide: 0=off, 10=mild, 30=moderate, 50+=aggressive shuffle
-foot_chain_weight: 1.0
+foot_chain_weight: 5.0
 
 # Body SDF cost: penalizes body center near obstacles
 # margin: threshold distance (meters)
@@ -152,7 +152,7 @@ body_sdf_weight: 1.0
 # Foot path SDF cost: penalizes swing arcs through obstacles
 # Evaluates SDF at interpolated points between stance and planned positions
 foot_path_sdf_scale: 0.2
-foot_path_sdf_weight: 1.0
+foot_path_sdf_weight: 5.0
 
 # Foot tracking cost: penalizes deviation between actual and planned foot positions
 # S2-style cost accumulated during rollout

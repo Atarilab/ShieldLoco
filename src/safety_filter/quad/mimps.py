@@ -100,16 +100,30 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
             params = self.f(state, params, plans)
 
-            # Only return train_data from last iteration to save memory
-            return params, _
+            # f() sets train_data — extract it and remove from carry
+            # so that the scan carry type stays consistent across iterations.
+            train_data = params.train_data
+            params = params.replace(train_data=None)
+
+            return params, train_data
 
         # Don't accumulate all iterations - only keep final iteration
-        params, _ = jax.lax.scan(
+        init_no_train = params.replace(train_data=None)
+        params, train_data_out = jax.lax.scan(
             f=_optimize_scan_body,
-            init=params,
+            init=init_no_train,
             xs=jnp.arange(self.iterations),
             length=self.iterations,
         )
+
+        # Restore train_data from the last scan iteration.
+        # jax.lax.scan always stacks ys along a new leading axis.
+        if train_data_out is not None:
+            def _take_last(x):
+                return x[-1]
+            params = params.replace(
+                train_data=jax.tree.map(_take_last, train_data_out)
+            )
 
         return params
 

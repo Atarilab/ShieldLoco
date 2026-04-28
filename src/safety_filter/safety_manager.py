@@ -388,7 +388,6 @@ class SafetyManager:
             "dynamic_obstacle_t0": kwargs.get("dynamic_obstacle_t0"),
             "dynamic_obstacle_active": kwargs.get("dynamic_obstacle_active"),
             "dynamic_obstacle_radii": kwargs.get("dynamic_obstacle_radii"),
-            "mocap_obstacle_positions": kwargs.get("mocap_obstacle_positions"),
         }
         current_seq = int(self._shared_state.get("seq", 0)) + 1
         self._shared_state["payload"] = payload
@@ -610,6 +609,11 @@ def _init_worker_objects(mj_model_path, rl_policy, rl_config):
         nconmax=_ncon_per_world * _num_samples,
         njmax=_njmax,
     )
+    print(
+        f"[WORKER] Buffer: nconmax={_ncon_per_world * _num_samples} "
+        f"({_ncon_per_world}×{_num_samples}), njmax={_njmax}, nbody={task.mj_model.nbody}",
+        flush=True,
+    )
     task_params = task.make_task_params()
 
     alg_name = rl_config.get("mps_alg_name", "MIMPS")
@@ -619,7 +623,8 @@ def _init_worker_objects(mj_model_path, rl_policy, rl_config):
     policy_params = planner.init_params(task_params=task_params, seed=random_seed)
     jit_optimize = jax.jit(planner.optimize)
     jit_dynamics = jax.jit(task.dynamics)
-    return task, task_params, policy_params, jit_optimize, jit_dynamics, random_seed
+    jit_mjx_forward = jax.jit(mjx.forward)
+    return task, task_params, policy_params, jit_optimize, jit_dynamics, jit_mjx_forward, random_seed
 
 
 # TODO: is it possible to decouple update and opt? might give a bump in speed
@@ -640,6 +645,7 @@ def _safety_worker_main(
     stop_event: Any,
 ):
     import os
+    import signal as _signal
     os.environ["XLA_FLAGS"] = (
         "--xla_gpu_triton_gemm_any=true "
         "--xla_gpu_autotune_level=4"
@@ -647,6 +653,12 @@ def _safety_worker_main(
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+    # Signal handler: set stop_event on SIGTERM so the worker can exit cleanly
+    # rather than being killed mid-JAX-call and leaking GPU memory.
+    def _on_term(signum, frame):
+        stop_event.set()
+    _signal.signal(_signal.SIGTERM, _on_term)
 
     try:
         from controllers.policies.policy import TorchScriptPolicy
@@ -656,7 +668,7 @@ def _safety_worker_main(
 
         rl_policy = TorchScriptPolicy(model_path, device="cuda")
 
-        task, task_params, policy_params, jit_optimize, jit_dynamics, random_seed = _init_worker_objects(mj_model_path, rl_policy, rl_config)
+        task, task_params, policy_params, jit_optimize, jit_dynamics, jit_mjx_forward, random_seed = _init_worker_objects(mj_model_path, rl_policy, rl_config)
 
         # ------------------------------------------------------------------
         # Inline safety-value trainer (deterministic, cycle-skipping, no threads)
@@ -753,14 +765,9 @@ def _safety_worker_main(
                 time=jnp.asarray(latest_state.get("time")),
             )
             # Refresh derived kinematics/contact fields after injecting raw state.
-            # task.data = jit_mjx_forward(task.model, task.data)
+            task.data = jit_mjx_forward(task.model, task.data)
             
             task_params = task.update_params(task_params, latest_state)
-
-            mocap_positions = latest_state.get("mocap_obstacle_positions")
-            if mocap_positions is not None:
-                task.data = task.data.replace(mocap_pos=jnp.array(mocap_positions))
-                task.update_obstacle_sdf(mocap_positions)
 
             ref_plan_normalized = task.get_reference_plan(
                 ref=latest_state.get("ref"),

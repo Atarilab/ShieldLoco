@@ -282,8 +282,6 @@ class QuadRLTaskParams(TaskParams):
     # Used by foot_step_cost to penalise large foot displacements that cause
     # the RL policy to take intermediate contacts through obstacles.
     init_foot_positions: jax.Array = jnp.zeros((4, 3))
-    # Mocap obstacle XYZ positions (M_mocap, 3) — updated each cycle from sim.
-    mocap_obstacle_positions: jax.Array = jnp.zeros((0, 3))
 
     # Optional learned safety-value parameters.  When non-None, terminal_cost
     # uses the heuristic + residual decomposition from safety_value.py.
@@ -513,28 +511,7 @@ class QuadRLTask(Task):
             hazard_prefixes=("obstacle_",),
             min_height=min_obs_h,
         )
-        # Store static SDF base data for runtime mocap position updates.
-        self._sdf_rotations = np.asarray(self.obstacle_sdf.rotations)
-        self._sdf_half_extents = np.asarray(self.obstacle_sdf.half_extents)
-        self._sdf_types = np.asarray(self.obstacle_sdf.types)
-
-    def update_obstacle_sdf(self, mocap_positions):
-        """Update obstacle_sdf with runtime mocap positions.
-
-        Args:
-            mocap_positions: (M, 2) XY or (M, 3) XYZ numpy array from mj_data.
-        """
-        if mocap_positions is None or len(mocap_positions) == 0:
-            return
-        if mocap_positions.ndim == 2 and mocap_positions.shape[1] == 3:
-            mocap_positions = mocap_positions[:, :2]
-        self.obstacle_sdf = self.obstacle_sdf.update_positions(mocap_positions)
-        if not hasattr(self, '_sdf_update_count'):
-            self._sdf_update_count = 0
-        self._sdf_update_count += 1
-        if self._sdf_update_count <= 3:
-            print(f"[Task] SDF updated (call #{self._sdf_update_count}): "
-                  f"{mocap_positions.shape[0]} obstacles, first pos: {mocap_positions[0]}")
+        self._sdf_update_count = 0
 
         # =============================================================================
         # LEARNED SAFETY VALUE (optional)
@@ -558,9 +535,6 @@ class QuadRLTask(Task):
             dynamic_obstacle_t0=jnp.zeros((n,), dtype=jnp.float32),
             dynamic_obstacle_radii=jnp.zeros((n,), dtype=jnp.float32),
             dynamic_obstacle_active=jnp.zeros((n,), dtype=jnp.bool_),
-            mocap_obstacle_positions=jnp.zeros(
-                (self.obstacle_sdf.num_obstacles, 3), dtype=jnp.float32
-            ),
         )
 
     def normalize(self, plan: jax.Array) -> jax.Array:
@@ -671,7 +645,8 @@ class QuadRLTask(Task):
         dynamic_obstacle_t0 = kwargs.get("dynamic_obstacle_t0")
         dynamic_obstacle_active = kwargs.get("dynamic_obstacle_active")
         dynamic_obstacle_radii = kwargs.get("dynamic_obstacle_radii")
-        mocap_obstacle_positions = kwargs.get("mocap_obstacle_positions")
+        safety_value_params = kwargs.get("safety_value_params")
+        safety_value_target_stats = kwargs.get("safety_value_target_stats")
 
         # Extract current foot positions from the full body xpos array.
         # Used by foot_step_cost to penalise large first-step displacements.
@@ -723,7 +698,8 @@ class QuadRLTask(Task):
             dynamic_obstacle_active=_sync(dynamic_obstacle_active, task_params.dynamic_obstacle_active, jnp.bool_),
             dynamic_obstacle_radii=_sync(dynamic_obstacle_radii, task_params.dynamic_obstacle_radii, jnp.float32),
             init_foot_positions=init_foot_positions,
-            mocap_obstacle_positions=_sync(mocap_obstacle_positions, task_params.mocap_obstacle_positions, jnp.float32),
+            safety_value_params=safety_value_params if safety_value_params is not None else task_params.safety_value_params,
+            safety_value_target_stats=safety_value_target_stats if safety_value_target_stats is not None else task_params.safety_value_target_stats,
         )
 
     def _build_contact_plan(

@@ -59,7 +59,6 @@ class ObstacleSDF:
     def from_mujoco_model(
         cls,
         mj_model,
-        mj_data=None,
         hazard_prefixes=("obstacle_",),
         min_height=0.001,
     ):
@@ -95,13 +94,8 @@ class ObstacleSDF:
                 types=np.zeros((0,), dtype=np.int32),
             )
 
-        # Use provided mj_data if available (for runtime positions),
-        # otherwise create a fresh MjData with default positions.
-        if mj_data is None:
-            _mj_data = mujoco.MjData(mj_model)
-            mujoco.mj_forward(mj_model, _mj_data)
-        else:
-            _mj_data = mj_data
+        _mj_data = mujoco.MjData(mj_model)
+        mujoco.mj_forward(mj_model, _mj_data)
 
         positions = np.zeros((M, 2), dtype=np.float32)
         rotations = np.zeros((M, 2, 2), dtype=np.float32)
@@ -148,22 +142,6 @@ class ObstacleSDF:
             rotations=rotations,
             half_extents=half_extents,
             types=types,
-        )
-
-    def update_positions(self, new_positions):
-        """Return a new ObstacleSDF with updated XY positions.
-
-        Args:
-            new_positions: (M, 2) array of new XY positions (numpy or JAX).
-
-        Returns:
-            New ObstacleSDF instance with updated positions.
-        """
-        return ObstacleSDF(
-            positions=new_positions,
-            rotations=self.rotations,
-            half_extents=self.half_extents,
-            types=self.types,
         )
 
 

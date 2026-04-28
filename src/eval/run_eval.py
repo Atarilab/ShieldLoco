@@ -42,6 +42,9 @@ import yaml
 import mujoco
 import numpy as np
 
+# Track PIDs of active subprocesses for global cleanup on Ctrl+C
+_active_pids = []
+
 
 # ---------------------------------------------------------------------------
 # SDF helpers (pure NumPy, no JAX/GPU involvement)
@@ -211,6 +214,7 @@ def run_episode(
     # Write temp scenario config (with per-run paths and seed)
     if seed is not None:
         scenario_cfg["seed"] = seed
+
     tmp_scenario = os.path.join(out_dir, f"scenario_{run_id}.yaml")
     with open(tmp_scenario, "w") as f:
         yaml.dump(scenario_cfg, f)
@@ -265,10 +269,12 @@ def run_episode(
 
     print(f"[run_eval] Run {run_id}: launching sim + controller …")
     sim_proc = subprocess.Popen(sim_cmd, **popen_kwargs)
+    _active_pids.append(sim_proc.pid)
     # Small delay so DDS channel is ready before controller connects
     time.sleep(1.0)
     ctrl_env = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
     ctrl_proc = subprocess.Popen(ctrl_cmd, env=ctrl_env, **popen_kwargs)
+    _active_pids.append(ctrl_proc.pid)
 
     # Double reset with delay — robot sometimes needs two resets to stabilize
     # before the controller takes over (avoids startup instability / fall).
@@ -278,24 +284,38 @@ def run_episode(
     os.makedirs(os.path.dirname(_eval_reset_sig), exist_ok=True)
     with open(_eval_reset_sig, "w") as f:
         f.write("reset")
-    time.sleep(0.5)
+    time.sleep(4.5)
     with open(_eval_reset_sig, "w") as f:
         f.write("reset")
-    print(f"[run_eval] Run {run_id}: double reset written (0.5s gap)", flush=True)
+    print(f"[run_eval] Run {run_id}: double reset written (4.5s gap)", flush=True)
 
     max_wait = scenario_cfg.get("max_time", 120.0) + 600  # generous: 10 min for JIT
     try:
         sim_proc.wait(timeout=max_wait)
     except subprocess.TimeoutExpired:
         print(f"[run_eval] Timeout waiting for sim (run {run_id})", flush=True)
+    except KeyboardInterrupt:
+        print(f"\n[run_eval] Interrupted — cleaning up run {run_id}…", flush=True)
     finally:
+        # Kill controller first (it may still be running)
         killpg_safe(ctrl_proc, signal.SIGTERM)
         try:
-            ctrl_proc.wait(timeout=10)
+            ctrl_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             killpg_safe(ctrl_proc, signal.SIGKILL)
+        # Kill sim if it's still alive
+        if sim_proc.poll() is None:
+            killpg_safe(sim_proc, signal.SIGTERM)
+            try:
+                sim_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                killpg_safe(sim_proc, signal.SIGKILL)
         # Wait for GPU memory to be reclaimed before the next run starts
-        time.sleep(5.0)
+        time.sleep(3.0)
+        # Remove killed PIDs from tracking list
+        for p in [sim_proc, ctrl_proc]:
+            if p.pid in _active_pids:
+                _active_pids.remove(p.pid)
 
     summary = parse_episode(
         sim_csv=scenario_cfg["sim_metric_file"],
@@ -472,6 +492,22 @@ def _coerce(s: str) -> Any:
 
 
 def main():
+    # Global cleanup on Ctrl+C — kill any lingering subprocesses
+    _active_pids = []
+
+    def _on_interrupt(signum, frame):
+        print("\n[run_eval] Caught signal — terminating subprocesses…", flush=True)
+        for pid in list(_active_pids):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        _active_pids.clear()
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, _on_interrupt)
+    signal.signal(signal.SIGTERM, _on_interrupt)
+
     parser = argparse.ArgumentParser(description="DoomMPC eval runner")
     parser.add_argument("--scenario", required=True, help="Path to scenario YAML")
     parser.add_argument("--runs", type=int, default=1, help="Runs per condition")
