@@ -125,7 +125,11 @@ def _init_action_mapping(
     """
     plan_lim = rl_config["plan_lim"]
     act_rl_clip = rl_config["act_rl_clip"]
-    act_rl_offset = jnp.asarray(rl_config["action_offset"], dtype=jnp.float32)
+    act_rl_offset = jnp.asarray(
+        rl_config.get("ISAAC_LAB_DEFAULT_JOINT_POS",
+                      rl_config.get("default_joint_pos",
+                                    rl_config["action_offset"])),
+        dtype=jnp.float32)
     act_rl_scale = rl_config["action_scale"]
     act_rl_mapping = np.asarray(rl_config["action_mapping"], dtype=np.int32)
     
@@ -388,7 +392,8 @@ class QuadRLTask(Task):
         # =============================================================================
         # Load default_joint_pos first to determine num_joints
         self.default_joint_pos = jnp.asarray(
-            rl_config["default_joint_pos"], dtype=jnp.float32
+            rl_config.get("ISAAC_LAB_DEFAULT_JOINT_POS", rl_config["default_joint_pos"]),
+            dtype=jnp.float32
         )
         self.num_joints = len(self.default_joint_pos)
         
@@ -420,8 +425,8 @@ class QuadRLTask(Task):
         # =============================================================================
         # PD CONTROLLER GAINS
         # =============================================================================
-        self.kp = rl_config["kp"]
-        self.kd = rl_config["kd"]
+        self.kp = rl_config.get("stiffness", rl_config["kp"])
+        self.kd = rl_config.get("damping", rl_config["kd"])
 
         # =============================================================================
         # GAIT PATTERNS

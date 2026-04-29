@@ -95,7 +95,7 @@ def create_planner(alg_name, task, config):
     
     common_params = {
         "num_samples": config.get("mps_num_samples", 800),
-        "plan_horizon": config.get("mps_plan_horizon", 6),
+        "plan_horizon": config.get("horizon_length", config.get("mps_plan_horizon", 6)),
         "iterations": config.get("mps_iterations", 2),
         "gamma": config.get("mps_gamma", 0.99),
         "safety_weight": config.get("mps_safety_weight", 1.0),

@@ -104,8 +104,8 @@ def build_config(rl_config: dict, args) -> SafetyValueConfig:
         use_feature_norm=_bool(
             "safety_value_use_feature_norm", args.feature_norm, args.no_feature_norm, False
         ),
-        n_step=int(_get("safety_value_n_step", args.n_step, 3)),
-        gamma=float(_get("safety_value_gamma", args.gamma, 0.99)),
+        n_step=int(_get("horizon_length", _get("safety_value_n_step", args.n_step, 3))),
+        gamma=float(_get("mps_gamma", _get("safety_value_gamma", args.gamma, 0.99))),
         learning_rate=float(_get("safety_value_lr", args.lr, 3e-4)),
         batch_size=int(_get("safety_value_batch_size", args.batch_size, 2048)),
         num_epochs=int(_get("safety_value_num_epochs", args.num_epochs, 30)),
