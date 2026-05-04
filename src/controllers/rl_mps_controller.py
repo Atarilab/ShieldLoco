@@ -376,6 +376,12 @@ class RLQuadrupedMPSController(RLControllerBase):
             options=["up", "down", "left", "center", "right", "turn-left", "turn-right"],
             default_value="center",
         )
+        self.command_manager.register_button_command(
+            name="gait",
+            description="Select Gait Pattern",
+            options=list(self.gait_patterns.keys()),
+            default_value="stance",
+        )
 
     def set_mode(self):
         """Runs when the mode is changed in the UI.

@@ -15,6 +15,110 @@ import traceback
 from controllers.policies.policy import TorchScriptPolicy
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: fix multiprocessing "spawn" failures in fd-heavy environments
+# (e.g. ROS2, where DDS middleware opens many sockets / pipes).
+#
+# PROBLEM
+#   Python ≤ 3.10 can hit
+#       ValueError: bad value(s) in fds_to_keep
+#   when multiprocessing.Manager() (or any spawn-context action) tries to
+#   launch its internal _resource_tracker helper process.  The tracker
+#   collects every open file descriptor via /proc/self/fd and feeds them to
+#   _posixsubprocess.fork_exec(), which rejects descriptors that are
+#   negative, ≥ os.sysconf("SC_OPEN_MAX"), or already closed by the DDS
+#   layer between the scan and the actual fork+exec.
+#
+# WHY NOT "fork"?
+#   The safety worker process initialises JAX + CUDA from scratch.  Forking
+#   a CUDA-enabled parent would duplicate the GPU context, which CUDA
+#   forbids.  "spawn" is therefore required — but the spawn codepath relies
+#   on spawnv_passfds, which is where the crash happens.
+#
+# FIX
+#   Wrap spawnv_passfds so that each file descriptor is validated with a
+#   cheap os.fstat() call *before* reaching fork_exec.  Descriptors that no
+#   longer exist (closed or never valid) are silently dropped.  If none
+#   survive the check we fall back to plain subprocess.Popen, which works
+#   without passing any fds.
+# ---------------------------------------------------------------------------
+def _apply_spawnv_passfds_patch():
+    """
+    Inject a safe wrapper around multiprocessing.util.spawnv_passfds so that
+    the resource_tracker helper launched by Manager() / Process() survives in
+    environments where the parent holds stale or out-of-range file descriptors
+    (common in ROS2 deployments).
+
+    This function is idempotent — calling it multiple times is harmless.
+    """
+    import os as _os
+    import subprocess as _subprocess
+    from multiprocessing import util as _mp_util
+
+    # Guard against repeated patching across multiple SafetyManager instances.
+    if getattr(_mp_util.spawnv_passfds, "_doom_safety_patched", False):
+        return
+
+    # Keep a reference to the original C-backed function (native code in
+    # _posixsubprocess.so).  We need it for the happy path where all fds are
+    # valid.
+    _original_spawnv_passfds = _mp_util.spawnv_passfds
+
+    def _safe_spawnv_passfds(path, args, passfds):
+        """
+        Replacement for multiprocessing.util.spawnv_passfds.
+
+        Iterates over every file descriptor that the resource tracker wants
+        to forward to the child and sanity-checks each one with os.fstat().
+        This call fails with OSError (EBADF) if the descriptor was closed
+        between the /proc/self/fd scan and now — exactly the condition that
+        triggers "bad value(s) in fds_to_keep" inside _posixsubprocess.
+
+        Any fd that fails the check is simply excluded from the list; the
+        resource tracker's internal pipe fd is always valid, so the list
+        should never become empty under normal circumstances.
+        """
+        # First pass: keep only descriptors that the kernel still recognises
+        # as open.  os.fstat(fd) is cheap (one syscall) and is the exact
+        # check that fork_exec performs internally.
+        clean: list[int] = []
+        for fd in passfds:
+            try:
+                _os.fstat(fd)          # raises OSError (EBADF) if closed
+            except OSError:
+                continue                # fd was closed → skip it
+            if fd < 0:
+                continue                # paranoia: negative fd
+            clean.append(fd)
+
+        if not clean:
+            # Degenerate case: every descriptor the tracker collected is now
+            # closed.  Fall back to spawning without any fd passing.  Under
+            # Python 3.10 this signals the tracker to reopen the pipe later.
+            proc = _subprocess.Popen(
+                [path] + args,
+                close_fds=True,
+            )
+            return proc.pid
+
+        # Happy path: forward the sanitised list to the C extension.
+        return _original_spawnv_passfds(path, args, clean)
+
+    # Mark the function so repeated calls are no-ops.
+    _safe_spawnv_passfds._doom_safety_patched = True
+
+    # Replace the module-level function.  All subsequent calls inside
+    # multiprocessing (Manager, Process, resource_tracker, …) will
+    # transparently go through our safe wrapper.
+    _mp_util.spawnv_passfds = _safe_spawnv_passfds
+
+
+# Apply the patch once at import time, before any multiprocessing objects are
+# created.  The patch is safe to call unconditionally — it is a no-op after
+# the first invocation.
+_apply_spawnv_passfds_patch()
+
+
 def _dump_train_data(train_data, output_dir: str, seq: int, seed: int = 0):
     """Save a QuadAlgTrainData object to disk as a pickle (numpy arrays)."""
     import pickle
