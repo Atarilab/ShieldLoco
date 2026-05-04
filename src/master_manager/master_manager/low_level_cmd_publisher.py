@@ -92,13 +92,7 @@ class LowLevelCmdPublisher(Node):
         start_time = time.time()
         self.running_time += self.dt
 
-        # Get active controller and compute torques
-        active_controller = self.mode_manager.get_active_controller()
-        # self.mode_manager.get_active_obs_manager()
-
         try:
-            # current_time = self.get_clock().now().nanoseconds / 1e9
-
             # Update joystick state and handle mode switching
             self.joystick_manager.update()
 
@@ -113,6 +107,10 @@ class LowLevelCmdPublisher(Node):
                 else:
                     self.logger.info(f"{self.robot.name}: Waiting for robot states")
                     return
+
+            # Get active controller AFTER joystick/state updates to avoid stale references.
+            # get_active_controller() is now thread-safe (guarded by mode_manager._lock).
+            active_controller = self.mode_manager.get_active_controller()
 
             # Update controller state
             active_controller.update_state(combined_state)
@@ -152,21 +150,30 @@ class LowLevelCmdPublisher(Node):
             if self.logger and not self._is_shutting_down:
                 self.logger.error(f"Error in low level callback computation: {e}")
 
-        # # self.last_callback_time = current_time
+        # --- Timing diagnostics: detect GIL contention / missed deadlines ---
+        execution_time = time.time() - start_time
+        if execution_time > self.dt * 1.5:
+            # Only log throttle violations periodically (every 200 callbacks) to avoid
+            # saturating the logger and making the problem worse.
+            if not hasattr(self, "_timing_warn_count"):
+                self._timing_warn_count = 0
+            self._timing_warn_count += 1
+            if self._timing_warn_count % 200 == 0:
+                self.logger.warning(
+                    f"Control loop deadline missed: {execution_time*1000:.1f} ms "
+                    f"(budget: {self.dt*1000:.1f} ms). "
+                    f"This often indicates GIL contention (e.g., Textual UI rendering). "
+                    f"Skipped {self._timing_warn_count} warning logs so far."
+                )
 
-        # # Log execution time and actual control frequency
-        # execution_time = time.time() - start_time
-        # current_time = time.time()
-        # actual_interval = current_time - self.last_callback_time
-        # self.callback_count += 1
-
-        # # Log every 100 callbacks to avoid spam
-        # if self.callback_count % 10 == 0:
-        #     actual_freq = 1.0 / actual_interval if actual_interval > 0 else 0
-        #     expected_freq = 1.0 / self.dt
-        #     self.logger.debug(f"Control frequency: {actual_freq:.1f} Hz (expected: {expected_freq:.1f} Hz), execution: {execution_time*1000:.2f} ms")
-
-        # self.last_callback_time = current_time
+        if not hasattr(self, "_callback_count"):
+            self._callback_count = 0
+        self._callback_count += 1
+        if self._callback_count % 500 == 0 and self.logger:
+            self.logger.debug(
+                f"Control loop summary: mean exec time over last 500 cycles, "
+                f"callback #{self._callback_count}"
+            )
 
     def publish_robot_state(self):
         """Publish robot state for visualization in RViz."""

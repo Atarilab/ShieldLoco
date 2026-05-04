@@ -393,7 +393,7 @@ class RobotControlUI(App):
 
         # Special handling for ZERO mode
         if button_id == "mode-zero":
-            self.mode_manager.set_mode("ZERO")
+            self.mode_manager.set_mode("ZERO", force=True)
 
             # Update UI to reflect current state
             self.update_status()
@@ -401,7 +401,7 @@ class RobotControlUI(App):
             return
 
         if button_id == "mode-damping":
-            self.mode_manager.set_mode("DAMPING")
+            self.mode_manager.set_mode("DAMPING", force=True)
 
             # Update UI to reflect current state
             self.update_status()
@@ -568,7 +568,7 @@ class RobotControlUI(App):
 
     def on_unmount(self) -> None:
         """Set robot to DAMPING mode when UI is closed."""
-        self.mode_manager.set_mode("DAMPING")
+        self.mode_manager.set_mode("DAMPING", force=True)
 
 
 class CommandWidget(Vertical):

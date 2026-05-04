@@ -157,7 +157,7 @@ class JoystickManager:
                     # Handle mode switching based on button combinations
                     if self.robot == "UnitreeGo2":
                         if key_state[self.key_map["select"]]:
-                            self.mode_manager.set_mode("ZERO")
+                            self.mode_manager.set_mode("ZERO", force=True)
                             self._last_command_time = current_time
                         elif key_state[self.key_map["start"]] and self.active_controller.__class__.__name__ in [
                             "DampingController",
@@ -169,7 +169,7 @@ class JoystickManager:
                             key_state[self.key_map["start"]]
                             and self.active_controller.__class__.__name__ != "DampingController"
                         ):
-                            self.mode_manager.set_mode("DAMPING")
+                            self.mode_manager.set_mode("DAMPING", force=True)
                             self._last_command_time = current_time
                         elif key_state[self.key_map["up"]] and self.active_controller.__class__.__name__ in {
                             "Go2StayDownController",
@@ -212,7 +212,7 @@ class JoystickManager:
 
                     elif self.robot == "UnitreeG1":
                         if key_state[self.key_map["select"]]:
-                            self.mode_manager.set_mode("ZERO")
+                            self.mode_manager.set_mode("ZERO", force=True)
                             self._last_command_time = current_time
                         elif key_state[self.key_map["start"]] and self.active_controller.__class__.__name__ in [
                             "DampingController",
@@ -224,7 +224,7 @@ class JoystickManager:
                             key_state[self.key_map["start"]]
                             and self.active_controller.__class__.__name__ != "DampingController"
                         ):
-                            self.mode_manager.set_mode("DAMPING")
+                            self.mode_manager.set_mode("DAMPING", force=True)
                             self._last_command_time = current_time
                         # elif key_state[self.key_map["up"]] and self.active_controller.__class__.__name__ in {
                         #     "Go2StayDownController",

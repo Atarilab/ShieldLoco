@@ -178,7 +178,7 @@ async def main_async(args=None):
                 while not os.path.exists(_done_file):
                     await asyncio.sleep(0.2)
                 logger.info("[Eval] Episode complete — shutting down controller node")
-                mode_manager.set_mode("DAMPING")
+                mode_manager.set_mode("DAMPING", force=True)
                 await asyncio.sleep(2.0)  # brief DAMPING period
                 # Release GPU memory before exiting so the next run can allocate cleanly
                 try:
@@ -205,7 +205,7 @@ async def main_async(args=None):
             await node_task
 
         except asyncio.CancelledError:
-            mode_manager.set_mode("DAMPING")
+            mode_manager.set_mode("DAMPING", force=True)
             if node:
                 node.request_shutdown()
             logger.info("Cancelling all tasks in master node before shutdown..")
@@ -215,7 +215,7 @@ async def main_async(args=None):
         logger.info("Received KeyboardInterrupt. Shutting down...")
 
         # Set controller to DAMPING mode before shutting down
-        mode_manager.set_mode("DAMPING")
+        mode_manager.set_mode("DAMPING", force=True)
         if node:
             node.request_shutdown()
         logger.info("Set controller to DAMPING mode before shutdown")
