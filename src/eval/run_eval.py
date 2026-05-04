@@ -242,13 +242,13 @@ def run_episode(
         sys.executable, "simulate.py",
         "--task", "rl-mps-eval-go2",
         "--headless",
-        "--log", f"eval_run_{run_id}",
+        "--log", "eval",
         "--eval-config", os.path.abspath(tmp_scenario),
     ] + sim_seed_args
     ctrl_cmd = [
         "ros2", "run", "master_manager", "master_node",
         "--task", "rl-mps-eval-go2",
-        "--log", f"eval_run_{run_id}",
+        "--log", "eval",
         "--eval-config", os.path.abspath(tmp_scenario),
     ]
     if tmp_ctrl_cfg is not None:
