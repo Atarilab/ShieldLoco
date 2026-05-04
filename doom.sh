@@ -125,8 +125,8 @@ while [[ $# -gt 0 ]]; do
                 --env-file .env.docker \
                 --network host \
                 --device /dev/input \
-                --group-add 107 \
-                --user $(id -u):$(id -u) \
+                --group-add $(getent group input | cut -d: -f3) \
+                --user $(id -u):$(id -g) \
                 --gpus all \
                 -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
                 -v /dev/shm:/dev/shm \
