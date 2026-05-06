@@ -169,11 +169,11 @@ class LowLevelCmdPublisher(Node):
         if not hasattr(self, "_callback_count"):
             self._callback_count = 0
         self._callback_count += 1
-        if self._callback_count % 500 == 0 and self.logger:
-            self.logger.debug(
-                f"Control loop summary: mean exec time over last 500 cycles, "
-                f"callback #{self._callback_count}"
-            )
+        # if self._callback_count % 500 == 0 and self.logger:
+        #     self.logger.debug(
+        #         f"Control loop summary: mean exec time over last 500 cycles, "
+        #         f"callback #{self._callback_count}"
+        #     )
 
     def publish_robot_state(self):
         """Publish robot state for visualization in RViz."""

@@ -407,6 +407,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.lateral_step_size = 0.0
             self.pending_lateral_step_size = 0.0
             self.lateral_step_size_change_pending = False
+            self.command_start_time = time.time()
 
         base_pos_w = torch.tensor(
             self.robot.mj_model.get_body_position_world("base_link"), dtype=torch.float32, device=self.device
@@ -1031,6 +1032,8 @@ class RLQuadrupedMPSController(RLControllerBase):
         return {
             # MPC toggle
             "A": lambda: self.change_commands({"mpc": "on" if not self.apply_mpc_contact_plan else "off"}),
+            # Gait toggle (trot ↔ stance)
+            "X": lambda: self.change_commands({"gait": "stance" if self.current_gait == "trot" else "trot"}),
             # Forward/backward speed
             "up": lambda: self._handle_step_size_change("up"),
             "down": lambda: self._handle_step_size_change("down"),

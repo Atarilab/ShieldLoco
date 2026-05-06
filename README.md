@@ -83,6 +83,8 @@ The various tasks are defined in [`tasks/task_configs.json`](src/tasks/task_conf
 - `rl-velocity-sim-g1` (Status: ✅ ) 
 - `rl-velocity-real-g1` (Status: ✅ )
 - `rl-contact-sim-g1` (Status: ⚠️ )
+- `rl-mps-sim-go2` (Status: ✅ )
+- `rl-mps-real-go2` (Status: ✅ )
   
 Once you've chosen the task you want to run, you can run the master node to control the robot using:
 ```bash
@@ -179,9 +181,9 @@ You can further define controller-specific joystick mappings by defining `get_jo
 ## 🗂️ Task Library
 <div align="center">
 
-| <div align="center"> rl-contact-real-go2 </div> | <div align="center"> rl-contact-sim-go2 </div> |
-| --- | --- |
-| [<img src="./assets/rl-contact-real-go2.gif" width="240px">](rl-contact-real-go2) | [<img src="./assets/rl-contact-sim-go2.gif" width="240px">](rl-contact-sim-go2) |
+| <div align="center"> rl-contact-real-go2 </div> | <div align="center"> rl-contact-sim-go2 </div> | <div align="center"> rl-mps-sim-go2 </div> |
+| --- | --- | --- |
+| [<img src="./assets/rl-contact-real-go2.gif" width="240px">](rl-contact-real-go2) | [<img src="./assets/rl-contact-sim-go2.gif" width="240px">](rl-contact-sim-go2) | [<img src="./assets/rl-mps-sim-go2.gif" width="240px">](rl-mps-sim-go2) |
 
 </div>
 
@@ -237,9 +239,10 @@ ros2 run master_manager master_node --task rl-mps-real-go2
 |---|---|---|
 | Startup | `Select` | ZERO mode |
 | | `Start` | STAY_DOWN |
-| | `Up` | STAND_UP |
+| | `L1+R1` | STANCE |
 | | `L1+R1` | RL-MPS (stance) |
 | In RL-MPS | `A` | Toggle MPC on/off |
+| | `X` | Toggle trot ↔ stance |
 | | `Up/Down` | Forward/backward speed |
 | | `Left/Right` | Strafe left/right |
 | | `Y/B` | Turn left/right |

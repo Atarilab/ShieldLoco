@@ -193,6 +193,34 @@ class JoystickManager:
                         elif (
                             key_state[self.key_map["L1"]]
                             and key_state[self.key_map["R1"]]
+                            and self.active_controller.__class__.__name__ == "Go2StayDownController"
+                        ):
+                            self.mode_manager.set_mode("STAND", "STANCE")
+                            self._last_command_time = current_time
+
+                        elif (
+                            key_state[self.key_map["L1"]]
+                            and key_state[self.key_map["R1"]]
+                            and self.active_controller.__class__.__name__ == "Go2StanceController"
+                        ):
+                            # Cycle through available submodes of the for the main mode
+                            main_mode = list(self.mode_manager._modes.keys())[3]
+                            available_submodes = self.mode_manager.get_mode_info(main_mode)["submode"]
+
+                            if main_mode not in self._submode_indices:
+                                self._submode_indices[main_mode] = 0
+
+                            current_index = self._submode_indices[main_mode]
+                            self.mode_manager.set_mode(main_mode, available_submodes[current_index])
+
+                            self.logger.info(f"Mode set to {main_mode} - {available_submodes[current_index]}")
+
+                            self._submode_indices[main_mode] = (current_index + 1) % len(available_submodes)
+                            self._last_command_time = current_time
+
+                        elif (
+                            key_state[self.key_map["L1"]]
+                            and key_state[self.key_map["R1"]]
                             and self.active_controller.__class__.__name__ == "Go2StandUpController"
                         ):
                             # Cycle through available submodes of the for the main mode

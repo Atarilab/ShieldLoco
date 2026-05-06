@@ -11,7 +11,7 @@ stiffness: 30.0
 damping: 0.5
 use_threading: False
 use_buffer: False
-device: "cuda:0"  
+device: "cpu"  
 feet_step_size: 0.0
 horizon_length: 200
 action_filter_alpha: 0.5

@@ -340,6 +340,7 @@ class RLQuadrupedLocomotionContactController(RLControllerBase):
             self.pending_heading = 0.0
             self.pending_step_size = 0.0
             self.pending_lateral_pos = 0.0
+            self.command_start_time = time.time()
 
         base_pos_w = torch.tensor(
             self.robot.mj_model.get_body_position_world("base_link"), dtype=torch.float32, device=self.device
