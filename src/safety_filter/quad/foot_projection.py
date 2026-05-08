@@ -43,17 +43,41 @@ class ObstacleSDF:
             BOX     -> (hx, hy)
             CAPSULE -> (radius, half_length)
         types: (M,) int32 obstacle type (CIRCLE / BOX / CAPSULE).
+        heights: (M,) float32 half-height in world Z (metres).
     """
 
-    def __init__(self, positions, rotations, half_extents, types):
+    def __init__(self, positions, rotations, half_extents, types, heights=None):
         self.positions = jnp.asarray(positions, dtype=jnp.float32)
         self.rotations = jnp.asarray(rotations, dtype=jnp.float32)
         self.half_extents = jnp.asarray(half_extents, dtype=jnp.float32)
         self.types = jnp.asarray(types, dtype=jnp.int32)
+        M = self.positions.shape[0]
+        if heights is not None:
+            self.heights = jnp.asarray(heights, dtype=jnp.float32)
+        else:
+            self.heights = jnp.zeros((M,), dtype=jnp.float32)
 
     @property
     def num_obstacles(self):
         return self.positions.shape[0]
+
+    def filter_by_height(self, min_height=-float("inf"), max_height=float("inf")):
+        """Return new ObstacleSDF with only obstacles in [min_height, max_height).
+
+        Uses numpy indexing — safe because this runs at init time, not inside JIT.
+        """
+        if self.num_obstacles == 0:
+            return self
+        h = np.asarray(self.heights)
+        mask = (h >= min_height) & (h < max_height)
+        idx = np.nonzero(mask)[0]
+        return ObstacleSDF(
+            positions=np.array(self.positions)[idx],
+            rotations=np.array(self.rotations)[idx],
+            half_extents=np.array(self.half_extents)[idx],
+            types=np.array(self.types)[idx],
+            heights=h[idx],
+        )
 
     @classmethod
     def from_mujoco_model(
@@ -92,6 +116,7 @@ class ObstacleSDF:
                 rotations=np.zeros((0, 2, 2), dtype=np.float32),
                 half_extents=np.zeros((0, 2), dtype=np.float32),
                 types=np.zeros((0,), dtype=np.int32),
+                heights=np.zeros((0,), dtype=np.float32),
             )
 
         _mj_data = mujoco.MjData(mj_model)
@@ -101,12 +126,21 @@ class ObstacleSDF:
         rotations = np.zeros((M, 2, 2), dtype=np.float32)
         half_extents = np.zeros((M, 2), dtype=np.float32)
         types = np.zeros(M, dtype=np.int32)
+        heights = np.zeros(M, dtype=np.float32)
 
         for i, gid in enumerate(hazard_ids):
             pos3d = _mj_data.geom_xpos[gid]
             mat3d = _mj_data.geom_xmat[gid].reshape(3, 3)
             gtype_mj = int(mj_model.geom_type[gid])
             size = mj_model.geom_size[gid]
+
+            if gtype_mj == 6:
+                height = size[2]
+            elif gtype_mj in (3, 5):
+                height = size[1]
+            else:
+                height = size[0]
+            heights[i] = height
 
             positions[i] = pos3d[:2]
             rotations[i] = mat3d[:2, :2]
@@ -142,6 +176,7 @@ class ObstacleSDF:
             rotations=rotations,
             half_extents=half_extents,
             types=types,
+            heights=heights,
         )
 
 
