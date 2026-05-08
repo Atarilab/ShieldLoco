@@ -253,6 +253,10 @@ class JointMappingInterface:
         """
         if self.robot_name == "go2":
             # Default positions in MuJoCo order
+            # Hip sign convention (MuJoCo/hardware order): FR/RR hips = +positive, FL/RL hips = -negative.
+            # The RL policy config (ISAAC_LAB_DEFAULT_JOINT_POS) uses the OPPOSITE sign convention.
+            # This matches the hardware convention.  When converted to IsaacLab order via
+            # convert_joint_positions, the hips will have the RL policy's convention automatically.
             mujoco_default = np.array(
                 [
                     0.1,

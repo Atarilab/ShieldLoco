@@ -48,6 +48,7 @@ class SceneCaptureNode(Node):
         self._num_samples = num_samples
 
         self._robot_positions: List[Tuple[float, float]] = []
+        self._robot_quats: List[Tuple[float, float, float, float]] = []
         self._obstacle_positions: Dict[str, List[Tuple[float, float, float]]] = (
             defaultdict(list)
         )
@@ -111,6 +112,9 @@ class SceneCaptureNode(Node):
         self._robot_positions.append(
             (msg.x_trans * 0.001, msg.y_trans * 0.001)
         )
+        self._robot_quats.append(
+            (msg.x_rot, msg.y_rot, msg.z_rot, msg.w)
+        )
 
     def _obstacle_callback(self, topic: str, msg: Position):
         if len(self._obstacle_positions[topic]) >= self._num_samples:
@@ -133,6 +137,28 @@ class SceneCaptureNode(Node):
             )
         )
         return robot_ready and obstacles_ready
+
+    def get_robot_pose(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        if not self._robot_positions:
+            return None
+        arr = np.array(self._robot_positions)
+        median_pos = np.median(arr, axis=0)
+        if self._robot_quats:
+            quat_arr = np.array(self._robot_quats)
+            yaws = np.arctan2(
+                2.0 * (quat_arr[:, 3] * quat_arr[:, 2] + quat_arr[:, 0] * quat_arr[:, 1]),
+                1.0 - 2.0 * (quat_arr[:, 1] ** 2 + quat_arr[:, 2] ** 2),
+            )
+            median_yaw = float(np.median(yaws))
+            qw = np.cos(median_yaw / 2.0)
+            qz = np.sin(median_yaw / 2.0)
+        else:
+            qw, qz = 1.0, 0.0
+        return (
+            float(median_pos[0]),
+            float(median_pos[1]),
+            float(qw), 0.0, 0.0, float(qz),
+        )
 
     def get_robot_xy(self) -> Optional[Tuple[float, float]]:
         if not self._robot_positions:
@@ -157,15 +183,17 @@ def _short_name(topic: str) -> str:
 
 
 _BASE_LINK_RE = re.compile(
-    r'(<body\s+name="base_link"\s+pos=)"[^"]*"'
+    r'(<body\s+name="base_link"\s+pos=)"([^"]*)"(\s+quat="[^"]*")?'
 )
 
 
-def _update_robot_xy_in_xml(xml_path: str, x: float, y: float):
+def _update_robot_pose_in_xml(
+    xml_path: str, x: float, y: float, qw: float, qx: float, qy: float, qz: float
+):
     with open(xml_path, "r") as f:
         content = f.read()
 
-    replacement = rf'\1"{x:.4f} {y:.4f} 0.445"'
+    replacement = rf'\1"{x:.4f} {y:.4f} 0.445" quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}"'
     new_content, count = _BASE_LINK_RE.subn(replacement, content)
 
     if count == 0:
@@ -176,7 +204,10 @@ def _update_robot_xy_in_xml(xml_path: str, x: float, y: float):
     with open(xml_path, "w") as f:
         f.write(new_content)
     os.remove(xml_path + ".bak")
-    print(f"Updated robot initial pos in {xml_path}: x={x:.4f} y={y:.4f}")
+    print(
+        f"Updated robot initial pose in {xml_path}: x={x:.4f} y={y:.4f} "
+        f"quat=({qw:.4f} {qx:.4f} {qy:.4f} {qz:.4f})"
+    )
 
 
 def write_obstacles_xml(
@@ -311,15 +342,15 @@ def main():
     except KeyboardInterrupt:
         node.get_logger().info("Interrupted by user.")
 
-    robot_xy = node.get_robot_xy()
+    robot_pose = node.get_robot_pose()
     obstacle_positions = node.get_obstacle_positions()
     node.destroy_node()
     rclpy.shutdown()
 
-    if robot_xy is not None:
-        rx, ry = robot_xy
-        _update_robot_xy_in_xml(GO2_XML, rx, ry)
-        _update_robot_xy_in_xml(GO2_MJX_XML, rx, ry)
+    if robot_pose is not None:
+        rx, ry, qw, qx, qy, qz = robot_pose
+        _update_robot_pose_in_xml(GO2_XML, rx, ry, qw, qx, qy, qz)
+        _update_robot_pose_in_xml(GO2_MJX_XML, rx, ry, qw, qx, qy, qz)
     else:
         print("No robot position captured — robot XML unchanged.")
 

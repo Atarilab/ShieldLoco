@@ -212,7 +212,7 @@ python3 eval/launch_eval.py --scenario eval/scenarios/scenario_a.yaml --seed 42
 ### Current Status
 - ✅ Large-obstacle navigation: tested
 - ✅ Cluttered scenes: tested
-- ⚠️ Dynamic obstacles: **not tested yet**
+- ⚠️ Dynamic obstacles: **not tested yet with new code**
 - ⚠️ Some collisions still occur in certain scenarios
 
 > **Note**: Collisions still occur in some scenarios—ongoing work on math and bug fixes.
@@ -227,6 +227,18 @@ ros2 launch vicon_receiver client.launch.py
 ```
 
 #### Terminal 2
+Generate Obstacles xml and disable the sport mode of robot
+```bash
+./doom.sh -a
+cd src
+python3 scripts/gen_obstacles_xml.py
+python3 scripts/safely_lay_down.py
+python3 scripts/disable_sport_mode.py 
+```
+
+> **Note**: Remember to cross verify that xml matches the real obj, you can do that by running `go2_mps_sim --headless` and view it in browser
+
+#### Terminal 3
 ```bash
 ./doom.sh -a
 source setup.sh

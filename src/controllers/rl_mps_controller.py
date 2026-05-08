@@ -415,7 +415,12 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.lateral_pos = base_pos_w[1]
         self.generate_future_feet_positions(pos=base_pos_w)
 
-        self.joint_pos_targets = self.default_joint_pos.clone()
+        # Initialize targets to stand_up_joint_pos (hardware convention), then smoothly blend
+        # to the RL policy's default_joint_pos over ~0.3s to avoid PD jerk from hip sign
+        # mismatch between stance controller and policy conventions.
+        self.joint_pos_targets = torch.tensor(self.robot.stand_up_joint_pos, dtype=torch.float32, device=self.device)
+        self._blend_alpha = 1.0
+        self._blend_decay = 0.85
 
         self.safety_manager.set_logger(self.logger)
 
@@ -577,6 +582,17 @@ class RLQuadrupedMPSController(RLControllerBase):
                     self.joint_pos_targets = self.compute_joint_pos_targets_from_policy(obs_tensor)
                 else:
                     self.joint_pos_targets = self.compute_joint_pos_targets()
+
+                # Smooth blend from stand_up (hardware convention) to policy targets
+                # over ~0.3s.  Handles the hip sign mismatch between Go2StanceController
+                # and RL policy conventions.
+                if self._blend_alpha > 0.001:
+                    stand_up = torch.tensor(self.robot.stand_up_joint_pos, dtype=torch.float32, device=self.device)
+                    self.joint_pos_targets = (
+                        self._blend_alpha * stand_up +
+                        (1.0 - self._blend_alpha) * self.joint_pos_targets
+                    )
+                    self._blend_alpha *= self._blend_decay
 
             # Clip the joint pos targets for safety
             if hasattr(self, "soft_dof_pos_limit"):
