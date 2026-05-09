@@ -81,7 +81,7 @@ transition_duration: 0
 # ----------------------------------------------------------------------------
 # OPTIMIZER
 # ----------------------------------------------------------------------------
-mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, DMPS, CMPS
+mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, CBF, DMPS, CMPS
 
 # Common parameters (all optimizers)
 mps_num_samples: 1200
@@ -222,15 +222,15 @@ safety_value_mode: "off"   # "off" | "heuristic" | "direct" | "residual"
 
 # ---- Network architecture --------------------------------------------------
 safety_value_hidden_dim: 256
-safety_value_use_layer_norm: false
-safety_value_use_feature_norm: false
+safety_value_use_layer_norm: true
+safety_value_use_feature_norm: true
 
 # ---- Training hyperparameters ----------------------------------------------
 safety_value_n_step: *horizon_length
 safety_value_gamma: *mps_gamma
-safety_value_lr: 1e-4
-safety_value_batch_size: 4096
-safety_value_num_epochs: 13500
+safety_value_lr: 3e-4
+safety_value_batch_size: 8000
+safety_value_num_epochs: 25000
 safety_value_grad_clip: 100.0
 safety_value_target_clip: 5000.0
 

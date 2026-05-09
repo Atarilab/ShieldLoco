@@ -164,6 +164,7 @@ PLANNER_REGISTRY = {
     "DIAL_MPC": "QuadDPMSPlanner",
     "CONSENSUS": "QuadCMPSPlanner",
     "REMIMPS": "QuadREMIMPSPlanner",
+    "CBF": "QuadCBFPlanner",
 }
 
 
@@ -183,6 +184,7 @@ def create_planner(alg_name, task, config):
     from .quad.dmps import QuadDPMSPlanner
     from .quad.cmps import QuadCMPSPlanner
     from .quad.remimps import QuadREMIMPSPlanner
+    from .quad.cbf_planner import QuadCBFPlanner
 
     registry = {
         "MIMPS": QuadMIMPSPlanner,
@@ -190,6 +192,7 @@ def create_planner(alg_name, task, config):
         "DMPS": QuadDPMSPlanner,
         "CMPS": QuadCMPSPlanner,
         "REMIMPS": QuadREMIMPSPlanner,
+        "CBF": QuadCBFPlanner,
     }
     
     if alg_name not in registry:
