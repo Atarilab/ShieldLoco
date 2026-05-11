@@ -82,24 +82,19 @@ def _cbf_correct_plan(
     plan_h: jax.Array,
     s_k: jax.Array,
     plan_lim: float,
+    A: jax.Array,
+    B: jax.Array,
     B_xy: jax.Array,
     sdf,
     clearance: float,
     gamma: float,
     max_correction: float,
 ) -> jax.Array:
-    """Apply a mild DCBF correction to one horizon step of the plan.
+    """Apply a DCBF correction using predicted CoM (one-step lookahead).
 
-    Evaluates the DCBF at the CURRENT CoM position (not a dynamics prediction)
-    to avoid 3D-LIP model mismatch compounding across steps.  The geometric
-    `project_plan_to_safe` (applied in finalize_best_plan) handles large
-    obstacle clearance; this CBF adds a small velocity-aware adjustment.
-
-    The DCBF constraint:
-        ∇h(s_k)^T B_xy (u_avg - u_avg_nom) >= -γ * h(s_k)
-
-    Only activates when h(s_k) < 0 (CoM inside obstacle) or h(s_k) is small.
-    Correction is clamped to prevent foot oscillation.
+    Evaluates h at the predicted next CoM s_nom = A@s_k + B@u_avg_nom,
+    so the constraint activates preventively when the next CoM would be
+    unsafe, even if the current CoM is safe.
     """
     ref_world = plan_h * plan_lim
     feet_world = ref_world.reshape(4, 3)
@@ -108,11 +103,18 @@ def _cbf_correct_plan(
     if sdf.num_obstacles == 0:
         return plan_h
 
+    # h_k: safety at current CoM (for RHS of DCBF)
     com_xy = s_k[jnp.array([0, 2])]
-    sdfs, grads = _sdf_and_grad_all(com_xy, sdf)
-    h_k = jnp.min(sdfs) - clearance
-    worst_idx = jnp.argmin(sdfs)
-    dh_dcom = grads[worst_idx]
+    sdfs_k, _ = _sdf_and_grad_all(com_xy, sdf)
+    h_k = jnp.min(sdfs_k) - clearance
+
+    # h_nom: safety at predicted next CoM under nominal footstep
+    s_nom = A @ s_k + B @ u_avg_nom
+    s_nom_xy = s_nom[jnp.array([0, 2])]
+    sdfs_nom, grads_nom = _sdf_and_grad_all(s_nom_xy, sdf)
+    h_nom = jnp.min(sdfs_nom) - clearance
+    worst_idx = jnp.argmin(sdfs_nom)
+    dh_dcom = grads_nom[worst_idx]
 
     grad_B = jnp.array([
         dh_dcom[0] * B_xy[0, 0] + dh_dcom[1] * B_xy[1, 0],
@@ -120,7 +122,7 @@ def _cbf_correct_plan(
     ])
 
     A_cbf = -grad_B[None, :]
-    b_cbf = gamma * h_k - grad_B @ u_avg_nom
+    b_cbf = h_nom - (1.0 - gamma) * h_k - grad_B @ u_avg_nom
     u_avg_safe = _project_onto_half_plane(u_avg_nom, A_cbf, b_cbf,
                                            u_avg_nom - max_correction,
                                            u_avg_nom + max_correction)
@@ -146,6 +148,8 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         noise_level: float = 0.6,
         cross_entropy_decay: float = _DEFAULT_DCBF_GAMMA,
         num_randomizations: int = 1,
+        enabled: bool = True,
+        use_geometric_fallback: bool = True,
         risk_strategy: Optional[RiskStrategy] = None,
         seed: int = 0,
         plan_horizon: int = 10,
@@ -181,10 +185,12 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
             include_terminal_cost=include_terminal_cost,
         )
 
+        self._enabled = enabled
+        self._use_geometric_fallback = use_geometric_fallback
         self.dcbf_gamma = cross_entropy_decay
         T = self.task.command_duration
-        _, B = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
-        self._B_xy = B[jnp.array([0, 2]), :]
+        self._A, self._B_full = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
+        self._B_xy = self._B_full[jnp.array([0, 2]), :]
         self._max_correction = _DEFAULT_MAX_CORRECTION
 
     def init_params(
@@ -219,6 +225,12 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         )
 
     def update_with_plan(self, state: mjx.Data, params: CBFParams) -> CBFParams:
+        if not self._enabled:
+            return params.replace(
+                mean=jnp.zeros_like(params.mean),
+                best_plan=params.ref,
+            )
+
         base_pos = state.xpos[self.task.base_body_id]
         base_vel = state.qvel
         s_k = jnp.array([base_pos[0], base_vel[0], base_pos[1], base_vel[1]])
@@ -232,7 +244,8 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
             def _step(plan_out, h):
                 ref_h = params.ref[h]
                 safe_h = _cbf_correct_plan(
-                    ref_h, s_k, self.task.plan_lim, self._B_xy,
+                    ref_h, s_k, self.task.plan_lim,
+                    self._A, self._B_full, self._B_xy,
                     sdf, clearance, self.dcbf_gamma, self._max_correction,
                 )
                 return plan_out.at[h].set(safe_h), None
@@ -261,6 +274,8 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         return params
 
     def finalize_best_plan(self, params: CBFParams) -> CBFParams:
-        abs_plan = self.task.project_plan_to_safe(params.best_plan)
+        abs_plan = params.best_plan
+        if self._use_geometric_fallback:
+            abs_plan = self.task.project_plan_to_safe(abs_plan)
         exec_plan = self.task.get_exec_plan(abs_plan)
         return params.replace(exec_plan=exec_plan)

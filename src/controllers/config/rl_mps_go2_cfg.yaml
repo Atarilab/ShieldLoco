@@ -81,7 +81,7 @@ transition_duration: 0
 # ----------------------------------------------------------------------------
 # OPTIMIZER
 # ----------------------------------------------------------------------------
-mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, CBF, DMPS, CMPS
+mps_alg_name: "CBF"  # MIMPS, REMIMPS, CEMPS, CBF, DMPS, CMPS
 
 # Common parameters (all optimizers)
 mps_num_samples: 1200
@@ -115,6 +115,12 @@ CEMPS:
   elite_fraction: 0.1
   cross_entropy_decay: 0.8
 
+CBF:
+  # Ablation: set enabled: false to skip CBF (only geometric projection applies)
+  enabled: true
+  # Ablation: set use_geometric_fallback: false to test CBF standalone
+  use_geometric_fallback: false
+  cross_entropy_decay: 0.5
 
 # ----------------------------------------------------------------------------
 # TASK

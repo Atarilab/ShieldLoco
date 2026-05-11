@@ -228,7 +228,14 @@ def run_episode(
         with open(base_ctrl_path) as f:
             ctrl_cfg = yaml.safe_load(f)
         for k, v in ctrl_overrides.items():
-            ctrl_cfg[k] = v
+            if "." in k:
+                parts = k.split(".")
+                d = ctrl_cfg
+                for p in parts[:-1]:
+                    d = d.setdefault(p, {})
+                d[parts[-1]] = v
+            else:
+                ctrl_cfg[k] = v
         tmp_ctrl_cfg = os.path.join(out_dir, f"ctrl_cfg_{run_id}.yaml")
         with open(tmp_ctrl_cfg, "w") as f:
             yaml.dump(ctrl_cfg, f)
