@@ -81,7 +81,7 @@ transition_duration: 0
 # ----------------------------------------------------------------------------
 # OPTIMIZER
 # ----------------------------------------------------------------------------
-mps_alg_name: "CBF"  # MIMPS, REMIMPS, CEMPS, CBF, DMPS, CMPS
+mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, CBF, HJ, DMPS, CMPS
 
 # Common parameters (all optimizers)
 mps_num_samples: 1200
@@ -121,6 +121,10 @@ CBF:
   # Ablation: set use_geometric_fallback: false to test CBF standalone
   use_geometric_fallback: false
   cross_entropy_decay: 0.5
+
+HJ:
+  hj_grid: [30, 20, 30, 20]
+  hj_vi_iters: 40
 
 # ----------------------------------------------------------------------------
 # TASK
