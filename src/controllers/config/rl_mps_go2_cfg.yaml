@@ -143,13 +143,24 @@ constraint_min_obstacle_height: 0.0005
 projection_clearance: 0.08   # meters (foot_radius + safety_margin)
 projection_iters: 3          # Active-set QP iterations
 
+# ---- Obstacle Height Classification ----
+# Obstacles with half-height >= threshold → "tall" (navigate around, foot_plan_sdf_cost).
+# Obstacles with half-height <  threshold → "short" (step over, body_sdf/foot_path_sdf).
+# Navigation boxes (half-h=0.2m) → tall.  Cluttered debris (half-h=0.01m) → short.
+cost_obstacle_height_threshold: 0.07  # half-height in metres
+
 # ---- Cost Weights ----
+# All costs are active simultaneously; each cost term sees only its height class.
+#   Tall  → foot_plan_sdf_cost (exponential, long-range ~0.5m gradient)
+#   Short → body_sdf_cost + foot_path_sdf_cost (softplus, precise near-field)
+
+ref_tracking_weight: 30.0
 
 # Foot chain cost: penalizes step-to-step displacement (shuffling regularizer)
 # Weight guide: 0=off, 10=mild, 30=moderate, 50+=aggressive shuffle
-foot_chain_weight: 5.0
+foot_chain_weight: 40.0
 
-# Body SDF cost: penalizes body center near obstacles
+# Body SDF cost: penalizes body center near obstacles (short obstacles only)
 # margin: threshold distance (meters)
 # scale: softplus sharpness (meters, smaller = sharper transition)
 # weight: overall cost multiplier
@@ -157,14 +168,19 @@ body_sdf_margin: 0.2
 body_sdf_scale: 0.2
 body_sdf_weight: 1.0
 
-# Foot path SDF cost: penalizes swing arcs through obstacles
+# Foot path SDF cost: penalizes swing arcs through obstacles (short obstacles only)
 # Evaluates SDF at interpolated points between stance and planned positions
 foot_path_sdf_scale: 0.2
 foot_path_sdf_weight: 5.0
 
+# Foot plan SDF cost: exponential penalty on planned foot positions (tall obstacles only)
+# scale: exponential decay length (meters, larger = longer reach)
+foot_plan_sdf_weight: 15.0
+foot_plan_sdf_scale: 0.2
+
 # Foot tracking cost: penalizes deviation between actual and planned foot positions
 # S2-style cost accumulated during rollout
-foot_tracking_weight: 1.0
+foot_tracking_weight: 50.0
 
 # Foot step cost: penalizes displacement from current stance (only at step 0)
 # Disabled by default - use foot_chain_weight for regularization

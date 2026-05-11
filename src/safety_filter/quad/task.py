@@ -464,6 +464,9 @@ class QuadRLTask(Task):
         # COST WEIGHTS - GROUPED BY COST FUNCTION
         # =============================================================================
         
+        # Reference tracking weight
+        self.ref_tracking_weight = float(rl_config.get("ref_tracking_weight", 1.0))
+
         # Foot step cost: penalizes displacement from current stance at step 0
         self.foot_step_weight = float(rl_config.get("foot_step_weight", 50.0))
         
@@ -486,6 +489,18 @@ class QuadRLTask(Task):
         # Foot tracking cost: penalizes deviation from planned foot positions
         self.foot_tracking_weight = float(
             rl_config.get("foot_tracking_weight", 0.0)
+        )
+
+        # Foot plan SDF cost: direct exponential penalty on planned foot positions
+        # near obstacles. Provides a smooth, long-range gradient for MPPI to
+        # steer feet away from obstacles at the planning level — essential for
+        # navigation where obstacles are sparse and body_sdf_cost is inactive.
+        # Set weight to 0 for cluttered scenes (projection handles fine placement).
+        self.foot_plan_sdf_weight = float(
+            rl_config.get("foot_plan_sdf_weight", 0.0)
+        )
+        self.foot_plan_sdf_scale = float(
+            rl_config.get("foot_plan_sdf_scale", 0.1)
         )
 
         # =============================================================================
@@ -515,6 +530,24 @@ class QuadRLTask(Task):
             min_height=min_obs_h,
         )
         self._sdf_update_count = 0
+
+        cost_obs_threshold = float(
+            rl_config.get("cost_obstacle_height_threshold", 0.1)
+        )
+        self.tall_obstacle_sdf = self.obstacle_sdf.filter_by_height(
+            min_height=cost_obs_threshold
+        )
+        self.short_obstacle_sdf = self.obstacle_sdf.filter_by_height(
+            max_height=cost_obs_threshold
+        )
+
+        # When all obstacles belong to one height class, reuse the original SDF
+        # directly to avoid a numpy→JAX roundtrip through filter_by_height that
+        # could change float32 precision or trigger XLA recompilation.
+        if self.tall_obstacle_sdf.num_obstacles == self.obstacle_sdf.num_obstacles:
+            self.tall_obstacle_sdf = self.obstacle_sdf
+        if self.short_obstacle_sdf.num_obstacles == self.obstacle_sdf.num_obstacles:
+            self.short_obstacle_sdf = self.obstacle_sdf
 
         # =============================================================================
         # LEARNED SAFETY VALUE (optional)
@@ -1069,7 +1102,7 @@ class QuadRLTask(Task):
         Only swing feet (contact_plan[f] == 0) are checked because stance feet
         do not move — their arc is degenerate (zero length) and irrelevant.
         """
-        if self.obstacle_sdf.num_obstacles == 0:
+        if self.short_obstacle_sdf.num_obstacles == 0:
             return jnp.array(0.0)
 
         # Identify swing feet: contact_plan[:4] encodes phase for each foot.
@@ -1107,7 +1140,7 @@ class QuadRLTask(Task):
 
         flat_stance_arc = interp_stance_to_step0.reshape(-1, 2)  # (n_interp * 4, 2)
 
-        sdfs_stance, _ = _batch_sdf_and_grad(flat_stance_arc, self.obstacle_sdf)
+        sdfs_stance, _ = _batch_sdf_and_grad(flat_stance_arc, self.short_obstacle_sdf)
         min_sdfs_stance = jnp.min(sdfs_stance, axis=1)  # (n_interp * 4,)
 
         # Compute violations for all feet, then mask to swing feet only.
@@ -1137,7 +1170,7 @@ class QuadRLTask(Task):
 
         flat_step_arc = interp_step0_to_step1.reshape(-1, 2)  # (n_interp * 4, 2)
 
-        sdfs_step, _ = _batch_sdf_and_grad(flat_step_arc, self.obstacle_sdf)
+        sdfs_step, _ = _batch_sdf_and_grad(flat_step_arc, self.short_obstacle_sdf)
         min_sdfs_step = jnp.min(sdfs_step, axis=1)  # (n_interp * 4,)
 
         all_violations_step = jnp.maximum(0.0, self.projection_clearance - min_sdfs_step)
@@ -1164,11 +1197,11 @@ class QuadRLTask(Task):
         This does NOT cause weight collapse — it's a continuous soft cost, not
         an all-or-nothing binary flag.
         """
-        if self.obstacle_sdf.num_obstacles == 0:
+        if self.short_obstacle_sdf.num_obstacles == 0:
             return jnp.array(0.0)
 
         body_xy = state.xpos[self.base_body_id, :2]
-        sdfs, _ = _sdf_and_grad_all(body_xy, self.obstacle_sdf)
+        sdfs, _ = _sdf_and_grad_all(body_xy, self.short_obstacle_sdf)
         min_sdf = jnp.min(sdfs)
         violation = jnp.maximum(0.0, self.body_sdf_margin - min_sdf)
         # Clamp before softplus to prevent overflow.  softplus(x) ~ x for small x,
@@ -1176,6 +1209,39 @@ class QuadRLTask(Task):
         # keeps the result safe for any physically plausible SDF value.
         violation_safe = jnp.clip(violation, -1e4, 1e4)
         return self.body_sdf_weight * jax.nn.softplus(violation_safe / self.body_sdf_scale) * self.body_sdf_scale
+
+    def foot_plan_sdf_cost(
+        self, task_params: QuadRLTaskParams, plan_segment: jax.Array
+    ) -> jax.Array:
+        """Direct exponential penalty on planned foot landing positions near obstacles.
+
+        Evaluates SDF at each planned foot XY position (denormalized) and applies
+        an exponential penalty: weight * exp(-min_sdf / scale).
+
+        Unlike body_sdf_cost (which measures the simulated body position and
+        depends on the physics rollout), this directly penalizes the plan input.
+        Every 2-foot landing pair for every foot at every horizon step contributes
+        a cost proportional to how close the foot lands to the nearest obstacle.
+
+        The exponential kernel has a long tail (~0.5 m for scale=0.1), giving MPPI
+        a smooth gradient to steer feet away from obstacles even in sparse
+        navigation scenes where the body never enters the body_sdf margin.
+
+        Set foot_plan_sdf_weight=0 to disable (e.g. in cluttered scenes where
+        foot_projection handles precise placement).
+        """
+        if self.foot_plan_sdf_weight <= 0.0 or self.tall_obstacle_sdf.num_obstacles == 0:
+            return jnp.array(0.0)
+
+        n_steps = plan_segment.shape[0]
+        feet_xy = self.denormalize(plan_segment).reshape(n_steps, 4, 3)[..., :2]
+        flat_xy = feet_xy.reshape(-1, 2)
+        sdfs, _ = _batch_sdf_and_grad(flat_xy, self.tall_obstacle_sdf)
+        min_sdfs = jnp.min(sdfs, axis=1)
+        exp_arg = jnp.clip(
+            -min_sdfs / self.foot_plan_sdf_scale, a_min=-100.0, a_max=20.0
+        )
+        return self.foot_plan_sdf_weight * jnp.sum(jnp.exp(exp_arg))
 
     def foot_tracking_cost(
         self, task_params: QuadRLTaskParams, state: mjx.Data, plan_segment: jax.Array
@@ -1249,10 +1315,10 @@ class QuadRLTask(Task):
             plan_segment_ref = jnp.zeros_like(plan_segment)
 
         # Tracking cost only (terminal - evaluated at end state)
-        tracking_cost = jnp.sum((plan_segment - plan_segment_ref) ** 2)
+        tracking_cost = self.ref_tracking_weight * jnp.sum((plan_segment - plan_segment_ref) ** 2) / self.horizon_length
         # foot_tracking = self.foot_tracking_cost(task_params, state)
 
-        return tracking_cost  # + foot_tracking
+        return tracking_cost # + foot_tracking
 
     def dense_running_cost(
         self,
@@ -1265,6 +1331,7 @@ class QuadRLTask(Task):
         foot_chain = self.foot_chain_cost(task_params, plan_segment)
         foot_path = self.foot_path_sdf_cost(task_params, plan_segment)
         body_sdf = self.body_sdf_cost(state)
+        foot_plan = self.foot_plan_sdf_cost(task_params, plan_segment)
         # foot_tracking = self.foot_tracking_cost(task_params, state, plan_segment)
 
         return (
@@ -1273,6 +1340,7 @@ class QuadRLTask(Task):
             + foot_chain
             # + foot_tracking
             + foot_path
+            + foot_plan
         )
 
     def forward(self, model, tp, x, a, a_ref, step_idx=None):

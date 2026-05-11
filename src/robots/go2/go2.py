@@ -51,6 +51,11 @@ class Go2(RobotBase):
         self.joints_unitree2isaac = self.joint_mapper.mujoco_to_isaac_mapping
         self.joints_isaac2unitree = self.joint_mapper.isaac_to_mujoco_mapping
 
+        # Hip sign convention (MuJoCo/hardware order): FR/RR hips = +positive, FL/RL hips = -negative.
+        # The RL policy config (ISAAC_LAB_DEFAULT_JOINT_POS) uses the OPPOSITE sign convention
+        # (FL/RL = +positive, FR/RR = -negative).  If switching between stand controllers and
+        # RL policy, flip all 4 hip signs or use rl_mps_controller's built-in blend transition
+        # to avoid 0.2 rad target jumps.
         self.stand_down_joint_pos = [
             0.0473455,
             1.22187,
