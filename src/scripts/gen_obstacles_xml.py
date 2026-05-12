@@ -11,6 +11,7 @@ Usage:
   python gen_obstacles_xml.py --size 0.1 0.1 0.15      # custom box size
   python gen_obstacles_xml.py --height 0.0              # obstacles at z=0 (ground)
   python gen_obstacles_xml.py --robot-topic /vicon/Go2/root
+  python gen_obstacles_xml.py --obs-data obs.data       # per-obstacle sizes from file
 
 Revert: git checkout go2.xml go2_mjx.xml obstacles_hw.xml
 """
@@ -50,6 +51,9 @@ class SceneCaptureNode(Node):
         self._robot_positions: List[Tuple[float, float]] = []
         self._robot_quats: List[Tuple[float, float, float, float]] = []
         self._obstacle_positions: Dict[str, List[Tuple[float, float, float]]] = (
+            defaultdict(list)
+        )
+        self._obstacle_quats: Dict[str, List[Tuple[float, float, float, float]]] = (
             defaultdict(list)
         )
         self._robot_found = False
@@ -122,6 +126,9 @@ class SceneCaptureNode(Node):
         self._obstacle_positions[topic].append(
             (msg.x_trans * 0.001, msg.y_trans * 0.001, msg.z_trans * 0.001)
         )
+        self._obstacle_quats[topic].append(
+            (msg.x_rot, msg.y_rot, msg.z_rot, msg.w)
+        )
 
     def all_done(self) -> bool:
         if self._done:
@@ -176,10 +183,40 @@ class SceneCaptureNode(Node):
             result[topic] = np.median(arr, axis=0)
         return result
 
+    def get_obstacle_poses(
+        self,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        positions = {}
+        quaternions = {}
+        for topic in self._obstacle_positions:
+            pos_samples = self._obstacle_positions[topic]
+            quat_samples = self._obstacle_quats[topic]
+            if not pos_samples or not quat_samples:
+                continue
+            positions[topic] = np.median(np.array(pos_samples), axis=0)
+            quaternions[topic] = np.median(np.array(quat_samples), axis=0)
+        return positions, quaternions
+
 
 def _short_name(topic: str) -> str:
     parts = [p for p in topic.strip("/").split("/") if p]
     return parts[-1] if parts else topic.replace("/", "_")
+
+
+def load_obs_sizes(path: str) -> Dict[str, Tuple[float, float, float]]:
+    sizes: Dict[str, Tuple[float, float, float]] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            name, hx, hy, hz = parts
+            sizes[name] = (float(hx), float(hy), float(hz))
+    print(f"Loaded {len(sizes)} obstacle size(s) from {path}")
+    return sizes
 
 
 _BASE_LINK_RE = re.compile(
@@ -213,9 +250,11 @@ def _update_robot_pose_in_xml(
 def write_obstacles_xml(
     positions: Dict[str, np.ndarray],
     output_path: str,
-    size: Tuple[float, float, float],
+    default_size: Tuple[float, float, float],
     height: Optional[float],
     rgba: Tuple[float, float, float, float],
+    quaternions: Optional[Dict[str, np.ndarray]] = None,
+    sizes: Optional[Dict[str, Tuple[float, float, float]]] = None,
 ):
     lines = ["<mujocoinclude>", ""]
     lines.append(
@@ -226,17 +265,25 @@ def write_obstacles_xml(
     )
     lines.append("")
 
-    hx, hy, hz = size
+    quaternions = quaternions or {}
+    sizes = sizes or {}
 
     for i, (topic, pos) in enumerate(sorted(positions.items())):
         name = _short_name(topic)
+        hx, hy, hz = sizes.get(name, default_size)
         x, y, z_measured = float(pos[0]), float(pos[1]), float(pos[2])
         z = height if height is not None else z_measured
         r, g, b, a = rgba
 
+        quat_attr = ""
+        if topic in quaternions:
+            q = quaternions[topic]
+            quat_attr = f'quat="{float(q[3]):.6f} {float(q[0]):.6f} {float(q[1]):.6f} {float(q[2]):.6f}" '
+
         line = (
             f'    <geom name="obstacle_hw_{i}" '
             f'pos="{x:.4f} {y:.4f} {z:.4f}" '
+            f'{quat_attr}'
             f'type="box" '
             f'size="{hx:.4f} {hy:.4f} {hz:.4f}" '
             f'rgba="{r:.2f} {g:.2f} {b:.2f} {a:.2f}" '
@@ -318,6 +365,12 @@ def main():
         metavar=("R", "G", "B", "A"),
         help="Obstacle color (default: 0.8 0.2 0.2 1.0 = red)",
     )
+    parser.add_argument(
+        "--obs-data",
+        default=None,
+        help="Path to obs.data file with per-obstacle box half-sizes "
+             "(format: <name> <hx> <hy> <hz> per line)",
+    )
 
     args = parser.parse_args()
 
@@ -343,9 +396,13 @@ def main():
         node.get_logger().info("Interrupted by user.")
 
     robot_pose = node.get_robot_pose()
-    obstacle_positions = node.get_obstacle_positions()
+    obstacle_positions, obstacle_quaternions = node.get_obstacle_poses()
     node.destroy_node()
     rclpy.shutdown()
+
+    obs_sizes = None
+    if args.obs_data and os.path.exists(args.obs_data):
+        obs_sizes = load_obs_sizes(args.obs_data)
 
     if robot_pose is not None:
         rx, ry, qw, qx, qy, qz = robot_pose
@@ -358,9 +415,11 @@ def main():
         write_obstacles_xml(
             obstacle_positions,
             OBSTACLES_HW_XML,
-            size=tuple(args.size),
+            default_size=tuple(args.size),
             height=args.height,
             rgba=tuple(args.rgba),
+            quaternions=obstacle_quaternions,
+            sizes=obs_sizes,
         )
     else:
         write_empty_obstacles_xml(OBSTACLES_HW_XML)
