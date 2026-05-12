@@ -25,7 +25,7 @@ from safety_filter.bases.risk import RiskStrategy
 
 _DEFAULT_COM_HEIGHT = 0.35
 _DEFAULT_DCBF_GAMMA = 0.5
-_DEFAULT_MAX_CORRECTION = 0.10
+_DEFAULT_MAX_CORRECTION = 0.20
 
 
 @dataclass
@@ -236,7 +236,7 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         s_k = jnp.array([base_pos[0], base_vel[0], base_pos[1], base_vel[1]])
 
         sdf = self.task.obstacle_sdf
-        clearance = self.task.projection_clearance
+        clearance = self.task.body_sdf_margin
 
         if sdf.num_obstacles == 0:
             safe_plan = params.ref

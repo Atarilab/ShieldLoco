@@ -155,7 +155,7 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         N = states.shape[0]
 
         sdfs, _ = _batch_sdf_and_grad(states[:, [0, 2]], self.task.obstacle_sdf)
-        h_vals = jnp.min(sdfs, axis=-1) - self.task.projection_clearance
+        h_vals = jnp.min(sdfs, axis=-1) - self.task.body_sdf_margin
 
         u_1d = jnp.linspace(-self._foot_bounds, self._foot_bounds, self._n_u_per_dim)
         UX, UY = jnp.meshgrid(u_1d, u_1d, indexing="ij")
@@ -328,10 +328,8 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         V_nom = self._query_V(s_nom)
 
         grad = self._grad_V(s_nom)
-        grad_B = jnp.array([
-            grad[0] * self._B_xy[0, 0] + grad[2] * self._B_xy[1, 0],
-            grad[0] * self._B_xy[0, 1] + grad[2] * self._B_xy[1, 1],
-        ])
+        grad_B = self._B_full.T @ grad          # (2,)  = B_full^T (4×2) @ grad (4,)
+        grad_B = grad_B[:2]                     # keep only the u_x, u_y components
 
         A_hj = -grad_B[None, :]
         b_hj = V_nom - grad_B @ u_avg_nom
