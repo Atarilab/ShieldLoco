@@ -22,6 +22,7 @@ class MjRobotWrapper:
         """
         self.model = mujoco.MjModel.from_xml_path(xml_path)  # type: ignore
         self.data = mujoco.MjData(self.model)  # type: ignore
+        mujoco.mj_forward(self.model, self.data)  # type: ignore
 
         # Cache commonly used body and joint indices
         self.body_names = {}
