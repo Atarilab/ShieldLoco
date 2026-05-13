@@ -144,6 +144,7 @@ constraint_min_obstacle_height: 0.0001
 
 # ---- Foot Projection ----
 # Pushes sampled foot positions out of obstacles
+# hardware 0.15
 projection_clearance: 0.08   # meters (foot_radius + safety_margin)
 projection_iters: 3          # Active-set QP iterations
 
@@ -168,6 +169,7 @@ foot_chain_weight: 40.0
 # margin: threshold distance (meters)
 # scale: softplus sharpness (meters, smaller = sharper transition)
 # weight: overall cost multiplier
+# hardware 0.01
 body_sdf_margin: 0.2
 body_sdf_scale: 0.2
 body_sdf_weight: 1.0

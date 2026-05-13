@@ -245,10 +245,22 @@ source setup.sh
 ros2 run master_manager master_node --task rl-mps-real-go2
 ```
 
+#### Terminal 4 (Data Collection)
+Record experiment data (Vicon pose + optimizer metrics) to CSV:
+```bash
+./doom.sh -a
+source setup.sh
+cd src
+python3 eval/hw_data_collector.py --label static_nav
+python3 eval/hw_data_collector.py --label static_nav --rosbag   # with rosbag
+```
+
+> **Note**: Start the collector BEFORE running the controller (captures full episode). Ctrl+C to stop cleanly.
+
 #### Joystick Workflow
 
 | Sequence | Button | Action |
-|---|---|---|
+|---|---|---|---|
 | Startup | `Select` | ZERO mode |
 | | `Start` | STAY_DOWN |
 | | `L1+R1` | STANCE |
@@ -262,6 +274,42 @@ ros2 run master_manager master_node --task rl-mps-real-go2
 | Shutdown | `Start` | DAMPING |
 
 > **Note**: The safety filter (MPPI) runs on GPU in a separate process. Ensure the container has GPU access (`nvidia-container-toolkit` installed). MPC starts OFF by default — press `A` to enable.
+
+### Data Collection & Output
+
+The controller publishes `/mps_optimizer_metrics` (Float32MultiArray) every control step — 12 floats: tracking cost, optimizer cost, opt elapsed ms, MPC active, plan seq, body-frame velocity, base height, base position. Use `eval/hw_data_collector.py` to log this alongside Vicon pose.
+
+**Sim testing** (no Vicon — uses controller's base position estimate):
+```bash
+cd src/
+python3 eval/hw_data_collector.py --sim --task rl-mps-eval-go2 --label static_nav
+python3 eval/hw_data_collector.py --sim --label static_nav --rosbag
+```
+
+**Hardware** (uses Vicon for ground-truth pose):
+```bash
+cd src/
+python3 eval/hw_data_collector.py --label static_nav
+python3 eval/hw_data_collector.py --label static_nav --rosbag
+```
+
+**Output directory** (`{alg}_{interface}_{label}_{timestamp}/`):
+```
+results/hw_eval/REMIMPS_hw_static_nav_20260512_143022/
+├── configs/
+│   ├── controller_cfg.yaml         # rl_mps_go2_cfg.yaml copy
+│   └── robot_interface_cfg.yaml    # real_go2_cfg.yaml copy
+├── xmls/
+│   ├── scene.xml, scene_mjx.xml    # scene XMLs
+│   ├── go2.xml, go2_mjx.xml        # robot XMLs
+│   ├── obstacles_hw.xml            # obstacle geometry
+│   └── balls.xml                   # dynamic obstacle config
+├── eval_data.csv                   # paper-ready metrics (time-series)
+├── experiment_config.json          # metadata (label, task, mode, timestamp)
+└── rosbag/                         # only if --rosbag
+```
+
+**CSV columns**: `t, x, y, z, qw, qx, qy, qz, heading, tracking_cost, optimizer_cost, opt_elapsed_ms, mpc_active, plan_seq, ctrl_vx, ctrl_vy, ctrl_height, frame_number`
 
 ---
 

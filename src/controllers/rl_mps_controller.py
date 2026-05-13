@@ -562,6 +562,8 @@ class RLQuadrupedMPSController(RLControllerBase):
                     #     violated = train_data["constraint_flags"].any()
                     #     self.logger.debug(f"Constraint Violated: {violated}")
 
+            self._publish_optimizer_metrics(state)
+
             if self.visualize["current_contact_locations"]:
                 self.pub_current_contact_locations()
 
@@ -1316,6 +1318,8 @@ class RLQuadrupedMPSController(RLControllerBase):
         if self.visualize["contact_status"]:
             self.contact_status_pub = self.create_publisher(Float32MultiArray, "contact_status", 10)
 
+        self._optimizer_metrics_pub = self.create_publisher(Float32MultiArray, "/mps_optimizer_metrics", 10)
+
     def pub_feet_error(self):
         """
         Visualizes the feet error in the world frame.
@@ -1714,3 +1718,49 @@ class RLQuadrupedMPSController(RLControllerBase):
             self.foot_forces_pub.publish(msg)
         except Exception as e:
             self.logger.error(f"Failed to publish foot forces: {e}")
+
+    def _publish_optimizer_metrics(self, state):
+        """Publish optimizer metrics over /mps_optimizer_metrics.
+
+        Float32MultiArray layout (12 floats):
+          [tracking_cost, optimizer_cost, opt_elapsed_ms, mpc_active,
+           plan_seq, ctrl_vx, ctrl_vy, ctrl_height, ctrl_timestamp,
+           base_x, base_y, base_z]
+        """
+        try:
+            diff = self.future_feet_positions_w - self.reference_feet_positions_w
+            tracking_cost = float(torch.nan_to_num(diff ** 2, nan=0.0).sum())
+
+            optimizer_cost = 0.0
+            opt_elapsed_ms = 0.0
+            train_data = self.safety_manager.get_train_data()
+            if train_data is not None and "costs" in train_data:
+                costs = np.asarray(train_data["costs"])
+                if costs.ndim == 1:
+                    optimizer_cost = float(costs.sum())
+                elif costs.ndim == 2:
+                    optimizer_cost = float(costs.sum(axis=1).min())
+            if self.safety_manager._shared_result is not None:
+                opt_elapsed_ms = float(self.safety_manager._shared_result.get("opt_elapsed_ms", 0.0))
+
+            lin_vel = state.get("robot/base_lin_vel_b", [0.0, 0.0, 0.0])
+            base_pos = state.get("robot/base_pos_w", [0.0, 0.0, 0.0])
+
+            msg = Float32MultiArray()
+            msg.data = [
+                tracking_cost,
+                optimizer_cost,
+                opt_elapsed_ms,
+                float(self.apply_mpc_contact_plan),
+                float(self.safety_manager._last_result_seq),
+                float(lin_vel[0]),
+                float(lin_vel[1]),
+                float(base_pos[2]),
+                float(time.time()),
+                float(base_pos[0]),
+                float(base_pos[1]),
+                float(base_pos[2]),
+            ]
+            self._optimizer_metrics_pub.publish(msg)
+        except Exception:
+            pass  # Silent — don't disturb control loop
