@@ -16,6 +16,7 @@ from safety_filter.quad.foot_projection import (
     project_plan_feet_with_arc_check,
     _sdf_and_grad_all,
     _batch_sdf_and_grad,
+    get_projection_methods,
 )
 
 from flax.struct import dataclass
@@ -459,6 +460,17 @@ class QuadRLTask(Task):
             rl_config.get("projection_clearance", 0.07)
         )
         self.projection_iters = int(rl_config.get("projection_iters", 3))
+        projection_method_name = rl_config.get("projection_method", "iterative")
+        self._project_fn, self._project_fn_arc = get_projection_methods(
+            projection_method_name
+        )
+        if projection_method_name == "iterative":
+            self._project_fn = partial(
+                project_plan_feet, n_iters=self.projection_iters
+            )
+            self._project_fn_arc = partial(
+                project_plan_feet_with_arc_check, n_iters=self.projection_iters
+            )
 
         # =============================================================================
         # COST WEIGHTS - GROUPED BY COST FUNCTION
@@ -579,8 +591,7 @@ class QuadRLTask(Task):
     def project_plan_to_safe(self, plans_normalized: jax.Array) -> jax.Array:
         """Project foot XY positions to satisfy obstacle clearance.
 
-        Solves min ||p - p_ref||^2 s.t. SDF(p) >= r_safe for all obstacles,
-        using the active-set QP in foot_projection.py.
+        Uses the configured projection method (iterative / qp_single / qp_sqp).
 
         Args:
             plans_normalized: (..., H, plan_dim) normalised contact plans.
@@ -591,11 +602,10 @@ class QuadRLTask(Task):
             return plans_normalized
 
         plans_world = self.denormalize(plans_normalized)
-        projected_world = project_plan_feet(
+        projected_world = self._project_fn(
             plans_world,
             self.obstacle_sdf,
             self.projection_clearance,
-            self.projection_iters,
         )
         return self.normalize(projected_world)
 
@@ -604,13 +614,8 @@ class QuadRLTask(Task):
     ) -> jax.Array:
         """Project foot XY positions with arc-aware swing collision avoidance.
 
-        Like project_plan_to_safe but additionally checks each swing arc
-        (current stance -> h=0, and h-1 -> h for h>0) and snaps landings
-        to the near-side boundary if the arc would cross an obstacle.
-
-        This addresses the key failure mode where geometric projection lands
-        a foot on the far side of an obstacle (SDF >= r_safe at landing) but
-        the swing arc from current stance passes through the obstacle interior.
+        Uses the configured projection method (iterative / qp_single / qp_sqp)
+        and additionally checks each swing arc to prevent crossing obstacles.
 
         Args:
             plans_normalized:   (..., H, plan_dim) normalised contact plans.
@@ -624,12 +629,11 @@ class QuadRLTask(Task):
             return plans_normalized
 
         plans_world = self.denormalize(plans_normalized)
-        projected_world = project_plan_feet_with_arc_check(
+        projected_world = self._project_fn_arc(
             plans_world,
             self.obstacle_sdf,
             self.projection_clearance,
             current_feet_world,
-            self.projection_iters,
         )
         return self.normalize(projected_world)
 

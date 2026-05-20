@@ -473,3 +473,296 @@ def project_plan_feet_with_arc_check(plans_denorm, sdf, r_safe, current_feet_xy,
     corrected_xy_4d = corrected_xy.reshape(*batch, H, 4, 2)
     corrected_4d = jnp.concatenate([corrected_xy_4d, feet_z], axis=-1)
     return corrected_4d.reshape(plans_denorm.shape)
+
+
+# ===========================================================================
+# QP projection: pairwise KKT enumeration
+# ===========================================================================
+#
+# For a 2D point with identity Hessian and M half-plane constraints, at most
+# 2 constraints can be active at the optimum.  We enumerate single-constraint
+# and pairwise projections, verify feasibility against all linearized
+# constraints, and pick the best feasible candidate.
+#
+# This gives the exact QP solution for the linearized subproblem in closed
+# form per candidate — no iterative convergence issues.
+# ===========================================================================
+
+
+def _project_one_pairwise(p_ref, sdfs, grads, r_safe):
+    """Project a single foot (2,) using pairwise KKT enumeration.
+
+    Args:
+        p_ref: (2,) initial XY position.
+        sdfs: (M,) SDF values at p_ref.
+        grads: (M, 2) outward unit gradients at p_ref.
+        r_safe: required clearance.
+
+    Returns:
+        p_proj: (2,) projected position.
+    """
+    M = sdfs.shape[0]
+    v = r_safe - sdfs  # (M,) violation per obstacle
+
+    b_rhs = jnp.einsum("mj,j->m", grads, p_ref) + r_safe - sdfs  # (M,)
+
+    top2_idx = jnp.flip(jnp.argsort(v)[-2:])
+    v2 = v[top2_idx]
+    g2 = grads[top2_idx]  # (2, 2)
+
+    # Candidate 1: single-constraint projection onto worst
+    p1 = p_ref + v2[0] * g2[0]
+    feasible1 = jnp.all(grads @ p1 >= b_rhs - 1e-5)
+
+    # Candidate 2: pairwise intersection
+    G = g2
+    det = G[0, 0] * G[1, 1] - G[0, 1] * G[1, 0]
+    nonsingular = jnp.abs(det) > 1e-10
+
+    def _compute_p2():
+        G_inv = jnp.array([[G[1, 1], -G[0, 1]], [-G[1, 0], G[0, 0]]]) / det
+        return G_inv @ b_rhs[top2_idx]
+    def _fallback_p2():
+        return p_ref
+    p2 = jax.lax.cond(nonsingular, _compute_p2, _fallback_p2)
+    feasible2 = jnp.all(grads @ p2 >= b_rhs - 1e-5) & nonsingular
+
+    p_default = p1
+    p_best = jax.lax.select(
+        feasible2, p2, jax.lax.select(feasible1, p1, p_default)
+    )
+    any_violation = v2[0] > 1e-6
+    return jax.lax.select(any_violation, p_best, p_ref)
+
+
+_project_batch_pairwise = jax.vmap(_project_one_pairwise, in_axes=(0, 0, 0, None))
+
+
+def project_plan_feet_qp(plans_denorm, sdf, r_safe):
+    """Project foot XY positions using pairwise KKT QP (1 SDF eval).
+
+    Solves min ||p - p_ref||^2 s.t. linearised SDF_j(p) >= r_safe via
+    enumeration of the top-2 violated half-plane constraints.
+
+    Args:
+        plans_denorm: (..., H, 12) world-frame feet positions.
+        sdf: ObstacleSDF.
+        r_safe: required clearance (metres).
+
+    Returns:
+        Same shape with projected XY and untouched Z.
+    """
+    if sdf.num_obstacles == 0:
+        return plans_denorm
+
+    *batch, H, _ = plans_denorm.shape
+    feet = plans_denorm.reshape(*batch, H, 4, 3)
+    feet_xy = feet[..., :2]
+    feet_z = feet[..., 2:]
+    flat_xy = feet_xy.reshape(-1, 2)
+
+    sdfs_all, grads_all = _batch_sdf_and_grad(flat_xy, sdf)
+    p_proj = _project_batch_pairwise(flat_xy, sdfs_all, grads_all, r_safe)
+
+    projected_xy = p_proj.reshape(feet_xy.shape)
+    projected_feet = jnp.concatenate([projected_xy, feet_z], axis=-1)
+    return projected_feet.reshape(plans_denorm.shape)
+
+
+def project_plan_feet_qp_sqp(plans_denorm, sdf, r_safe, n_outer=2):
+    """SQP‑style QP: 2 outer iterations re‑linearising SDF after each solve.
+
+    Each iteration: evaluate SDFs, project via pairwise KKT, re-linearise.
+    This catches the nonlinear boundary cases (boxes, capsules) that a single
+    linearisation might miss.
+
+    Args:
+        plans_denorm: (..., H, 12).
+        sdf: ObstacleSDF.
+        r_safe: clearance.
+        n_outer: SQP outer iterations (1 or 2).
+
+    Returns:
+        Projected feet.
+    """
+    if sdf.num_obstacles == 0:
+        return plans_denorm
+
+    *batch, H, _ = plans_denorm.shape
+    feet = plans_denorm.reshape(*batch, H, 4, 3)
+    feet_xy = feet[..., :2]
+    feet_z = feet[..., 2:]
+    p = feet_xy.reshape(-1, 2)
+
+    sdfs, grads = _batch_sdf_and_grad(p, sdf)
+    p = _project_batch_pairwise(p, sdfs, grads, r_safe)
+
+    if n_outer >= 2:
+        sdfs, grads = _batch_sdf_and_grad(p, sdf)
+        p = _project_batch_pairwise(p, sdfs, grads, r_safe)
+
+    projected_xy = p.reshape(feet_xy.shape)
+    projected_feet = jnp.concatenate([projected_xy, feet_z], axis=-1)
+    return projected_feet.reshape(plans_denorm.shape)
+
+
+def project_plan_feet_with_arc_check_qp(plans_denorm, sdf, r_safe, current_feet_xy):
+    """Arc‑aware foot projection using pairwise KKT QP (1 SDF eval).
+
+    Like project_plan_feet_with_arc_check but replaces the iterative
+    projection step with a single‑shot QP solve.
+
+    Args:
+        plans_denorm:    (..., H, 12) world-frame feet positions.
+        sdf:             ObstacleSDF.
+        r_safe:          required clearance (metres).
+        current_feet_xy: (..., 4, 2) current foot XY in world frame.
+
+    Returns:
+        Projected plans with arc corrections.
+    """
+    if sdf.num_obstacles == 0:
+        return plans_denorm
+
+    *batch, H, _ = plans_denorm.shape
+    feet = plans_denorm.reshape(*batch, H, 4, 3)
+    feet_xy = feet[..., :2]
+    feet_z = feet[..., 2:]
+
+    flat_xy = feet_xy.reshape(-1, 2)
+    sdfs_all, grads_all = _batch_sdf_and_grad(flat_xy, sdf)
+    projected_flat_xy = _project_batch_pairwise(flat_xy, sdfs_all, grads_all, r_safe)
+    projected_xy = projected_flat_xy.reshape(feet_xy.shape)
+
+    def _fix_arc_h0(p_proj, p_curr):
+        return jax.vmap(check_and_fix_swing_arc, in_axes=(0, 0, None, None))(
+            p_curr, p_proj, sdf, r_safe
+        )
+
+    def _fix_arc_hm1(p_proj, p_from):
+        return jax.vmap(check_and_fix_swing_arc, in_axes=(0, 0, None, None))(
+            p_from, p_proj, sdf, r_safe
+        )
+
+    corrected_xy = projected_xy.copy()
+
+    h0_to_check = corrected_xy[..., 0, :, :]
+    current_arr = jnp.asarray(current_feet_xy)
+    if current_arr.ndim == 2:
+        h0_from = jnp.broadcast_to(current_arr, h0_to_check.shape)
+    else:
+        h0_from = current_arr.reshape(*batch, 4, 2)
+    fixed_h0 = _fix_arc_h0(h0_to_check, h0_from)
+    corrected_xy = corrected_xy.at[..., 0, :, :].set(fixed_h0)
+
+    if H > 1:
+        for h in range(1, H):
+            hm1_xy = corrected_xy[..., h - 1, :, :]
+            h_xy = corrected_xy[..., h, :, :]
+            fixed_h = _fix_arc_hm1(h_xy, hm1_xy)
+            corrected_xy = corrected_xy.at[..., h, :, :].set(fixed_h)
+
+    corrected_xy_4d = corrected_xy.reshape(*batch, H, 4, 2)
+    corrected_4d = jnp.concatenate([corrected_xy_4d, feet_z], axis=-1)
+    return corrected_4d.reshape(plans_denorm.shape)
+
+
+def project_plan_feet_with_arc_check_qp_sqp(
+    plans_denorm, sdf, r_safe, current_feet_xy, n_outer=2
+):
+    """Arc‑aware foot projection using SQP (2 SDF evals, re‑linearising).
+
+    Like project_plan_feet_with_arc_check_qp but with 2 outer iterations.
+
+    Args:
+        plans_denorm:    (..., H, 12).
+        sdf:             ObstacleSDF.
+        r_safe:          clearance.
+        current_feet_xy: (..., 4, 2).
+        n_outer:         SQP outer iterations (1 or 2).
+
+    Returns:
+        Projected plans with arc corrections.
+    """
+    if sdf.num_obstacles == 0:
+        return plans_denorm
+
+    *batch, H, _ = plans_denorm.shape
+    feet = plans_denorm.reshape(*batch, H, 4, 3)
+    feet_xy = feet[..., :2]
+    feet_z = feet[..., 2:]
+    p = feet_xy.reshape(-1, 2)
+
+    sdfs, grads = _batch_sdf_and_grad(p, sdf)
+    p = _project_batch_pairwise(p, sdfs, grads, r_safe)
+
+    if n_outer >= 2:
+        sdfs, grads = _batch_sdf_and_grad(p, sdf)
+        p = _project_batch_pairwise(p, sdfs, grads, r_safe)
+
+    projected_xy = p.reshape(feet_xy.shape)
+
+    def _fix_arc_h0(p_proj, p_curr):
+        return jax.vmap(check_and_fix_swing_arc, in_axes=(0, 0, None, None))(
+            p_curr, p_proj, sdf, r_safe
+        )
+
+    def _fix_arc_hm1(p_proj, p_from):
+        return jax.vmap(check_and_fix_swing_arc, in_axes=(0, 0, None, None))(
+            p_from, p_proj, sdf, r_safe
+        )
+
+    corrected_xy = projected_xy.copy()
+
+    h0_to_check = corrected_xy[..., 0, :, :]
+    current_arr = jnp.asarray(current_feet_xy)
+    if current_arr.ndim == 2:
+        h0_from = jnp.broadcast_to(current_arr, h0_to_check.shape)
+    else:
+        h0_from = current_arr.reshape(*batch, 4, 2)
+    fixed_h0 = _fix_arc_h0(h0_to_check, h0_from)
+    corrected_xy = corrected_xy.at[..., 0, :, :].set(fixed_h0)
+
+    if H > 1:
+        for h in range(1, H):
+            hm1_xy = corrected_xy[..., h - 1, :, :]
+            h_xy = corrected_xy[..., h, :, :]
+            fixed_h = _fix_arc_hm1(h_xy, hm1_xy)
+            corrected_xy = corrected_xy.at[..., h, :, :].set(fixed_h)
+
+    corrected_xy_4d = corrected_xy.reshape(*batch, H, 4, 2)
+    corrected_4d = jnp.concatenate([corrected_xy_4d, feet_z], axis=-1)
+    return corrected_4d.reshape(plans_denorm.shape)
+
+
+# ===========================================================================
+# Projection method registry
+# ===========================================================================
+#
+# Add new methods here as (project_fn, project_with_arc_check_fn) tuples.
+# The task code calls get_projection_methods(name) to retrieve the pair,
+# making it trivial to switch between algorithms via config.
+# ===========================================================================
+
+PROJECTION_METHODS = {
+    "iterative": (project_plan_feet, project_plan_feet_with_arc_check),
+    "qp_single": (project_plan_feet_qp, project_plan_feet_with_arc_check_qp),
+    "qp_sqp": (project_plan_feet_qp_sqp, project_plan_feet_with_arc_check_qp_sqp),
+}
+
+
+def get_projection_methods(name):
+    """Return (project_fn, project_with_arc_check_fn) for a named method.
+
+    Args:
+        name: one of "iterative", "qp_single", "qp_sqp".
+
+    Returns:
+        (project_fn, project_with_arc_check_fn) tuple.
+    """
+    if name not in PROJECTION_METHODS:
+        raise ValueError(
+            f"Unknown projection method: {name!r}. "
+            f"Choose from: {list(PROJECTION_METHODS.keys())}"
+        )
+    return PROJECTION_METHODS[name]
