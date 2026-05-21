@@ -3,7 +3,7 @@
 # Metrics: survived (zero violations), min_ball_distance, tracking_cost
 
 scenario: dynamic_obs
-start_gait: trot
+# start_gait: inherited from controller_config.default_gait
 start_move: center         # stay in place
 
 ball_throw_delay: 5.0      # seconds after eval auto-start

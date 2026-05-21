@@ -95,6 +95,8 @@ class QuadAlgSamplingParams:
     best_plan: Optional[jax.Array] = None
     exec_plan: Optional[jax.Array] = None
 
+    diag: jax.Array = jnp.zeros(7, dtype=jnp.float32)
+
 
 class QuadSamplingBasedPlanner(ABC):
     """An abstract sampling-based MPC algorithm interface."""

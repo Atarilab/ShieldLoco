@@ -21,7 +21,7 @@ from controllers.rl_mps_controller import RLQuadrupedMPSController
 
 @dataclass
 class EvalConfig:
-    start_gait: str = "trot"
+    start_gait: str | None = None                 # None = inherit from controller_config.default_gait
     start_move: str = "up"                          # "up"=forward, "center"=stay
     min_plans: int = 2                              # wait for N plans before auto-starting
     start_move_num: int = 8
@@ -33,7 +33,7 @@ class EvalConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "EvalConfig":
         return cls(
-            start_gait=d.get("start_gait", "trot"),
+            start_gait=d.get("start_gait"),  # None means inherit
             start_move=d.get("start_move", "up"),
             min_plans=int(d.get("min_plans", 2)),
             start_move_num=int(d.get("start_move_num", 8)),
@@ -68,6 +68,10 @@ class RLQuadrupedMPSEvalController(RLQuadrupedMPSController):
         super().__init__(robot=robot, configs=configs, debug=debug)
         raw = configs.get("eval_config", {}) or {}
         self.eval_cfg = EvalConfig.from_dict(raw)
+        if self.eval_cfg.start_gait is None:
+            self.eval_cfg.start_gait = configs.get("controller_config", {}).get(
+                "default_gait", "trot"
+            )
         self.eval_m = EvalMetrics()
 
     # ------------------------------------------------------------------

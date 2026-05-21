@@ -164,9 +164,35 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             # Select alpha < (self.momentum + 1) to avoid singularities
             # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
         
+        # ── constraint diagnostics over all samples ──
+        n_total = rollouts.constraint_flags.shape[0]
+        feet_flags  = rollouts.constraint_flags[:, :, 0]   # (N, H+1)
+        body_counts = rollouts.constraint_flags[:, :, 1]   # (N, H+1)
+        total_feet  = jnp.sum(feet_flags, axis=1)           # (N,)
+        total_body  = jnp.sum(body_counts, axis=1)          # (N,)
+        has_foot = total_feet > 0
+        has_body = total_body > 0
+        n_clean     = jnp.sum(~has_foot & ~has_body).astype(jnp.float32)
+        n_foot_only = jnp.sum( has_foot & ~has_body).astype(jnp.float32)
+        n_body_only = jnp.sum(~has_foot &  has_body).astype(jnp.float32)
+        n_both      = jnp.sum( has_foot &  has_body).astype(jnp.float32)
+        first_hit   = jnp.argmax(feet_flags > 0, axis=1).astype(jnp.float32)  # (N,)
+        never_hit   = total_feet == 0
+        first_hit_mean = jnp.where(
+            jnp.any(~never_hit),
+            jnp.sum(jnp.where(~never_hit, first_hit, 0.0)) / jnp.maximum(jnp.sum(~never_hit).astype(jnp.float32), 1.0),
+            -1.0,
+        )
+        diag = jnp.array([
+            n_clean, n_foot_only, n_body_only, n_both,
+            jnp.mean(total_feet), jnp.mean(total_body),
+            first_hit_mean,
+        ], dtype=jnp.float32)
+
         return params.replace(
             mean=new_mean,
             best_plan=new_best,
+            diag=diag,
         )
 
     #### Can be called with super/modified by child classes ####

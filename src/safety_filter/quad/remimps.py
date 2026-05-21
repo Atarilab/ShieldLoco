@@ -434,6 +434,30 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
                 best_plan_replicas=new_best_plans,
             )
 
+            # ---- 5b. Constraint diagnostics (full batch) ----
+            cf_flat = rollouts_flat.constraint_flags  # (K*N_k, H+1, 2)
+            feet_f  = cf_flat[:, :, 0]
+            body_c  = cf_flat[:, :, 1]
+            tf = jnp.sum(feet_f, axis=1)
+            tb = jnp.sum(body_c, axis=1)
+            hf = tf > 0
+            hb = tb > 0
+            nc = jnp.sum(~hf & ~hb).astype(jnp.float32)
+            nfo = jnp.sum(hf & ~hb).astype(jnp.float32)
+            nbo = jnp.sum(~hf & hb).astype(jnp.float32)
+            nb = jnp.sum(hf & hb).astype(jnp.float32)
+            fh = jnp.argmax(feet_f > 0, axis=1).astype(jnp.float32)
+            nh = tf == 0
+            fhm = jnp.where(
+                jnp.any(~nh),
+                jnp.sum(jnp.where(~nh, fh, 0.0)) / jnp.maximum(jnp.sum(~nh).astype(jnp.float32), 1.0),
+                -1.0,
+            )
+            params_iter = params_iter.replace(diag=jnp.array([
+                nc, nfo, nbo, nb,
+                jnp.mean(tf), jnp.mean(tb), fhm,
+            ], dtype=jnp.float32))
+
             # ---- 6. Replica exchange (swap means) ----
             should_swap = jnp.mod(iter_idx, params_iter.swap_every) == 0
 

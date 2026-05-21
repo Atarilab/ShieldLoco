@@ -3,7 +3,7 @@
 # Metrics: goal_reached, time_to_goal, constraint_violations, tracking_cost
 
 scenario: static_nav
-start_gait: trot
+# start_gait: inherited from controller_config.default_gait
 start_move: up            # forward
 
 goal_position: [6.5, 0.0] # xy only

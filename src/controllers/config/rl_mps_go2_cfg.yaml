@@ -70,6 +70,80 @@ j_pd_min: -100.0  # Override if needed, otherwise uses soft limits
 j_pd_max: 100.0
 
 # ----------------------------------------------------------------------------
+# GAIT
+# ----------------------------------------------------------------------------
+# Overriding default: joystick, eval, safety filter all use this gait unless
+# explicitly overridden at runtime.  Must match a key in gait_patterns below.
+default_gait: "trot-fly"
+
+# All available gait patterns (shared by controller and safety filter).
+# Each gait is a list of boolean phases in [FL, FR, RL, RR] order.
+# The controller and safety filter read from the same definition.
+gait_patterns:
+  stance:
+    - [ true,  true,  true,  true]
+    - [ true,  true,  true,  true]
+  transition:
+    - [ true,  true,  true,  true]
+    - [ true,  true,  true,  true]
+  trot:
+    - [false,  true,  true, false]
+    - [ true, false, false,  true]
+  trot-jump1:
+    - [false,  true,  true, false]
+    - [false, false, false, false]
+  trot-jump2:
+    - [ true, false, false,  true]
+    - [false, false, false, false]
+  pace:
+    - [ true, false,  true, false]
+    - [false,  true, false,  true]
+  pace-jump1:
+    - [false, false, false, false]
+    - [ true, false,  true, false]
+  pace-jump2:
+    - [false, false, false, false]
+    - [false,  true, false,  true]
+  bound:
+    - [ true,  true, false, false]
+    - [false, false,  true,  true]
+  random1:
+    - [ true, false, false, false]
+    - [false,  true,  true,  true]
+  random2:
+    - [false,  true, false, false]
+    - [ true, false,  true,  true]
+  random3:
+    - [false, false,  true, false]
+    - [ true,  true, false,  true]
+  random4:
+    - [false, false, false,  true]
+    - [ true,  true,  true, false]
+  jump:
+    - [false, false, false, false]
+    - [ true,  true,  true,  true]
+  crawl-anticlockwise:
+    - [ true,  true,  true, false]
+    - [ true,  true, false,  true]
+    - [ true, false,  true,  true]
+    - [false,  true,  true,  true]
+  crawl-anticlockwise2:
+    - [ true,  true,  true, false]
+    - [ true,  true, false,  true]
+    - [false,  true,  true,  true]
+    - [ true, false,  true,  true]
+  crawl-clockwise:
+    - [ true,  true,  true, false]
+    - [false,  true,  true,  true]
+    - [ true, false,  true,  true]
+    - [ true,  true, false,  true]
+  trot-fly:
+    - [false,  true,  true, false]
+    - [false, false, false, false]
+    - [ true, false, false,  true]
+    - [false, false, false, false]
+
+# ----------------------------------------------------------------------------
 # PLANNING
 # ----------------------------------------------------------------------------
 horizon_length: &horizon_length 6    # Number of contact plan steps

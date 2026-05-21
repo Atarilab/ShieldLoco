@@ -106,126 +106,23 @@ class RLQuadrupedMPSController(RLControllerBase):
         self.heading_command_lock = threading.RLock()  # Lock for heading command updates
         self.heading_change_pending = False  # Flag to indicate pending heading change
 
-        # Define gait patterns (FL, FR, RL, RR)
-        self.gait_patterns = {
-            "transition": torch.tensor(
-                [
-                    [True, True, True, True],  # Phase 1: All legs in contact
-                    [True, True, True, True],  # Phase 2: All legs in contact
-                ]
-            ),
-            "stance": torch.tensor(
-                [
-                    [True, True, True, True],  # Phase 1: All legs in contact
-                    [True, True, True, True],  # Phase 2: All legs in contact
-                ]
-            ),
-            "trot": torch.tensor(
-                [
-                    [False, True, True, False],  # Phase 2: FR and RL in contact
-                    [True, False, False, True],  # Phase 1: FL and RR in contact
-                ]
-            ),
-            "trot-jump1": torch.tensor(
-                [
-                    [False, True, True, False],  # Phase 2: FR and RL in contact
-                    [False, False, False, False],  # Phase 1: FL and RR in contact
-                ]
-            ),
-            "trot-jump2": torch.tensor(
-                [
-                    [True, False, False, True],  # Phase 2: FR and RL in contact
-                    [False, False, False, False],  # Phase 1: FL and RR in contact
-                ]
-            ),
-            "pace": torch.tensor(
-                [
-                    [True, False, True, False],  # Phase 1: FL and RL in contact
-                    [False, True, False, True],  # Phase 2: FR and RR in contact
-                ]
-            ),
-            "pace-jump1": torch.tensor(
-                [
-                    [False, False, False, False],  # Phase 2: All legs in flight
-                    [True, False, True, False],  # Phase 1: FL and RL in contact
-                ]
-            ),
-            "pace-jump2": torch.tensor(
-                [
-                    [False, False, False, False],  # Phase 2: All legs in flight
-                    [False, True, False, True],  # Phase 1: FR and RR in contact
-                ]
-            ),
-            "bound": torch.tensor(
-                [
-                    [True, True, False, False],  # Phase 1: Front legs in contact
-                    [False, False, True, True],  # Phase 2: Back legs in contact
-                ]
-            ),
-            "random1": torch.tensor(
-                [
-                    [True, False, False, False],
-                    [False, True, True, True],
-                ]
-            ),
-            "random2": torch.tensor(
-                [
-                    [False, True, False, False],
-                    [True, False, True, True],
-                ]
-            ),
-            "random3": torch.tensor(
-                [
-                    [False, False, True, False],
-                    [True, True, False, True],
-                ]
-            ),
-            "random4": torch.tensor(
-                [
-                    [False, False, False, True],
-                    [True, True, True, False],
-                ]
-            ),
-            "jump": torch.tensor(
-                [
-                    [False, False, False, False],  # Phase 2: All legs in flight
-                    [True, True, True, True],  # Phase 1: All legs in contact
-                ]
-            ),
-            "crawl-anticlockwise": torch.tensor(
-                [
-                    [True, True, True, False],  # Phase 1: FL, FR, RL in contact, RR moving
-                    [True, True, False, True],  # Phase 2: FL, FR, RR in contact, RL moving
-                    [True, False, True, True],  # Phase 3: FL, RL, RR in contact, FR moving
-                    [False, True, True, True],  # Phase 4: FR, RL, RR in contact, FL moving
-                ]
-            ),
-            "crawl-anticlockwise2": torch.tensor(
-                [
-                    [True, True, True, False],  # Phase 1: FL, FR, RL in contact, RR moving
-                    [True, True, False, True],  # Phase 2: FL, FR, RR in contact, RL moving
-                    [False, True, True, True],  # Phase 4: FR, RL, RR in contact, FL moving
-                    [True, False, True, True],  # Phase 3: FL, RL, RR in contact, FR moving
-                ]
-            ),
-            "crawl-clockwise": torch.tensor(
-                [
-                    [True, True, True, False],  # Phase 2: FL, FR, RL in contact, RR moving
-                    [False, True, True, True],  # Phase 1: FR, RL, RR in contact, FL moving
-                    [True, False, True, True],  # Phase 4: FL, RL, RR in contact, FR moving
-                    [True, True, False, True],  # Phase 3: FL, FR, RR in contact, RL moving
-                ]
-            ),
-            "trot-fly": torch.tensor(
-                [
-                    [False, True, True, False],  # Phase 2: FR and RL in contact
-                    [False, False, False, False],  # Phase 1: FL and RR in contact
-                    [True, False, False, True],  # Phase 4: FR and RL in contact
-                    [False, False, False, False],  # Phase 3: FL and RR in contact
-                ]
-            ),
-        }
-        self.current_gait = "stance"  # Default gait
+        # Gait patterns loaded from config (shared with safety filter)
+        self._gait_names = []  # Ordered list mapping index -> name
+        self.gait_patterns = {}
+        cfg_patterns = configs["controller_config"].get("gait_patterns", {})
+        for name, phases in cfg_patterns.items():
+            self._gait_names.append(name)
+            self.gait_patterns[name] = torch.tensor(phases, dtype=torch.bool, device=self.device)
+
+        self.default_gait = configs["controller_config"].get("default_gait", "stance")
+        if self.default_gait not in self.gait_patterns:
+            msg = f"default_gait '{self.default_gait}' not in gait_patterns, falling back to 'stance'"
+            if self.logger:
+                self.logger.warning(msg)
+            else:
+                print(f"[WARNING] {msg}")
+            self.default_gait = "stance"
+        self.current_gait = self.default_gait
         self.pending_gait_change = None  # Store pending gait change
         self.in_transition = False  # Flag to indicate if we're in a transition phase
         self.transition_counter = 0  # Counter to track resample steps during transition
@@ -380,7 +277,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             name="gait",
             description="Select Gait Pattern",
             options=list(self.gait_patterns.keys()),
-            default_value="stance",
+            default_value=self.default_gait,
         )
 
     def set_mode(self):
@@ -390,10 +287,10 @@ class RLQuadrupedMPSController(RLControllerBase):
         # Call the base class set_mode to activate the controller
         super().set_mode()
 
-        # Set default gait to stance when switching back to RL controller
+        # Reset to configured default gait when switching back to RL controller
         with self._gait_lock:
-            self.current_gait = "stance"
-            self.current_contact_plan = self.gait_patterns["stance"]
+            self.current_gait = self.default_gait
+            self.current_contact_plan = self.gait_patterns[self.default_gait]
 
             self.pending_gait_change = None
             self.in_transition = False
@@ -484,14 +381,7 @@ class RLQuadrupedMPSController(RLControllerBase):
 
             # update state
             if self.safety_manager.is_running():
-                safety_gait_id = {
-                    "stance": 0,
-                    "transition": 1,
-                    "trot": 2,
-                    "pace": 3,
-                    "bound": 4,
-                    "jump": 5,
-                }.get(self.current_gait, 0)
+                safety_gait_id = self._gait_names.index(self.current_gait) if self.current_gait in self._gait_names else 0
                 self.safety_manager.update_state(
                     ref=self.reference_feet_positions_w.detach().cpu().numpy(),
                     qpos=self.robot.mj_model.data.qpos,
@@ -1050,8 +940,8 @@ class RLQuadrupedMPSController(RLControllerBase):
         return {
             # MPC toggle
             "A": lambda: self.change_commands({"mpc": "on" if not self.apply_mpc_contact_plan else "off"}),
-            # Gait toggle (trot ↔ stance)
-            "X": lambda: self.change_commands({"gait": "stance" if self.current_gait == "trot" else "trot"}),
+            # Gait toggle (default_gait ↔ stance)
+            "X": lambda: self.change_commands({"gait": "stance" if self.current_gait == self.default_gait else self.default_gait}),
             # Forward/backward speed
             "up": lambda: self._handle_step_size_change("up"),
             "down": lambda: self._handle_step_size_change("down"),

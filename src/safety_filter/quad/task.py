@@ -235,18 +235,43 @@ def _init_collision_geometry(
     )
 
 
-def _init_gait_patterns() -> jnp.ndarray:
-    """Define standard quadruped gait patterns."""
-    return jnp.array(
-        [
-            [[True, True, True, True], [True, True, True, True]],  # 0: stance
-            [[True, True, True, True], [True, True, True, True]],  # 1: transition
-            [[False, True, True, False], [True, False, False, True]],  # 2: trot
-            [[True, False, True, False], [False, True, False, True]],  # 3: pace
-            [[True, True, False, False], [False, False, True, True]],  # 4: bound
-            [[False, False, False, False], [True, True, True, True]],  # 5: jump
-        ]
-    )
+def _init_gait_patterns(rl_config: Dict[str, Any]) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Load gait patterns from config, padding to uniform max_phases.
+
+    Returns:
+        gait_patterns: (num_gaits, max_phases, 4) padded boolean array
+        gait_num_phases: (num_gaits,) int32 array with actual phase counts
+    """
+    cfg_patterns = rl_config.get("gait_patterns", {})
+    if not cfg_patterns:
+        # Fallback minimal set (backward compat)
+        fallback = jnp.array([
+            [[True, True, True, True], [True, True, True, True]],
+            [[True, True, True, True], [True, True, True, True]],
+            [[False, True, True, False], [True, False, False, True]],
+            [[True, False, True, False], [False, True, False, True]],
+            [[True, True, False, False], [False, False, True, True]],
+            [[False, False, False, False], [True, True, True, True]],
+        ], dtype=jnp.bool_)
+        num_phases = jnp.full((6,), 2, dtype=jnp.int32)
+        # Pad to max_phases=4 (fallback gaits all have 2)
+        padded = jnp.zeros((6, 4, 4), dtype=jnp.bool_)
+        padded = padded.at[:, :2, :].set(fallback)
+        return padded, num_phases
+
+    # Determine max phases across all gaits
+    max_phases = max(len(phases) for phases in cfg_patterns.values())
+    num_gaits = len(cfg_patterns)
+
+    padded = np.zeros((num_gaits, max_phases, 4), dtype=np.bool_)
+    num_phases_arr = np.zeros(num_gaits, dtype=np.int32)
+
+    for i, (name, phases) in enumerate(cfg_patterns.items()):
+        n = len(phases)
+        num_phases_arr[i] = n
+        padded[i, :n, :] = np.asarray(phases, dtype=np.bool_)
+
+    return jnp.array(padded), jnp.array(num_phases_arr)
 
 
 def _init_base_body_id(mj_model: mujoco.MjModel) -> int:
@@ -432,7 +457,7 @@ class QuadRLTask(Task):
         # =============================================================================
         # GAIT PATTERNS
         # =============================================================================
-        self.gait_patterns = _init_gait_patterns()
+        self.gait_patterns, self.gait_num_phases = _init_gait_patterns(rl_config)
         self.plan_dim = 4 * 3  # 4 legs, 3D position
         self.horizon_length = rl_config["horizon_length"]
 
@@ -738,12 +763,16 @@ class QuadRLTask(Task):
     def _build_contact_plan(
         self, gait: jax.Array, counter: jax.Array
     ) -> jax.Array:
-        """Construct an 8-element contact_plan for the given gait and phase counter."""
+        """Construct an 8-element contact_plan for the given gait and phase counter.
+
+        Handles gaits with 2 or more phases via self.gait_num_phases.
+        """
         gait_pattern = jax.lax.dynamic_index_in_dim(
             self.gait_patterns, gait, axis=0, keepdims=False
         )
-        phase_idx = jnp.mod(counter, 2)
-        next_phase_idx = 1 - phase_idx
+        num_phases = self.gait_num_phases[gait]
+        phase_idx = jnp.mod(counter, num_phases)
+        next_phase_idx = jnp.mod(phase_idx + 1, num_phases)
         current_phase = jax.lax.dynamic_index_in_dim(
             gait_pattern, phase_idx, axis=0, keepdims=False
         )

@@ -893,6 +893,20 @@ def _safety_worker_main(
             )
             policy_params = jit_optimize(data_ahead, policy_params, True)
 
+            # ── constraint diagnostic log (every 5th cycle) ──
+            # if latest_seq % 5 == 0 and hasattr(policy_params, "diag"):
+            #     d = np.asarray(policy_params.diag)
+            #     total = d[0] + d[1] + d[2] + d[3]
+            #     pct_clean = (d[0] / total * 100) if total > 0 else 0.0
+            #     _add_log(shared_result,
+            #         f"[DIAG-FULL] N={int(total):.0f} "
+            #         f"clean={d[0]:.0f}({pct_clean:.0f}%) "
+            #         f"foot={d[1]:.0f} body={d[2]:.0f} both={d[3]:.0f} | "
+            #         f"mean_feet_hits={d[4]:.2f} mean_body_hits={d[5]:.2f} "
+            #         f"first_foot_hit@step={d[6]:.1f} "
+            #         f"c_max={np.asarray(policy_params.c_max):.2f}"
+            #     )
+
             # Optionally dump raw train_data to disk for offline pre-training.
             # Throttled: only dump every 5th cycle to avoid IO overhead.
             data_dir = rl_config.get("safety_value_data_dir")
@@ -944,19 +958,40 @@ def _safety_worker_main(
                             constraint_traj[best_idx] if constraint_traj.ndim >= 2 else constraint_traj
                         )
                     
-                    # if best_costs is not None:
-                    #     _add_log(shared_result, f"[SAFETY] Best costs: min={best_costs.min():.4f}, max={best_costs.max():.4f}, mean={best_costs.mean():.4f}, sum={best_costs.sum():.4f}")
+                    # # ── constraint diagnostics (every 5th cycle) ──
+                    # if constraint_traj.ndim == 3 and constraint_traj.shape[2] == 2:
+                    #     feet_flags  = constraint_traj[:, :, 0]   # (B, H+1)
+                    #     body_counts = constraint_traj[:, :, 1]   # (B, H+1)
+                    #     total_feet  = feet_flags.sum(axis=1)      # (B,)
+                    #     total_body  = body_counts.sum(axis=1)     # (B,)
+                    #     has_foot    = total_feet > 0
+                    #     has_body    = total_body > 0
+                    #     n_clean     = int(np.sum(~has_foot & ~has_body))
+                    #     n_foot_only = int(np.sum( has_foot & ~has_body))
+                    #     n_body_only = int(np.sum(~has_foot &  has_body))
+                    #     n_both      = int(np.sum( has_foot &  has_body))
+                    #     B_total     = feet_flags.shape[0]
 
-                    # if best_constraints is not None:
-                    #     violations = np.sum(best_constraints > 0)
-                    #     total_constraints = best_constraints.shape[0] * best_constraints.shape[1]
-                    #     _add_log(shared_result, f"[SAFETY] Best constraints: violations={violations}/{total_constraints}, max_val={best_constraints.max():.4f}")
+                    #     # argmin sample (if available)
+                    #     bc_feet = -1.0
+                    #     bc_body = -1.0
+                    #     if best_constraints is not None:
+                    #         bc_feet = best_constraints[:, 0].sum()
+                    #         bc_body = best_constraints[:, 1].sum()
 
-                    # # Distribution of constraint_sums across all top-B samples
-                    # if constraint_traj.ndim == 2:
-                    #     c_sums = constraint_traj.sum(axis=1)
-                    #     n_safe = int(np.sum(c_sums == 0))
-                    #     _add_log(shared_result, f"[SAFETY] Top-B constraint_sums: min={c_sums.min():.1f}, mean={c_sums.mean():.1f}, max={c_sums.max():.1f}, n_safe={n_safe}/{len(c_sums)}")
+                    #     # timing: first horizon step with a foot collision
+                    #     first_hit = np.argmax(feet_flags > 0, axis=1)       # (B,); 0 = never
+                    #     never_hit = total_feet == 0
+                    #     first_hit_mean = first_hit[~never_hit].mean() if (~never_hit).any() else -1.0
+
+                    #     _add_log(shared_result,
+                    #         f"[DIAG] top-{B_total}: "
+                    #         f"clean={n_clean} foot={n_foot_only} body={n_body_only} both={n_both} | "
+                    #         f"best: feet_hits={bc_feet:.0f} body_hits={bc_body:.0f} | "
+                    #         f"mean_feet_hits={total_feet.mean():.1f} "
+                    #         f"max_feet_hits={total_feet.max():.0f} "
+                    #         f"first_hit@step={first_hit_mean:.1f}"
+                    #     )
 
                 elif qpos_traj.ndim == 2:
                     best_qpos = qpos_traj
