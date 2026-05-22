@@ -215,7 +215,7 @@ class RLQuadrupedMPSController(RLControllerBase):
             "contact_plan",
             ObsTerm(
                 contact_plan,
-                params={"contact_plan": lambda: self.current_contact_plan},
+                params={"contact_plan": lambda: self.current_contact_plan[:2].contiguous().view(-1)},
                 obs_dim=8,
                 device=self.device,
             ),
@@ -287,10 +287,10 @@ class RLQuadrupedMPSController(RLControllerBase):
         # Call the base class set_mode to activate the controller
         super().set_mode()
 
-        # Reset to configured default gait when switching back to RL controller
+        # Start in stance; user toggles via X to switch to configured default gait
         with self._gait_lock:
-            self.current_gait = self.default_gait
-            self.current_contact_plan = self.gait_patterns[self.default_gait]
+            self.current_gait = "stance"
+            self.current_contact_plan = self.gait_patterns["stance"]
 
             self.pending_gait_change = None
             self.in_transition = False

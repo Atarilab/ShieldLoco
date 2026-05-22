@@ -22,7 +22,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import rclpy
@@ -203,20 +203,33 @@ def _short_name(topic: str) -> str:
     return parts[-1] if parts else topic.replace("/", "_")
 
 
-def load_obs_sizes(path: str) -> Dict[str, Tuple[float, float, float]]:
+def load_obs_sizes(path: str) -> Tuple[Dict[str, Tuple[float, float, float]], Set[str]]:
     sizes: Dict[str, Tuple[float, float, float]] = {}
+    l_shapes: Set[str] = set()
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) != 4:
+            if len(parts) < 3:
                 continue
-            name, hx, hy, hz = parts
-            sizes[name] = (float(hx), float(hy), float(hz))
-    print(f"Loaded {len(sizes)} obstacle size(s) from {path}")
-    return sizes
+            name = parts[0]
+            if parts[1] == "L":
+                if len(parts) != 5:
+                    continue
+                hx, hy, hz = float(parts[2]), float(parts[3]), float(parts[4])
+                sizes[name] = (hx, hy, hz)
+                l_shapes.add(name)
+            else:
+                if len(parts) != 4:
+                    continue
+                hx, hy, hz = float(parts[1]), float(parts[2]), float(parts[3])
+                sizes[name] = (hx, hy, hz)
+    n_simple = len(sizes) - len(l_shapes)
+    n_compound = len(l_shapes)
+    print(f"Loaded {len(sizes)} obstacle size(s) from {path} ({n_simple} simple, {n_compound} L-shaped)")
+    return sizes, l_shapes
 
 
 _BASE_LINK_RE = re.compile(
@@ -255,6 +268,7 @@ def write_obstacles_xml(
     rgba: Tuple[float, float, float, float],
     quaternions: Optional[Dict[str, np.ndarray]] = None,
     sizes: Optional[Dict[str, Tuple[float, float, float]]] = None,
+    l_shapes: Optional[Set[str]] = None,
 ):
     lines = ["<mujocoinclude>", ""]
     lines.append(
@@ -267,10 +281,10 @@ def write_obstacles_xml(
 
     quaternions = quaternions or {}
     sizes = sizes or {}
+    l_shapes = l_shapes or set()
 
     for i, (topic, pos) in enumerate(sorted(positions.items())):
         name = _short_name(topic)
-        hx, hy, hz = sizes.get(name, default_size)
         x, y, z_measured = float(pos[0]), float(pos[1]), float(pos[2])
         z = height if height is not None else z_measured
         r, g, b, a = rgba
@@ -280,17 +294,59 @@ def write_obstacles_xml(
             q = quaternions[topic]
             quat_attr = f'quat="{float(q[3]):.6f} {float(q[0]):.6f} {float(q[1]):.6f} {float(q[2]):.6f}" '
 
-        line = (
-            f'    <geom name="obstacle_hw_{i}" '
-            f'pos="{x:.4f} {y:.4f} {z:.4f}" '
-            f'{quat_attr}'
-            f'type="box" '
-            f'size="{hx:.4f} {hy:.4f} {hz:.4f}" '
-            f'rgba="{r:.2f} {g:.2f} {b:.2f} {a:.2f}" '
-            f'friction="1.0"/>'
-        )
-        line += f"  <!-- {name} ({topic}) -->"
-        lines.append(line)
+        if name in l_shapes:
+            hx, hy, hz = sizes.get(name, default_size)
+
+            lines.append(
+                f'    <geom name="obstacle_hw_{i}_leg0" '
+                f'pos="{x:.4f} {y:.4f} {z:.4f}" '
+                f'{quat_attr}'
+                f'type="box" size="{hx:.4f} {hy:.4f} {hz:.4f}" '
+                f'rgba="{r:.2f} {g:.2f} {b:.2f} {a:.2f}" '
+                f'friction="1.0"/>'
+                f'  <!-- {name} leg0 ({topic}) -->'
+            )
+
+            if topic in quaternions:
+                q = quaternions[topic]
+                qw, qx, qy, qz = float(q[3]), float(q[0]), float(q[1]), float(q[2])
+                R = np.array([
+                    [1 - 2 * qy * qy - 2 * qz * qz, 2 * qx * qy - 2 * qz * qw, 2 * qx * qz + 2 * qy * qw],
+                    [2 * qx * qy + 2 * qz * qw, 1 - 2 * qx * qx - 2 * qz * qz, 2 * qy * qz - 2 * qx * qw],
+                    [2 * qx * qz - 2 * qy * qw, 2 * qy * qz + 2 * qx * qw, 1 - 2 * qx * qx - 2 * qy * qy],
+                ])
+                local_offset = np.array([hx, -hy, 0.0])
+                world_offset = R @ local_offset
+                lx = x + float(world_offset[0])
+                ly = y + float(world_offset[1])
+                lz = z + float(world_offset[2])
+            else:
+                lx = x + hx
+                ly = y - hy
+                lz = z
+
+            lines.append(
+                f'    <geom name="obstacle_hw_{i}_leg1" '
+                f'pos="{lx:.4f} {ly:.4f} {lz:.4f}" '
+                f'{quat_attr}'
+                f'type="box" size="{hy:.4f} {hx:.4f} {hz:.4f}" '
+                f'rgba="{r:.2f} {g:.2f} {b:.2f} {a:.2f}" '
+                f'friction="1.0"/>'
+                f'  <!-- {name} leg1 ({topic}) -->'
+            )
+        else:
+            hx, hy, hz = sizes.get(name, default_size)
+            line = (
+                f'    <geom name="obstacle_hw_{i}" '
+                f'pos="{x:.4f} {y:.4f} {z:.4f}" '
+                f'{quat_attr}'
+                f'type="box" '
+                f'size="{hx:.4f} {hy:.4f} {hz:.4f}" '
+                f'rgba="{r:.2f} {g:.2f} {b:.2f} {a:.2f}" '
+                f'friction="1.0"/>'
+            )
+            line += f"  <!-- {name} ({topic}) -->"
+            lines.append(line)
 
     lines.append("")
     lines.append("</mujocoinclude>")
@@ -299,7 +355,9 @@ def write_obstacles_xml(
     with open(output_path, "w") as f:
         f.write("\n".join(lines))
 
-    print(f"Wrote {len(positions)} obstacle(s) to {output_path}")
+    n_l = len(l_shapes)
+    print(f"Wrote {len(positions)} obstacle(s) to {output_path}"
+          f"{f' ({n_l} L-shaped)' if n_l else ''}")
 
 
 def write_empty_obstacles_xml(output_path: str):
@@ -322,8 +380,8 @@ def main():
     )
     parser.add_argument(
         "--robot-topic",
-        default="/vicon/Go2/root",
-        help="Vicon topic for robot XY capture (default: /vicon/Go2/root)",
+        default="/vicon/Go2/Go2",
+        help="Vicon topic for robot XY capture (default: /vicon/Go2/Go2)",
     )
     parser.add_argument(
         "--robot-exclude",
@@ -369,7 +427,8 @@ def main():
         "--obs-data",
         default=None,
         help="Path to obs.data file with per-obstacle box half-sizes "
-             "(format: <name> <hx> <hy> <hz> per line)",
+             "(format: <name> <hx> <hy> <hz> per line, "
+             "or <name> L <hx> <hy> <hz> for L-shaped obstacles)",
     )
 
     args = parser.parse_args()
@@ -401,8 +460,9 @@ def main():
     rclpy.shutdown()
 
     obs_sizes = None
+    l_shapes: Set[str] = set()
     if args.obs_data and os.path.exists(args.obs_data):
-        obs_sizes = load_obs_sizes(args.obs_data)
+        obs_sizes, l_shapes = load_obs_sizes(args.obs_data)
 
     if robot_pose is not None:
         rx, ry, qw, qx, qy, qz = robot_pose
@@ -420,6 +480,7 @@ def main():
             rgba=tuple(args.rgba),
             quaternions=obstacle_quaternions,
             sizes=obs_sizes,
+            l_shapes=l_shapes,
         )
     else:
         write_empty_obstacles_xml(OBSTACLES_HW_XML)

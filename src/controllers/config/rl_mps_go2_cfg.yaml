@@ -21,7 +21,7 @@ device: 'cpu'  # or "cuda:0"
 # ----------------------------------------------------------------------------
 control_dt: 0.005          # Main controller frequency (200 Hz)
 decimation: 4              # RL policy decimation
-command_duration: 0.3      # Duration per contact plan step
+command_duration: 0.45      # Duration per contact plan step
 obs_horizon: 2             # Reference trajectory horizon for policy observations
 timestep: 0.03             # MuJoCo physics timestep
 
@@ -30,7 +30,7 @@ timestep: 0.03             # MuJoCo physics timestep
 # ----------------------------------------------------------------------------
 action_dim: 12
 action_scale: 0.35
-action_filter_alpha: 0.5
+action_filter_alpha: 0.1
 
 # Joint ordering: maps Unitree hardware order to IsaacLab training order
 joint_obs_unitree_to_isaac_mapping: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
@@ -74,7 +74,7 @@ j_pd_max: 100.0
 # ----------------------------------------------------------------------------
 # Overriding default: joystick, eval, safety filter all use this gait unless
 # explicitly overridden at runtime.  Must match a key in gait_patterns below.
-default_gait: "trot-fly"
+default_gait: "trot"
 
 # All available gait patterns (shared by controller and safety filter).
 # Each gait is a list of boolean phases in [FL, FR, RL, RR] order.
@@ -146,7 +146,7 @@ gait_patterns:
 # ----------------------------------------------------------------------------
 # PLANNING
 # ----------------------------------------------------------------------------
-horizon_length: &horizon_length 6    # Number of contact plan steps
+horizon_length: &horizon_length 5    # Number of contact plan steps
 plan_lim: 0.25                      # Plan normalization limit (meters)
 act_rl_clip: 100                    # Action clipping (large = no effective clip)
 feet_step_size: 0.0
@@ -160,7 +160,7 @@ mps_alg_name: "REMIMPS"  # MIMPS, REMIMPS, CEMPS, CBF, HJ, DMPS, CMPS
 # Common parameters (all optimizers)
 mps_num_samples: 1200
 mps_plan_horizon: *horizon_length
-mps_iterations: 1
+mps_iterations: 3
 mps_gamma: &mps_gamma 0.99
 mps_safety_weight: 10
 mps_collect_data: true
@@ -219,7 +219,7 @@ constraint_min_obstacle_height: 0.0001
 # ---- Foot Projection ----
 # Pushes sampled foot positions out of obstacles
 # hardware 0.15
-projection_clearance: 0.08   # meters (foot_radius + safety_margin)
+projection_clearance: 0.12   # meters (foot_radius + safety_margin)
 projection_iters: 3          # iterations (for "iterative" method only)
 projection_method: "iterative"  # "iterative" | "qp_single" | "qp_sqp"
 
@@ -245,7 +245,7 @@ foot_chain_weight: 40.0
 # scale: softplus sharpness (meters, smaller = sharper transition)
 # weight: overall cost multiplier
 # hardware 0.01
-body_sdf_margin: 0.2
+body_sdf_margin: 0.01
 body_sdf_scale: 0.2
 body_sdf_weight: 1.0
 
