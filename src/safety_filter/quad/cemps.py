@@ -71,6 +71,7 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
+        std_decay: float = 0.9,
     ) -> None:
         """Initialize CEM planner.
 
@@ -110,6 +111,7 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
             p_max=p_max,
             c_max_decay=c_max_decay,
             include_terminal_cost=include_terminal_cost,
+            std_decay=std_decay,
         )
 
         self.elite_fraction = elite_fraction
@@ -147,7 +149,7 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
         )
 
     def prepare_optimize(self, state: mjx.Data, params: CEMPSParams) -> CEMPSParams:
-        """Warm-start: shift best_plan forward, reset std to noise_level."""
+        """Warm-start: shift best_plan forward and std forward + decay toward noise_level."""
         abs_plan = params.best_plan
         abs_plan = jnp.concatenate([abs_plan[1:], params.ref[-1:]], axis=0)
         abs_plan = jnp.clip(abs_plan, self.task.u_min, self.task.u_max)
@@ -156,7 +158,11 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
         plan_dim = self.task.plan_dim
 
         new_mean = abs_plan - params.ref
-        new_std = jnp.full((H, plan_dim), self.noise_level, dtype=jnp.float32)
+
+        # Shift std forward and decay toward noise_level
+        std_shifted = jnp.concatenate([params.std[1:], params.std[-1:]], axis=0)
+        new_std = self.std_decay * std_shifted + (1 - self.std_decay) * self.noise_level
+        new_std = jnp.maximum(new_std, 0.1 * self.noise_level)
 
         params = params.replace(
             mean=new_mean,
@@ -216,28 +222,24 @@ class QuadCEMPSPlanner(QuadSamplingBasedPlanner):
 
         elite_increments = increments[elite_indices]
 
-        new_mean = jnp.mean(elite_increments, axis=0)
-        new_std = jnp.std(elite_increments, axis=0)
-
-        new_std = jnp.maximum(new_std, 1e-6)
-
+        raw_mean = jnp.mean(elite_increments, axis=0)
 
         if self.use_momentum:
-            # S Sanokowski, et. al. formulation
-            new_mean = new_mean + (self.momentum / (1 - self.momentum)) * (params.mean - new_mean)
+            new_mean = raw_mean + (self.momentum / (1 - self.momentum)) * (raw_mean - params.mean)
 
-            # Select alpha < (self.momentum + 1) to avoid singularities
-            # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
+            s = jnp.mean((elite_increments - new_mean[None, :, :]) ** 2, axis=0)
 
-            new_variance = new_std ** 2
             old_variance = params.std ** 2
-            
             alpha = (self.momentum + 1) * 0.1
-
-            new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (old_variance - new_variance) + alpha * new_variance)
-            new_std = jnp.sqrt(jnp.maximum(new_variance, 1e-6))
+            new_variance = s + (1 / (self.momentum + 1 - alpha)) * (
+                self.momentum * (old_variance - s) + alpha * s
+            )
+            new_std = jnp.sqrt(jnp.maximum(new_variance, (0.1 * self.noise_level) ** 2))
         else:
+            new_mean = raw_mean
+            new_std = jnp.std(elite_increments, axis=0)
             new_std = self.cross_entropy_decay * new_std + (1 - self.cross_entropy_decay) * self.noise_level
+            new_std = jnp.maximum(new_std, 0.1 * self.noise_level)
 
         new_best = plans[jnp.argmin(costs)]
 

@@ -36,8 +36,8 @@ class REMIMPSParams(QuadAlgSamplingParams):
     The base-class fields ``mean`` and ``best_plan`` are kept as the **coldest**
     replica's state (shape ``(H, plan_dim)``) so that upstream callers (e.g.
     ``safety_manager.py``) never need to know about the internal per-replica
-    arrays.  The full per-replica state lives in ``mean_replicas`` and
-    ``best_plan_replicas`` (shape ``(K, H, plan_dim)``).
+    arrays.  The full per-replica state lives in ``mean_replicas``,
+    ``best_plan_replicas``, and ``std_replicas``.
 
     Attributes:
         mean: Coldest-replica plan offset, shape (H, plan_dim).
@@ -46,6 +46,7 @@ class REMIMPSParams(QuadAlgSamplingParams):
         swap_every: Propose swaps every N iterations.
         mean_replicas: Per-replica means, shape (K, H, plan_dim).
         best_plan_replicas: Per-replica best plans, shape (K, H, plan_dim).
+        std_replicas: Per-replica stds, shape (K, H, plan_dim).
     """
     # All fields need defaults because the base class already has defaults.
     temperature: jax.Array = jnp.zeros(1)  # (K,)
@@ -53,6 +54,7 @@ class REMIMPSParams(QuadAlgSamplingParams):
     # Dummy defaults — real shapes are set in init_params
     mean_replicas: jax.Array = jnp.zeros((1, 1, 1))  # (K, H, plan_dim)
     best_plan_replicas: jax.Array = jnp.zeros((1, 1, 1))  # (K, H, plan_dim)
+    std_replicas: jax.Array = jnp.zeros((1, 1, 1))  # (K, H, plan_dim)
 
 
 class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
@@ -94,6 +96,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
+        std_decay: float = 0.9,
         num_replicas: int = 3,
         temp_min: float = 0.1,
         temp_max: float = 2.0,
@@ -117,6 +120,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             p_max=p_max,
             c_max_decay=c_max_decay,
             include_terminal_cost=include_terminal_cost,
+            std_decay=std_decay,
         )
 
         if num_replicas < 2:
@@ -176,6 +180,9 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             perturb = jax.random.normal(subrng, (H, plan_dim)) * 0.1
             best_plans = best_plans.at[k].set(base_params.ref + perturb)
 
+        # Per-replica stds
+        stds = jnp.full((K, H, plan_dim), self.noise_level, dtype=jnp.float32)
+
         temp_ladder = self._build_temperature_ladder()
 
         return REMIMPSParams(
@@ -185,6 +192,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             swap_every=self.swap_every,
             mean_replicas=means,
             best_plan_replicas=best_plans,
+            std_replicas=stds,
             rng=rng,
             ref=base_params.ref,
             task_params=base_params.task_params,
@@ -222,6 +230,20 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
         # Recompute means as offset from the current reference
         mean_shifted = best_shifted - params.ref[None, :, :]
 
+        # Warm-start stds: shift forward and decay toward noise_level
+        std_shifted = jnp.concatenate(
+            [params.std_replicas[:, 1:, :], params.std_replicas[:, -1:, :]], axis=1
+        )
+        std_decayed = self.std_decay * std_shifted + (1 - self.std_decay) * self.noise_level
+        std_decayed = jnp.maximum(std_decayed, 0.1 * self.noise_level)
+        # Safety: if any replica std is all zeros, restore to noise_level
+        has_zero_std = jnp.all(std_decayed == 0.0, axis=(1, 2))
+        std_decayed = jnp.where(
+            has_zero_std[:, None, None],
+            jnp.full_like(std_decayed, self.noise_level),
+            std_decayed,
+        )
+
         # If caller reset, propagate to all hot replicas so they don't warm-start
         # from stale plans belonging to the previous reference trajectory.
         best_shifted = jnp.where(
@@ -233,6 +255,11 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             caller_reset,
             jnp.zeros_like(mean_shifted),
             mean_shifted,
+        )
+        std_decayed = jnp.where(
+            caller_reset,
+            jnp.full_like(std_decayed, self.noise_level),
+            std_decayed,
         )
 
         # If any replica has NaN/Inf in its best plan (physics divergence
@@ -249,6 +276,11 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             jnp.zeros_like(mean_shifted),
             mean_shifted,
         )
+        std_decayed = jnp.where(
+            has_nan,
+            jnp.full_like(std_decayed, self.noise_level),
+            std_decayed,
+        )
 
         # Sync coldest replica back to public interface
         mean_cold = mean_shifted[0]
@@ -260,6 +292,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
             best_plan=best_cold,
             mean_replicas=mean_shifted,
             best_plan_replicas=best_shifted,
+            std_replicas=std_decayed,
             exec_plan=exec_plan,
         )
 
@@ -271,12 +304,14 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
 
         zero_means = jnp.zeros((K, H, plan_dim), dtype=jnp.float32)
         best_plans = jnp.repeat(params.ref[None, :, :], K, axis=0)
+        stds = jnp.full((K, H, plan_dim), self.noise_level, dtype=jnp.float32)
 
         return params.replace(
             mean=zero_means[0],
             best_plan=best_plans[0],
             mean_replicas=zero_means,
             best_plan_replicas=best_plans,
+            std_replicas=stds,
             exec_plan=self.task.get_exec_plan(params.ref),
             train_data=(
                 self._empty_train_data(self._num_samples_total)
@@ -305,9 +340,12 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
 
             noise = self.quad_noise(noise_rng, self.samples_per_replica)
 
+            # Normalize by noise_level so params.std_replicas directly controls scale
+            noise_raw = noise / jnp.maximum(self.noise_level, 1e-6)
+
             # Scale noise by temperature: hot replicas explore more
             temp_scale = jnp.sqrt(params.temperature[k] / self.temp_min)
-            noise_scaled = noise * temp_scale
+            noise_scaled = noise_raw * params.std_replicas[k] * temp_scale
 
             # Mean + ref + noise.  Guard against stale NaN means.
             mean_k = jnp.where(
@@ -391,18 +429,26 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
                 # Temperature-weighted softmax
                 weights = jax.nn.softmax(-costs_normed / T_k, axis=0)
                 increments = plans_k - params_iter.ref
-                new_mean_k = jnp.sum(
+                raw_mean_k = jnp.sum(
                     weights[:, None, None] * increments, axis=0
                 )
 
 
                 if self.use_momentum:
-                    # S Sanokowski, et. al. formulation
-                    new_mean_k = new_mean_k + (self.momentum / (1 - self.momentum)) * (params_iter.mean_replicas[k] - new_mean_k)
+                    new_mean_k = raw_mean_k + (self.momentum / (1 - self.momentum)) * (raw_mean_k - params_iter.mean_replicas[k])
 
-                    # TODO: add variance updates to MPPI and Replica Exchange
-                    # Select alpha < (self.momentum + 1) to avoid singularities
-                    # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
+                    diffs = increments - new_mean_k[None, :, :]
+                    s_k = jnp.sum(weights[:, None, None] * (diffs ** 2), axis=0)
+
+                    old_variance = params_iter.std_replicas[k] ** 2
+                    alpha = (self.momentum + 1) * 0.1
+                    new_variance = s_k + (1 / (self.momentum + 1 - alpha)) * (
+                        self.momentum * (old_variance - s_k) + alpha * s_k
+                    )
+                    new_std_k = jnp.sqrt(jnp.maximum(new_variance, (0.1 * self.noise_level) ** 2))
+                else:
+                    new_mean_k = raw_mean_k
+                    new_std_k = params_iter.std_replicas[k]
 
                 # Best plan for warm-starting
                 best_idx = jnp.argmin(costs_k)
@@ -412,7 +458,7 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
                 replica_cost = jnp.mean(costs_k)
 
                 # If any cost is non-finite, discard this update and keep the
-                # previous mean/best_plan.  Setting energy to +inf guarantees
+                # previous mean/best_plan/std.  Setting energy to +inf guarantees
                 # the swap logic will reject any exchange involving this replica.
                 new_mean_k = jnp.where(
                     all_valid, new_mean_k, params_iter.mean_replicas[k]
@@ -420,18 +466,22 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
                 new_best_plan_k = jnp.where(
                     all_valid, new_best_plan_k, params_iter.best_plan_replicas[k]
                 )
+                new_std_k = jnp.where(
+                    all_valid, new_std_k, params_iter.std_replicas[k]
+                )
                 replica_cost = jnp.where(all_valid, replica_cost, jnp.inf)
 
-                return new_mean_k, new_best_plan_k, replica_cost
+                return new_mean_k, new_best_plan_k, new_std_k, replica_cost
 
             k_range = jnp.arange(K)
-            new_means, new_best_plans, replica_costs = jax.vmap(
+            new_means, new_best_plans, new_stds, replica_costs = jax.vmap(
                 update_replica
             )(k_range)
 
             params_iter = params_iter.replace(
                 mean_replicas=new_means,
                 best_plan_replicas=new_best_plans,
+                std_replicas=new_stds,
             )
 
             # ---- 5b. Constraint diagnostics (full batch) ----
@@ -458,16 +508,17 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
                 jnp.mean(tf), jnp.mean(tb), fhm,
             ], dtype=jnp.float32))
 
-            # ---- 6. Replica exchange (swap means) ----
+            # ---- 6. Replica exchange (swap means and stds) ----
             should_swap = jnp.mod(iter_idx, params_iter.swap_every) == 0
 
             def do_swap(p):
                 means = p.mean_replicas
+                stds = p.std_replicas
                 temp = p.temperature
                 costs = replica_costs
                 rng = p.rng
 
-                def swap_pair(i, j, means_in, rng_in):
+                def swap_pair(i, j, means_in, stds_in, rng_in):
                     ci = costs[i]
                     cj = costs[j]
                     Ti = temp[i]
@@ -487,28 +538,34 @@ class QuadREMIMPSPlanner(QuadSamplingBasedPlanner):
 
                     new_mean_i = jnp.where(accept, means_in[j], means_in[i])
                     new_mean_j = jnp.where(accept, means_in[i], means_in[j])
+                    new_std_i = jnp.where(accept, stds_in[j], stds_in[i])
+                    new_std_j = jnp.where(accept, stds_in[i], stds_in[j])
 
                     means_out = (
                         means_in.at[i].set(new_mean_i).at[j].set(new_mean_j)
                     )
-                    return means_out, rng_out
+                    stds_out = (
+                        stds_in.at[i].set(new_std_i).at[j].set(new_std_j)
+                    )
+                    return means_out, stds_out, rng_out
 
                 means_curr = means
+                stds_curr = stds
                 rng_curr = rng
 
                 # Even-indexed pairs: (0,1), (2,3), ...
                 for i in range(0, K - 1, 2):
-                    means_curr, rng_curr = swap_pair(
-                        i, i + 1, means_curr, rng_curr
+                    means_curr, stds_curr, rng_curr = swap_pair(
+                        i, i + 1, means_curr, stds_curr, rng_curr
                     )
 
                 # Odd-indexed pairs: (1,2), (3,4), ...
                 for i in range(1, K - 1, 2):
-                    means_curr, rng_curr = swap_pair(
-                        i, i + 1, means_curr, rng_curr
+                    means_curr, stds_curr, rng_curr = swap_pair(
+                        i, i + 1, means_curr, stds_curr, rng_curr
                     )
 
-                return p.replace(mean_replicas=means_curr, rng=rng_curr)
+                return p.replace(mean_replicas=means_curr, std_replicas=stds_curr, rng=rng_curr)
 
             def no_swap(p):
                 return p

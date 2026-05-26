@@ -213,6 +213,7 @@ def create_planner(alg_name, task, config):
         "top_fraction": config.get("mps_top_fraction", 0.01),
         "momentum": config.get("mps_momentum", 0.5),
         "use_momentum": config.get("mps_use_momentum", True),
+        "std_decay": config.get("mps_std_decay", 0.9),
         "include_terminal_cost": config.get(
             "safety_value_mode", "heuristic"
         ) != "off",
@@ -864,17 +865,25 @@ def _safety_worker_main(
                         ref_plan_normalized[None, :, :], K, axis=0
                     )
                     means = jnp.zeros_like(best_plans)
-                    policy_params = policy_params.replace(  # type: ignore
+                    stds = jnp.zeros_like(best_plans)
+                    updates = dict(
                         best_plan=ref_plan_normalized,
                         mean=means[0],
                         mean_replicas=means,
                         best_plan_replicas=best_plans,
+                        std_replicas=stds,
                     )
+                    if hasattr(policy_params, "std"):
+                        updates["std"] = jnp.zeros_like(policy_params.std)
+                    policy_params = policy_params.replace(**updates)  # type: ignore
                 else:
-                    policy_params = policy_params.replace(  # type: ignore
+                    updates = dict(
                         best_plan=ref_plan_normalized,
                         mean=jnp.zeros_like(policy_params.mean),
                     )
+                    if hasattr(policy_params, "std"):
+                        updates["std"] = jnp.zeros_like(policy_params.std)
+                    policy_params = policy_params.replace(**updates)  # type: ignore
                 last_reference_generation_id = current_generation_id
 
             policy_params = update_params(

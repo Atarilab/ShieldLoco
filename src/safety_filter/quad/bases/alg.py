@@ -120,6 +120,7 @@ class QuadSamplingBasedPlanner(ABC):
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
+        std_decay: float = 0.9,
     ) -> None:
         """Initialize the MPC controller.
 
@@ -181,6 +182,7 @@ class QuadSamplingBasedPlanner(ABC):
         self.top_fraction = top_fraction
         self.use_momentum = use_momentum
         self.momentum = momentum
+        self.std_decay = std_decay
         self.gamma = gamma
         self.p_max = p_max
         self.c_max_decay = c_max_decay

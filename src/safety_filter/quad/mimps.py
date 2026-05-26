@@ -16,13 +16,12 @@ from safety_filter.bases.risk import RiskStrategy
 class MIMPSParams(QuadAlgSamplingParams):
     """Policy parameters for model-predictive path integral control.
 
-    Same as QuadAlgSamplingParams (best_plan, exec_plan now inherited from base).
-
     Attributes:
         best_plan: The best plan spline knots found so far.
         exec_plan: Materialized execution plan for controller output.
+        std: Per-element standard deviation of sampling distribution, shape (H, plan_dim).
     """
-    pass
+    std: jax.Array = jnp.zeros((1, 1))
 
 
 class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
@@ -40,12 +39,13 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         gamma: float = 0.99,
         safety_weight: float = 1e3,
         collect_data: bool = False,
+        top_fraction: float = 0.01,
         use_momentum: bool = False,
         momentum: float = 0.5,
-        top_fraction: float = 0.01,
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
+        std_decay: float = 0.9,
     ) -> None:
         """Initialize the controller.
 
@@ -84,6 +84,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             p_max=p_max,
             c_max_decay=c_max_decay,
             include_terminal_cost=include_terminal_cost,
+            std_decay=std_decay,
         )
 
         if temperature <= 0.0:
@@ -152,17 +153,25 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         costs_normed = (costs_mean_safe - jnp.mean(costs_mean_safe)) / (cost_std + 1e-6)
         costs_normed = jnp.clip(costs_normed, -100.0, 100.0)
         weights_mean = jax.nn.softmax(-costs_normed / self.temperature, axis=0)
-        new_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
+        raw_mean = jnp.sum(weights_mean[:, None, None] * increments_mean, axis=0)
 
         new_best = rollouts.plans[jnp.argmin(costs)]
 
         if self.use_momentum:
-            # S Sanokowski, et. al. formulation
-            new_mean = new_mean + (self.momentum / (1 - self.momentum)) * (params.mean - new_mean)
+            new_mean = raw_mean + (self.momentum / (1 - self.momentum)) * (raw_mean - params.mean)
 
-            # TODO: add variance updates to MPPI and Replica Exchange
-            # Select alpha < (self.momentum + 1) to avoid singularities
-            # new_variance = new_variance + (1 / (self.momentum + 1 - alpha)) * (self.momentum * (params.variance - new_variance) + alpha * new_variance)
+            diffs = increments_mean - new_mean[None, :, :]
+            s = jnp.sum(weights_mean[:, None, None] * (diffs ** 2), axis=0)
+
+            old_variance = params.std ** 2
+            alpha = (self.momentum + 1) * 0.1
+            new_variance = s + (1 / (self.momentum + 1 - alpha)) * (
+                self.momentum * (old_variance - s) + alpha * s
+            )
+            new_std = jnp.sqrt(jnp.maximum(new_variance, (0.1 * self.noise_level) ** 2))
+        else:
+            new_mean = raw_mean
+            new_std = params.std
         
         # ── constraint diagnostics over all samples ──
         n_total = rollouts.constraint_flags.shape[0]
@@ -191,6 +200,7 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         return params.replace(
             mean=new_mean,
+            std=new_std,
             best_plan=new_best,
             diag=diag,
         )
@@ -207,10 +217,14 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         """Initialize the policy parameters."""
         _params = super().init_params(task_params, initial_mean, ref_traj, seed)
 
+        H = self.plan_horizon
+        plan_dim = self.task.plan_dim
         abs_plan = (_params.ref + _params.mean).copy()
+        std = jnp.full((H, plan_dim), self.noise_level, dtype=jnp.float32)
 
         return MIMPSParams(
             mean=_params.mean,
+            std=std,
             best_plan=abs_plan,
             exec_plan=self.task.get_exec_plan(abs_plan),
             ref=_params.ref,
@@ -231,26 +245,16 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
         rng, noise_rng = jax.random.split(params.rng)
         noise = self.quad_noise(noise_rng)
 
-        knots = params.mean + params.ref + noise
+        # quad_noise bakes in self.noise_level as a fixed scale factor.
+        # Normalize so that params.std directly controls the per-element scale.
+        noise_raw = noise / jnp.maximum(self.noise_level, 1e-6)
+        knots = params.mean + params.ref + noise_raw * params.std[None, :, :]
 
         # Last sample is always the plain reference (zero exploration)
         knots = knots.at[-1].set(params.ref)
 
-        # Second-to-last sample anchors all feet at current stance positions.
-        # Guarantees at least one near-side option when the warm-start has
-        # drifted to the far side of an obstacle.  Without this, ALL samples
-        # project to the same (far) side after the warm-start crosses through
-        # an obstacle, giving MPPI zero near-side plans to select from.
-        # stance_world = params.task_params.init_foot_positions  # (4, 3)
-        # stance_plan_world = jnp.tile(
-        #     stance_world.reshape(1, self.task.plan_dim), (H, 1)
-        # )  # (H, plan_dim)
-        # stance_plan_norm = stance_plan_world / self.task.plan_lim
-        # knots = knots.at[-2].set(stance_plan_norm)
-
         current_feet_xy = params.task_params.init_foot_positions[:, :2]
         knots = self.task.project_plan_to_safe_with_arc_check(knots, current_feet_xy)
-        # knots = self.task.project_plan_to_safe(knots)
 
         return knots, params.replace(rng=rng)  # type: ignore
 
@@ -265,14 +269,19 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
         abs_plan = jnp.clip(abs_plan, self.task.u_min, self.task.u_max)
 
-        # Project warm-start plan to safe set so MPPI starts from
-        # a feasible reference and doesn't warm-start into an obstacle.
-        # abs_plan = self.task.project_plan_to_safe(abs_plan)
-
         new_mean = abs_plan - params.ref
+
+        # Warm-start std: shift forward and decay toward noise_level
+        std_shifted = jnp.concatenate([params.std[1:], params.std[-1:]], axis=0)
+        new_std = self.std_decay * std_shifted + (1 - self.std_decay) * self.noise_level
+        new_std = jnp.maximum(new_std, 0.1 * self.noise_level)
+        # Safety: if std was reset to zeros (external reference change), restore to noise_level
+        has_zero_std = jnp.all(new_std == 0.0)
+        new_std = jnp.where(has_zero_std, jnp.full_like(new_std, self.noise_level), new_std)
 
         params = params.replace(  # type: ignore
             mean=new_mean,
+            std=new_std,
             best_plan=abs_plan,
             exec_plan=self.task.get_exec_plan(abs_plan),
         )
@@ -281,8 +290,12 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
 
     def update_without_plan(self, params: MIMPSParams):
         zero_offset = jnp.zeros_like(params.ref)
+        H = self.plan_horizon
+        plan_dim = self.task.plan_dim
+        zero_std = jnp.full((H, plan_dim), self.noise_level, dtype=jnp.float32)
         return params.replace(  # type: ignore
             mean=zero_offset,
+            std=zero_std,
             best_plan=params.ref,
             exec_plan=self.task.get_exec_plan(params.ref),
             train_data=(
@@ -290,42 +303,3 @@ class QuadMIMPSPlanner(QuadSamplingBasedPlanner):
             )
         )
 
-    # def finalize_best_plan(self, params: MIMPSParams) -> MIMPSParams:
-    #     """Project exec_plan to the safe set and finalize for execution.
-
-    #     exec_plan is set in update_params with tie-breaking applied:
-    #     - Normally: exec_plan = get_exec_plan(argmin_plan)
-    #     - When all samples tie (equal body contacts): exec_plan = get_exec_plan(stance_plan)
-
-    #     best_plan is always the argmin plan, preserved for warm-starting next cycle
-    #     via prepare_optimize.  Separating exec_plan from best_plan ensures the
-    #     tie-breaking only affects execution, not the optimizer's search state.
-
-    #     The exec plan is projected to the safe set so that even the selected
-    #     sample — which may still clip an obstacle corner — has its feet pushed to
-    #     the nearest safe position.
-    #     """
-    #     # Recover the denormalized plan from the current exec_plan for projection.
-    #     # exec_plan has shape (4, H, 3) from get_exec_plan; invert back to (H, plan_dim).
-    #     # Simpler: project best_plan (always argmin, not stance) for safe warm-start,
-    #     # but project exec_plan's underlying plan for actual execution.
-    #     #
-    #     # exec_plan is already (4, H, 3); to project we need (H, plan_dim) normalized form.
-    #     # Re-derive from params.best_plan if exec plan == argmin, or leave as-is if stance.
-    #     # Safest: just project exec_plan's normalized equivalent via the stored exec_plan.
-    #     #
-    #     # Since exec_plan is get_exec_plan(plan) = denorm(plan).reshape(4,H,3).T-ish,
-    #     # we cannot easily invert it.  Instead, project best_plan for the warm-start
-    #     # (done in prepare_optimize) and project exec_plan by re-deriving from exec_plan.
-    #     #
-    #     # Practical approach: exec_plan carries the tie-breaking choice.  Project it
-    #     # by converting back to (H, plan_dim) normalized, projecting, re-applying get_exec_plan.
-    #     # exec_plan shape: (4, H, 3) world-frame → normalize → (H, plan_dim) → project → exec.
-    #     exec_world = params.exec_plan                          # (4, H, 3)
-    #     H = exec_world.shape[1]
-    #     exec_norm = (exec_world.transpose(1, 0, 2).reshape(H, self.task.plan_dim)
-    #                  / self.task.plan_lim)                    # (H, plan_dim) normalized
-    #     projected_norm = self.task.project_plan_to_safe(exec_norm[None])[0]  # (H, plan_dim)
-    #     exec_plan = self.task.get_exec_plan(projected_norm)
-
-    #     return params.replace(exec_plan=exec_plan)

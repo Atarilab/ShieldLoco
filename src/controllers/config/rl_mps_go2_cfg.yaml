@@ -168,6 +168,7 @@ mps_top_fraction: 0.3
 mps_policy_decimation: 1
 mps_use_momentum: false
 mps_momentum: 0.5 # [-1, 1], if in [-1, 0] then EMA style damping, else extrapolation
+mps_std_decay: 0.5 # Warm-start decay for std toward noise_level each planning cycle
 
 # Optimizer-specific parameters
 MIMPS:
