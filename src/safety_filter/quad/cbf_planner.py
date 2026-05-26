@@ -7,6 +7,10 @@ using Linear Discrete Control Barrier Functions" (IROS 2024).
 Replaces MPPI sampling with a deterministic CBF-QP over footstep
 contact locations using 3D-LIP dynamics.  Single-step receding-horizon,
 closed-form QP (iterative half-plane projection), no learning.
+
+Supports configurable dynamics models:
+  - "lip"      : 3D-LIP inverted pendulum (Peng et al.)
+  - "unicycle" : kinematic point-mass CoM = footstep centroid
 """
 
 import jax
@@ -53,6 +57,22 @@ def _make_lip_matrices(T: float, z_c: float = _DEFAULT_COM_HEIGHT) -> Tuple[jax.
     return A, B
 
 
+def _make_unicycle_matrices(T: float) -> Tuple[jax.Array, jax.Array]:
+    A = jnp.array([
+        [0.0, 0.0, 0.0, 0.0],
+        [-1.0 / T, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0 / T, 0.0],
+    ])
+    B = jnp.array([
+        [1.0, 0.0],
+        [1.0 / T, 0.0],
+        [0.0, 1.0],
+        [0.0, 1.0 / T],
+    ])
+    return A, B
+
+
 def _project_onto_half_plane(
     u: jax.Array,
     A: jax.Array,
@@ -89,16 +109,26 @@ def _cbf_correct_plan(
     clearance: float,
     gamma: float,
     max_correction: float,
+    stance_mask: Optional[jax.Array] = None,
 ) -> jax.Array:
     """Apply a DCBF correction using predicted CoM (one-step lookahead).
 
     Evaluates h at the predicted next CoM s_nom = A@s_k + B@u_avg_nom,
     so the constraint activates preventively when the next CoM would be
     unsafe, even if the current CoM is safe.
+
+    If stance_mask is provided (4,), only stance feet are averaged into
+    the centroid and only stance feet receive the correction.
     """
     ref_world = plan_h * plan_lim
     feet_world = ref_world.reshape(4, 3)
-    u_avg_nom = jnp.mean(feet_world[:, :2], axis=0)
+
+    if stance_mask is not None:
+        mask_f = stance_mask.astype(jnp.float32)
+        n_stance = jnp.maximum(jnp.sum(mask_f), 1.0)
+        u_avg_nom = jnp.sum(mask_f[:, None] * feet_world[:, :2], axis=0) / n_stance
+    else:
+        u_avg_nom = jnp.mean(feet_world[:, :2], axis=0)
 
     if sdf.num_obstacles == 0:
         return plan_h
@@ -128,17 +158,18 @@ def _cbf_correct_plan(
                                            u_avg_nom + max_correction)
 
     correction = u_avg_safe - u_avg_nom
-    safe_feet_xy = feet_world[:, :2] + correction[None, :]
+    mask_f = stance_mask.astype(jnp.float32) if stance_mask is not None else jnp.ones(4, dtype=jnp.float32)
+    safe_feet_xy = feet_world[:, :2] + mask_f[:, None] * correction[None, :]
     safe_feet = jnp.concatenate([safe_feet_xy, feet_world[:, 2:]], axis=-1)
     return safe_feet.reshape(-1) / plan_lim
 
 
 class QuadCBFPlanner(QuadSamplingBasedPlanner):
-    """3D-LIP LDCBF footstep safety filter.
+    """DCBF footstep safety filter with configurable dynamics model.
 
     Deterministic CBF-QP replaces MPPI sampling.  Computes safe footstep
     positions by projecting the nominal reference onto DCBF half-planes
-    derived from 3D-LIP CoM dynamics and SDF obstacle constraints.
+    derived from CoM dynamics (3D-LIP or unicycle) and SDF obstacle constraints.
     """
 
     def __init__(
@@ -163,6 +194,7 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         p_max: float = 1.0,
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
+        dynamics_model: str = "lip",
         **kwargs,
     ) -> None:
         super().__init__(
@@ -189,7 +221,13 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         self._use_geometric_fallback = use_geometric_fallback
         self.dcbf_gamma = cross_entropy_decay
         T = self.task.command_duration
-        self._A, self._B_full = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
+
+        self._dynamics_model = dynamics_model
+        if dynamics_model == "unicycle":
+            self._A, self._B_full = _make_unicycle_matrices(T)
+        else:
+            self._A, self._B_full = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
+
         self._B_xy = self._B_full[jnp.array([0, 2]), :]
         self._max_correction = _DEFAULT_MAX_CORRECTION
 
@@ -224,6 +262,28 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
             exec_plan=self.task.get_exec_plan(abs_plan),
         )
 
+    def _get_stance_mask(self, params: CBFParams, step_idx: int) -> Optional[jax.Array]:
+        """Return (4,) boolean stance mask for horizon step step_idx.
+
+        Only for the 3D-LIP model: stance mask = which feet are on the ground
+        at this phase.  Unicycle model returns None (all-feet centroid).
+        """
+        if self._dynamics_model == "unicycle":
+            return None
+
+        tp = params.task_params
+        gait = jnp.asarray(tp.current_gait, dtype=jnp.int32)
+        counter = jnp.asarray(tp.goal_completion_counter, dtype=jnp.int32)
+        num_phases = self.task.gait_num_phases[gait]
+        phase_idx = jnp.mod(counter + jnp.asarray(step_idx, dtype=jnp.int32), num_phases)
+
+        gait_pattern = jax.lax.dynamic_index_in_dim(
+            self.task.gait_patterns, gait, axis=0, keepdims=False
+        )
+        return jax.lax.dynamic_index_in_dim(
+            gait_pattern, phase_idx, axis=0, keepdims=False
+        )
+
     def update_with_plan(self, state: mjx.Data, params: CBFParams) -> CBFParams:
         if not self._enabled:
             return params.replace(
@@ -243,10 +303,12 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         else:
             def _step(plan_out, h):
                 ref_h = params.ref[h]
+                stance_mask = self._get_stance_mask(params, h)
                 safe_h = _cbf_correct_plan(
                     ref_h, s_k, self.task.plan_lim,
                     self._A, self._B_full, self._B_xy,
                     sdf, clearance, self.dcbf_gamma, self._max_correction,
+                    stance_mask=stance_mask,
                 )
                 return plan_out.at[h].set(safe_h), None
 

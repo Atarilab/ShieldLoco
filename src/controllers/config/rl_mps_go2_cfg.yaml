@@ -195,10 +195,12 @@ CBF:
   # Ablation: set use_geometric_fallback: false to test CBF standalone
   use_geometric_fallback: false
   cross_entropy_decay: 0.5
+  dynamics_model: "lip"   # "lip" | "unicycle"
 
 HJ:
   hj_grid: [30, 20, 30, 20]
   hj_vi_iters: 40
+  dynamics_model: "lip"   # "lip" | "unicycle"
 
 # ----------------------------------------------------------------------------
 # TASK

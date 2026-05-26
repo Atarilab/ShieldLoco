@@ -1,10 +1,11 @@
 """
 HJ Reachability Safety Filter for Footstep Planning.
 
-Discrete-time reach-avoid value function on a 4D grid for the 3D-LIP
-dynamics.  The value function V(s) = max(min(h(s), max_u V(A@s+B@u)))
-is computed via value iteration at planner init using the actual obstacle
-SDF from task.py — no external dependencies, pure JAX.
+Discrete-time reach-avoid value function on a 4D grid for CoM
+dynamics (configurable: 3D-LIP or unicycle).  The value function
+V(s) = max(min(h(s), max_u V(A@s+B@u))) is computed via value
+iteration at planner init using the actual obstacle SDF from
+task.py — no external dependencies, pure JAX.
 
 At runtime the filter linearises V around the nominal footstep and solves
 a 2D QP (iterative half-plane projection) to find the minimally-invasive
@@ -28,7 +29,11 @@ from typing import Tuple, Optional
 from .bases.alg import QuadAlgSamplingParams, QuadSamplingBasedPlanner, QuadAlgTrajectory
 from .task import QuadRLTaskParams, QuadRLTask
 from .foot_projection import _batch_sdf_and_grad
-from .cbf_planner import _make_lip_matrices, _project_onto_half_plane
+from .cbf_planner import (
+    _make_lip_matrices,
+    _make_unicycle_matrices,
+    _project_onto_half_plane,
+)
 
 from safety_filter.bases.risk import RiskStrategy
 
@@ -50,6 +55,10 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
     grid (x, vx, y, vy) via value iteration at init time.  At runtime,
     the same linearised-QP structure as the CBF planner is used but with
     the HJ value function in place of the SDF barrier function.
+
+    Supports configurable dynamics models:
+      - "lip"      : 3D-LIP inverted pendulum with gait-aware stance centroid
+      - "unicycle" : kinematic point-mass CoM = footstep centroid
     """
 
     def __init__(
@@ -79,6 +88,7 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         hj_n_u_per_dim: int = 6,
         hj_vi_iters: int = 30,
         hj_foot_bounds: float = 0.25,
+        dynamics_model: str = "lip",
         **kwargs,
     ) -> None:
         super().__init__(
@@ -106,7 +116,12 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         self._max_correction = _DEFAULT_MAX_CORRECTION
 
         T = self.task.command_duration
-        self._A, self._B_full = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
+        self._dynamics_model = dynamics_model
+        if dynamics_model == "unicycle":
+            self._A, self._B_full = _make_unicycle_matrices(T)
+        else:
+            self._A, self._B_full = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
+
         self._B_xy = self._B_full[jnp.array([0, 2]), :]
 
         self._hj_grid = hj_grid
@@ -302,7 +317,8 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
     # =====================================================================
 
     def _hj_correct_step(
-        self, plan_h: jax.Array, s_k: jax.Array
+        self, plan_h: jax.Array, s_k: jax.Array,
+        stance_mask: Optional[jax.Array] = None,
     ) -> jax.Array:
         """HJ value-based footstep correction for one horizon step.
 
@@ -313,6 +329,7 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         Args:
             plan_h: (plan_dim,) normalised nominal footstep plan for step h.
             s_k:    (4,) current CoM state.
+            stance_mask: (4,) boolean, True = stance foot. If None, all 4 used.
 
         Returns:
             (plan_dim,) corrected normalised plan.
@@ -322,7 +339,13 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
 
         ref_world = plan_h * self.task.plan_lim
         feet_world = ref_world.reshape(4, 3)
-        u_avg_nom = jnp.mean(feet_world[:, :2], axis=0)
+
+        if stance_mask is not None:
+            mask_f = stance_mask.astype(jnp.float32)
+            n_stance = jnp.maximum(jnp.sum(mask_f), 1.0)
+            u_avg_nom = jnp.sum(mask_f[:, None] * feet_world[:, :2], axis=0) / n_stance
+        else:
+            u_avg_nom = jnp.mean(feet_world[:, :2], axis=0)
 
         s_nom = self._A @ s_k + self._B_full @ u_avg_nom
         V_nom = self._query_V(s_nom)
@@ -343,9 +366,36 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         )
 
         correction = u_avg_safe - u_avg_nom
-        safe_feet_xy = feet_world[:, :2] + correction[None, :]
+        mask_f = stance_mask.astype(jnp.float32) if stance_mask is not None else jnp.ones(4, dtype=jnp.float32)
+        safe_feet_xy = feet_world[:, :2] + mask_f[:, None] * correction[None, :]
         safe_feet = jnp.concatenate([safe_feet_xy, feet_world[:, 2:]], axis=-1)
         return safe_feet.reshape(-1) / self.task.plan_lim
+
+    # =====================================================================
+    # GAIT HELPERS
+    # =====================================================================
+
+    def _get_stance_mask(self, params: HJParams, step_idx: int) -> Optional[jax.Array]:
+        """Return (4,) boolean stance mask for horizon step step_idx.
+
+        Only for the 3D-LIP model: stance mask = which feet are on the ground
+        at this phase.  Unicycle model returns None (all-feet centroid).
+        """
+        if self._dynamics_model == "unicycle":
+            return None
+
+        tp = params.task_params
+        gait = jnp.asarray(tp.current_gait, dtype=jnp.int32)
+        counter = jnp.asarray(tp.goal_completion_counter, dtype=jnp.int32)
+        num_phases = self.task.gait_num_phases[gait]
+        phase_idx = jnp.mod(counter + jnp.asarray(step_idx, dtype=jnp.int32), num_phases)
+
+        gait_pattern = jax.lax.dynamic_index_in_dim(
+            self.task.gait_patterns, gait, axis=0, keepdims=False
+        )
+        return jax.lax.dynamic_index_in_dim(
+            gait_pattern, phase_idx, axis=0, keepdims=False
+        )
 
     # =====================================================================
     # SAMPLING-BASED PLANNER INTERFACE
@@ -395,7 +445,8 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
 
         def _step(plan_out, h):
             ref_h = params.ref[h]
-            safe_h = self._hj_correct_step(ref_h, s_k)
+            stance_mask = self._get_stance_mask(params, h)
+            safe_h = self._hj_correct_step(ref_h, s_k, stance_mask=stance_mask)
             return plan_out.at[h].set(safe_h), None
 
         H = self.plan_horizon
