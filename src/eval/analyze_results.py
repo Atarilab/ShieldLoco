@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyze DoomMPC eval results.
+Analyze Shield-Loco eval results.
 
 Usage:
     python eval/analyze_results.py results/sweep_*/results.json
@@ -383,7 +383,7 @@ def _inject_experiment_name(data: list[dict], experiment_name: str | None) -> li
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze DoomMPC eval results.json")
+    parser = argparse.ArgumentParser(description="Analyze Shield-Loco eval results.json")
     parser.add_argument("results", nargs="+", help="Path(s) to results.json (glob ok, e.g. results/exp/*/results.json)")
     parser.add_argument("--out", default=None, help="Output directory for CSVs (default: next to first results.json)")
     parser.add_argument(

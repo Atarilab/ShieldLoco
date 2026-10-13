@@ -1,34 +1,246 @@
 <div align="center">
 
+# 🛡️ Shield-Loco
+
+**Shielding Locomotion Policies with Predictive Safety Filtering**
+
+Aditya Shirwatkar, Sebastian Sanokowski, Shishir Kolathaya, Aaron Johnson, Majid Khadiv
+
+[![arXiv](https://img.shields.io/badge/arXiv-2606.07193-b31b1b.svg)](https://arxiv.org/abs/2606.07193)
+[![Python](https://img.shields.io/badge/Python-3.10-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/Docker-Required-orange.svg)](https://www.docker.com/)
+
+</div>
+
+This is the code for the paper [Shield-Loco](https://arxiv.org/abs/2606.07193). A Unitree Go2 walks with a pre-trained RL policy that follows foot contact locations. The safety filter changes those contact locations when it predicts a collision, so the robot steps around obstacles and stays close to what the user asked for.
+
+## 🤔 How this repo is organised
+
+This repo is built on top of [DOOM](https://github.com/Atarilab/DOOM), a framework from the Atari lab for running controllers on Unitree robots, in simulation and on the real robot. DOOM handles the robot connection, Docker, ROS2, the joystick and the contact-conditioned policy. The Shield-Loco safety filter is added on top of it, for the Go2 only.
+
+- **The Shield-Loco part** is everything above the "Base DOOM" line: setup, running the simulation, reproducing the paper, running on the robot. Start here.
+- **The Base DOOM part** is the original DOOM documentation, kept as it was further down. Read it if you want to know how DOOM itself works, or you need the Vicon and robot connection setup for hardware.
+- **Where the code is** is listed near the end of the Shield-Loco part, in [Where is the code](#-where-is-the-code).
+
+## 📋 Table of Contents
+
+📦 [Setup](#-setup) • 🧪 [Simulation](#-simulation) • 📊 [Reproducing the paper](#-reproducing-the-paper) • 🦿 [Hardware](#-hardware-real-go2) • 💾 [Data](#-data-collection-and-output) • 📁 [Where is the code](#-where-is-the-code) • 📝 [Notes](#-notes) • 📚 [Citation](#-citation) • 📄 [License](#-license)
+
+## 📦 Setup
+
+You need Linux, Docker and an NVIDIA GPU with [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). The simulation results in the paper were run on an RTX 3090.
+
+```bash
+git clone --recurse-submodules https://github.com/Atarilab/ShieldLoco.git
+cd ShieldLoco
+./doom.sh -b            # builds the base DOOM image
+./doom.sh -s            # builds the Shield-Loco image on top of it
+./doom.sh -e --safety   # enter the container
+```
+
+`./doom.sh -b` is enough for simulation. For the real robot use `./doom.sh -i` instead, which also builds the image and then adds a network connection to the robot (it asks for sudo).
+
+> **Note**: All DOOM images share one container called `DOOM`, and `./doom.sh -e` reuses it if it exists. If you ever entered the base container before, run `./doom.sh -d` first (it deletes the old containers), otherwise `-e --safety` drops you into one without the Shield-Loco libraries.
+
+Inside the container, run `b` once to build the ROS workspace, then work from `src/`. The image also adds a few shortcuts: `go2_mps_sim` (simulator), `kill_eval` (stops leftover sim and controller processes).
+
+The first start takes a few minutes while the optimizer compiles. Wait for it.
+
+## 🧪 Simulation
+
+Run from `src/` inside the container. One run with the simulator and controller together (`Ctrl+C` stops both):
+```bash
+cd src/
+python3 eval/launch_eval.py --scenario eval/scenarios/scenario_a.yaml --seed 42
+```
+`scenario_a.yaml` is the robot trotting forward to x = 6.5 m through the cluttered scene. `scenario_b.yaml` adds a ball thrown at the robot.
+
+Many runs and sweeps over settings:
+```bash
+python3 eval/run_eval.py --scenario eval/scenarios/scenario_a.yaml --runs 10 --seed 0 \
+    --sweep mps_alg_name=MIMPS,REMIMPS,CEMPS mps_iterations=1,3,6 --out results/my_sweep
+python3 eval/analyze_results.py results/my_sweep/*/results.json --out results/my_sweep
+```
+`--sweep` accepts any setting from `rl_mps_go2_cfg.yaml` (nested ones as `CBF.clearance=0.35`) and runs every combination. Results are written to `src/results/` and the summary table shows collisions, tracking cost, optimizer cost and optimization time.
+
+## 📊 Reproducing the paper
+
+Edit the settings at the top of each script, then run it with `bash` from `src/`:
+
+| Study | Script |
+|---|---|
+| Optimizers, iterations, horizon, samples, momentum | `eval.sh` |
+| CBF, HJ and LIPM baselines against no filter | `baselines_ablation.sh` |
+| Learned value function: off, heuristic, direct, residual | `sv_ablation.sh` |
+
+Settings used in the paper: horizon 5, 3 iterations, 512 samples, momentum 0.1, 10 seeds. The defaults in the yaml are different (for example 1200 samples and momentum off), so pass the paper values when sweeping, e.g. `--sweep mps_num_samples=512 mps_use_momentum=true mps_momentum=0.1`.
+
+The learned value function is off by default (`safety_value_mode: "off"`) and no trained weights are included. To train your own:
+1. In `rl_mps_go2_cfg.yaml` set `safety_value_data_dir: "logs/safety_value_rollouts"`, so the filter saves its rollouts.
+2. From `src/`, run `bash collect_data.sh` (5 seeds of scenario A).
+3. Run `bash train_terminal.sh`. It trains the `direct` and `residual` versions and writes `direct.msgpack` and `residual.msgpack` to `safety_filter/quad/safety_value_checkpoint/`, which is where `sv_ablation.sh` looks.
+
+Then set `safety_value_mode` to `direct` or `residual` to use them.
+
+## 🦿 Hardware (real Go2)
+
+This needs the Vicon setup from the DOOM docs below, since the robot and the obstacles are tracked with Vicon. Turn off sport mode first (see the warning in [Testing Robot Connection](#-testing-robot-connection-if-running-on-the-robot)).
+
+#### Terminal 1
+Launch Vicon client for base state estimation
+```bash
+./doom.sh -e --safety
+ros2 launch vicon_receiver client.launch.py
+```
+
+#### Terminal 2
+Generate the obstacles xml, lay the robot down and disable the sport mode of the robot
+```bash
+./doom.sh -a
+cd src
+python3 scripts/gen_obstacles_xml.py
+python3 scripts/safely_lay_down.py
+python3 scripts/disable_sport_mode.py
+```
+
+> **Note**: Check that the xml matches the real objects by running `go2_mps_sim --headless` and opening it in the browser. To use the generated obstacles, switch the include in `scene.xml` and `scene_mjx.xml` from `obstacles.xml` to `obstacles_hw.xml`. `gen_obstacles_xml.py` also changes the start position in `go2.xml` and `go2_mjx.xml`, `git checkout` those files to undo it.
+
+#### Terminal 3
+```bash
+./doom.sh -a
+source setup.sh
+ros2 run master_manager master_node --task rl-mps-real-go2
+```
+
+#### Terminal 4 (Data Collection)
+Record Vicon pose and optimizer metrics to CSV. Start it before the controller so the whole episode is captured, and stop it with Ctrl+C.
+```bash
+./doom.sh -a
+source setup.sh
+cd src
+python3 eval/hw_data_collector.py --label static_nav
+python3 eval/hw_data_collector.py --label static_nav --rosbag   # with rosbag
+```
+
+#### Joystick workflow
+
+| Sequence | Button | Action |
+|---|---|---|
+| Startup | `Select` | ZERO mode |
+| | `Start` | STAY_DOWN |
+| | `L1+R1` | STANCE |
+| | `L1+R1` | RL-MPS (stance) |
+| In RL-MPS | `A` | Safety filter on/off |
+| | `X` | Toggle trot ↔ stance |
+| | `Up/Down` | Forward/backward speed |
+| | `Left/Right` | Strafe left/right |
+| | `Y/B` | Turn left/right |
+| | `L1+R1` | Reset to defaults |
+| Shutdown | `Start` | DAMPING |
+
+> **Note**: The filter runs on the GPU in its own process, so the container needs GPU access. It starts OFF, press `A` to turn it on. The paper's hardware runs used a horizon of 6 (about 200 ms per plan) and 8 (about 400 ms).
+
+## 💾 Data collection and output
+
+While the controller runs it publishes `/mps_optimizer_metrics` every control step. It holds 12 numbers: tracking cost, optimizer cost, optimization time (ms), whether the filter is on, plan number, body-frame velocity, base height and base position. `eval/hw_data_collector.py` saves these together with the Vicon pose.
+
+In simulation there is no Vicon, so the controller's own position estimate is used:
+```bash
+cd src/
+python3 eval/hw_data_collector.py --sim --task rl-mps-eval-go2 --label static_nav
+python3 eval/hw_data_collector.py --sim --label static_nav --rosbag
+```
+
+Each recording goes to a new folder `{alg}_{interface}_{label}_{timestamp}/`:
+```
+results/hw_eval/REMIMPS_hw_static_nav_20260512_143022/
+├── configs/
+│   ├── controller_cfg.yaml         # copy of rl_mps_go2_cfg.yaml
+│   └── robot_interface_cfg.yaml    # copy of real_go2_cfg.yaml
+├── xmls/
+│   ├── scene.xml, scene_mjx.xml    # scene xmls
+│   ├── go2.xml, go2_mjx.xml        # robot xmls
+│   ├── obstacles_hw.xml            # obstacle geometry
+│   └── balls.xml                   # moving obstacle config
+├── eval_data.csv                   # time series
+├── experiment_config.json          # label, task, mode, timestamp
+└── rosbag/                         # only if --rosbag
+```
+
+**CSV columns**: `t, x, y, z, qw, qx, qy, qz, heading, tracking_cost, optimizer_cost, opt_elapsed_ms, mpc_active, plan_seq, ctrl_vx, ctrl_vy, ctrl_height, frame_number`
+
+## 📁 Where is the code
+
+Nothing was moved from the DOOM layout. These are the files added for Shield-Loco:
+
+| Where | What |
+|---|---|
+| `src/safety_filter/` | The safety filter. `safety_manager.py` runs it in a separate process on the GPU, `quad/task.py` simulates and scores candidate contact plans, and the other files in `quad/` are listed below. |
+| `src/controllers/rl_mps_controller.py` | The Go2 controller that uses the filter. It runs the policy like the normal `rl-contact` controller, but takes its contact plan from the filter when a collision is predicted. |
+| `src/controllers/config/rl_mps_go2_cfg.yaml` | All the settings. |
+| `src/eval/`, `src/eval.sh`, `src/baselines_ablation.sh`, `src/sv_ablation.sh` | Running experiments and collecting results. |
+| `src/scripts/` | Hardware helpers, and training of the learned value function. |
+| `src/robots/go2/obstacles.xml` | The obstacle scenes. The cluttered scene is switched on, the navigation scene is commented out. |
+| `Dockerfile.safety` | Extra libraries for the filter (JAX, MJX, MuJoCo Warp). |
+
+The method pieces in `src/safety_filter/quad/`:
+
+| Piece | File |
+|---|---|
+| Replica exchange optimizer (the default, `REMIMPS`) | `remimps.py` |
+| Plain MPPI (`MIMPS`) and CEM (`CEMPS`) | `mimps.py`, `cemps.py` |
+| Projecting contacts out of obstacles | `foot_projection.py` |
+| Momentum | settings `mps_use_momentum` and `mps_momentum` |
+| Learned value function | `safety_value.py` |
+| Baselines: CBF, HJ reachability, LIPM | `cbf_planner.py`, `hj_planner.py`, `lipm_planner.py` |
+
+`cmps.py` and `dmps.py` are unfinished and not used in the paper.
+
+A few DOOM files were edited to hook things in: `task_configs.py` (the `rl-mps-*` tasks), `simulate.py`, `sim_robot_interface.py`, `go2.py`, `scene.xml` and `doom.sh` (which got the `--safety` option). Everything else is untouched DOOM, including the G1 robot, which has nothing to do with the paper. The Shield-Loco work starts in February 2026 in the git history.
+
+## 📝 Notes
+
+- The filter is given the obstacle positions (from the xml, or from Vicon on hardware). There is no perception.
+- Moving obstacles (the ball in `scenario_b.yaml`) were only shown qualitatively in the paper.
+- The filter reduces collisions, it does not remove them. Some still happen in the dense scenes.
+- Simulation speed depends on your GPU. The paper's numbers are from an RTX 3090.
+- `src/obs.data` is a leftover from experiments (obstacle sizes that `gen_obstacles_xml.py --obs-data` can read). The tests in `src/safety_filter/tests/` were written during development and are not a full test suite.
+
+## 📚 Citation
+
+```bibtex
+@article{shirwatkar2026shieldloco,
+  title   = {Shield-Loco: Shielding Locomotion Policies with Predictive Safety Filtering},
+  author  = {Shirwatkar, Aditya and Sanokowski, Sebastian and Kolathaya, Shishir and Johnson, Aaron and Khadiv, Majid},
+  journal = {arXiv preprint arXiv:2606.07193},
+  year    = {2026}
+}
+```
+
+## 📄 License
+
+BSD 3-Clause, see [LICENSE](LICENSE).
+
+---
+
+<a id="base-doom"></a>
+
+<div align="center">
+
 ![ATARI DOOM Banner](assets/banner.jpg)
 
 # 🤖 DOOM - Robot Control Framework
 
 **Unified Interface for Real Robot Control and MuJoCo Real-time Control**
 
-[![Python](https://img.shields.io/badge/Python-3.10-blue.svg)](https://www.python.org/downloads/)
-[![ROS2](https://img.shields.io/badge/ROS2-Humble-green.svg)](https://docs.ros.org/en/humble/)
-![MuJoCo](https://img.shields.io/badge/MuJoCo-3.3.3-blue)
-[![Docker](https://img.shields.io/badge/Docker-Required-orange.svg)](https://www.docker.com/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Active-brightgreen.svg)](https://github.com/Atarilab/DOOM)
-
 *A framework for controlling Unitree robots (Go2, G1) in the real world and in Mujoco real-time using a unified interface.*
+
+Everything below is the original [DOOM](https://github.com/Atarilab/DOOM) documentation, as it was before Shield-Loco was added. The Shield-Loco tasks are `rl-mps-sim-go2`, `rl-mps-eval-go2` and `rl-mps-real-go2`.
 </div>
 
-## 📋 Table of Contents
+⚙️ [Requirements](#️-requirements) • 📦 [Installation Instructions](#-installation-instructions) • 🤖 [Testing Robot Connection](#-testing-robot-connection-if-running-on-the-robot) • 🚀 [How to Use DOOM](#-how-to-use-doom-to-control-your-robot) • 🎮 [Joystick Control](#-joystick) • 🗂️ [Task Library](#️-task-library)
 
-⚙️ [Requirements](#️-requirements) • 📦 [Installation Instructions](#-installation-instructions) • 🤖 [Testing Robot Connection](#-testing-robot-connection-if-running-on-the-robot)
-
-🚀 [How to Use DOOM to Control Your Robot](#-how-to-use-doom-to-control-your-robot) • 🎮 [Joystick Control](#-joystick) • 🗂️ [Task Library](#-task-library)
-
-📡 [Vicon State Estimation](#-vicon-state-estimation) • 📊 [Live Plotting using PlotJuggler](#-live-plotting-using-plotjuggler) • 👁️ [Robot Visualization in RViz](#️-robot-visualization-in-rviz) •
-
-🐞 [Debugging](#-debugging) • 🧹 [Code Formatting](#-code-formatting) • 📦 [Installed ROS2 Packages](#-installed-ros2-packages)
-
-🧩 [DOOM Elements](#-doom-elements)
-
-📝 [TODO](#-todo) • 🤝 [Contributing](#-contributing) • 📚 [Resources](#-resources) 
+📡 [Vicon State Estimation](#-vicon-state-estimation) • 📊 [PlotJuggler](#-live-plotting-using-plotjuggler) • 👁️ [RViz](#️-robot-visualization-in-rviz) • 🐞 [Debugging](#-debugging) • 🧩 [DOOM Elements](#-doom-elements) • 📝 [TODO](#-todo)
 
 ## ⚙️ Requirements 
 - docker (ros2 container with unitree_sdk)
@@ -181,137 +393,11 @@ You can further define controller-specific joystick mappings by defining `get_jo
 ## 🗂️ Task Library
 <div align="center">
 
-| <div align="center"> rl-contact-real-go2 </div> | <div align="center"> rl-contact-sim-go2 </div> | <div align="center"> rl-mps-sim-go2 </div> |
-| --- | --- | --- |
-| [<img src="./assets/rl-contact-real-go2.gif" width="240px">](rl-contact-real-go2) | [<img src="./assets/rl-contact-sim-go2.gif" width="240px">](rl-contact-sim-go2) | [<img src="./assets/rl-mps-sim-go2.gif" width="240px">](rl-mps-sim-go2) |
+| <div align="center"> rl-contact-real-go2 </div> | <div align="center"> rl-contact-sim-go2 </div> |
+| --- | --- |
+| [<img src="./assets/rl-contact-real-go2.gif" width="240px">](rl-contact-real-go2) | [<img src="./assets/rl-contact-sim-go2.gif" width="240px">](rl-contact-sim-go2) |
 
 </div>
-
-## 🛡️ Safety-Filtered Control
-
-### Overview
-The safety filter uses a **minimally invasive predictive safety filter** that redirects footsteps around obstacles while preserving goal-reaching performance. It employs a sampling-based receding-horizon optimizer (MPPI) warm-started by nominal commands and a learned value function.
-
-**Key insight**: Formal safety guarantees (HJ Reachability, CBF, MPS) are infeasible for legged locomotion due to curse of dimensionality. Instead, we optimize in the compact **contact-location space** where a pre-trained contact-conditioned policy maps contacts → joint trajectories.
-
-### Core Pipeline
-1. **High-level planner** → nominal contact locations (given user velocity command)
-2. **Risk detector** monitors for safety violations
-3. **If violation detected** → MPPI optimizer samples alternative contact sequences
-4. **MPPI samples** cost via full-simulation rollout
-5. **Optimized contacts** returned in receding-horizon fashion
-
-### Evaluation (Simulation)
-```bash
-./doom.sh -e --safety        # Enter container with safety mode
-cd src/
-python3 eval/launch_eval.py --scenario eval/scenarios/scenario_a.yaml --seed 42
-./eval.sh  # analysis
-```
-
-### Current Status
-- ✅ Large-obstacle navigation: tested
-- ✅ Cluttered scenes: tested
-- ⚠️ Dynamic obstacles: **not tested yet with new code**
-- ⚠️ Some collisions still occur in certain scenarios
-
-> **Note**: Collisions still occur in some scenarios—ongoing work on math and bug fixes.
-
-### Hardware Testing (Real Go2 with Joystick)
-
-#### Terminal 1
-Launch Vicon client for base state estimation
-```bash
-./doom.sh -e
-ros2 launch vicon_receiver client.launch.py
-```
-
-#### Terminal 2
-Generate Obstacles xml and disable the sport mode of robot
-```bash
-./doom.sh -a
-cd src
-python3 scripts/gen_obstacles_xml.py
-python3 scripts/safely_lay_down.py
-python3 scripts/disable_sport_mode.py 
-```
-
-> **Note**: Remember to cross verify that xml matches the real obj, you can do that by running `go2_mps_sim --headless` and view it in browser
-
-#### Terminal 3
-```bash
-./doom.sh -a
-source setup.sh
-ros2 run master_manager master_node --task rl-mps-real-go2
-```
-
-#### Terminal 4 (Data Collection)
-Record experiment data (Vicon pose + optimizer metrics) to CSV:
-```bash
-./doom.sh -a
-source setup.sh
-cd src
-python3 eval/hw_data_collector.py --label static_nav
-python3 eval/hw_data_collector.py --label static_nav --rosbag   # with rosbag
-```
-
-> **Note**: Start the collector BEFORE running the controller (captures full episode). Ctrl+C to stop cleanly.
-
-#### Joystick Workflow
-
-| Sequence | Button | Action |
-|---|---|---|---|
-| Startup | `Select` | ZERO mode |
-| | `Start` | STAY_DOWN |
-| | `L1+R1` | STANCE |
-| | `L1+R1` | RL-MPS (stance) |
-| In RL-MPS | `A` | Toggle MPC on/off |
-| | `X` | Toggle trot ↔ stance |
-| | `Up/Down` | Forward/backward speed |
-| | `Left/Right` | Strafe left/right |
-| | `Y/B` | Turn left/right |
-| | `L1+R1` | Reset to defaults |
-| Shutdown | `Start` | DAMPING |
-
-> **Note**: The safety filter (MPPI) runs on GPU in a separate process. Ensure the container has GPU access (`nvidia-container-toolkit` installed). MPC starts OFF by default — press `A` to enable.
-
-### Data Collection & Output
-
-The controller publishes `/mps_optimizer_metrics` (Float32MultiArray) every control step — 12 floats: tracking cost, optimizer cost, opt elapsed ms, MPC active, plan seq, body-frame velocity, base height, base position. Use `eval/hw_data_collector.py` to log this alongside Vicon pose.
-
-**Sim testing** (no Vicon — uses controller's base position estimate):
-```bash
-cd src/
-python3 eval/hw_data_collector.py --sim --task rl-mps-eval-go2 --label static_nav
-python3 eval/hw_data_collector.py --sim --label static_nav --rosbag
-```
-
-**Hardware** (uses Vicon for ground-truth pose):
-```bash
-cd src/
-python3 eval/hw_data_collector.py --label static_nav
-python3 eval/hw_data_collector.py --label static_nav --rosbag
-```
-
-**Output directory** (`{alg}_{interface}_{label}_{timestamp}/`):
-```
-results/hw_eval/REMIMPS_hw_static_nav_20260512_143022/
-├── configs/
-│   ├── controller_cfg.yaml         # rl_mps_go2_cfg.yaml copy
-│   └── robot_interface_cfg.yaml    # real_go2_cfg.yaml copy
-├── xmls/
-│   ├── scene.xml, scene_mjx.xml    # scene XMLs
-│   ├── go2.xml, go2_mjx.xml        # robot XMLs
-│   ├── obstacles_hw.xml            # obstacle geometry
-│   └── balls.xml                   # dynamic obstacle config
-├── eval_data.csv                   # paper-ready metrics (time-series)
-├── experiment_config.json          # metadata (label, task, mode, timestamp)
-└── rosbag/                         # only if --rosbag
-```
-
-**CSV columns**: `t, x, y, z, qw, qx, qy, qz, heading, tracking_cost, optimizer_cost, opt_elapsed_ms, mpc_active, plan_seq, ctrl_vx, ctrl_vy, ctrl_height, frame_number`
-
----
 
 ## 📡 Vicon State Estimation
 The Vicon receiver client is already installed in the Docker container. You can launch it in a new terminal inside the existing container (`./doom.sh -a`) using:

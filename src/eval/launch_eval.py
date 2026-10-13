@@ -174,7 +174,7 @@ def launch_tmux(src, args):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Launch DoomMPC eval (sim + ROS)")
+    parser = argparse.ArgumentParser(description="Launch Shield-Loco eval (sim + ROS)")
     parser.add_argument("--scenario", required=True, help="Path to eval scenario YAML")
     parser.add_argument("--task", default="rl-mps-eval-go2")
     parser.add_argument("--log", default="test")

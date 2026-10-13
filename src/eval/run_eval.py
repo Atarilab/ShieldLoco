@@ -1,5 +1,5 @@
 """
-Multi-run eval launcher for DoomMPC.
+Multi-run eval launcher for Shield-Loco.
 
 Launches simulate.py and master_node as subprocesses (mirroring the go2_mps_eval_*
 aliases), waits for the episode to finish, then parses the CSVs into a summary dict.
@@ -524,7 +524,7 @@ def main():
     signal.signal(signal.SIGINT, _on_interrupt)
     signal.signal(signal.SIGTERM, _on_interrupt)
 
-    parser = argparse.ArgumentParser(description="DoomMPC eval runner")
+    parser = argparse.ArgumentParser(description="Shield-Loco eval runner")
     parser.add_argument("--scenario", required=True, help="Path to scenario YAML")
     parser.add_argument("--runs", type=int, default=1, help="Runs per condition")
     parser.add_argument("--out", default="results/eval", help="Output directory")

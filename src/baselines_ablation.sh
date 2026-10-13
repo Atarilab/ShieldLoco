@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reduced-order baseline ablation for the rebuttal.
+# Reduced-order baseline ablation for the paper.
 #
 # Compares the safety-filter baselines against each other and the unfiltered
 # nominal over the LIPM fix (clearance 0.35 m, swing-feet control):

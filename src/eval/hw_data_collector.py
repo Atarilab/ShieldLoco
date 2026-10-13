@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-hw_data_collector.py — Data collection for DoomMPC safety-filter experiments.
+hw_data_collector.py — Data collection for Shield-Loco safety-filter experiments.
 
 Supports both hardware (Vicon) and simulation modes.
 
@@ -370,7 +370,7 @@ class DataCollector(Node):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="DoomMPC data collector (sim + hw)")
+    parser = argparse.ArgumentParser(description="Shield-Loco data collector (sim + hw)")
     parser.add_argument("--label", required=True, help="Experiment label (e.g. static_nav)")
     parser.add_argument(
         "--task", default="rl-mps-real-go2",

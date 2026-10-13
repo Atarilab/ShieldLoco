@@ -10,7 +10,7 @@ the obstacle SDF — no MuJoCo physics, no learned policy.
 
 Purpose: isolate the effect of the *dynamics model* (reduced-order LIPM vs.
 full-order MuJoCo) while keeping the optimizer identical to the proposed
-method.  This is the "LIPM model + my optimizer" ablation baseline.
+method.  This is the "LIPM model + the proposed optimizer" ablation baseline.
 
 The class is self-contained and modular, mirroring the structure of
 QuadCBFPlanner / QuadHJPlanner:

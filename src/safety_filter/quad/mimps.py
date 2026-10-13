@@ -11,7 +11,7 @@ from .task import QuadRLTaskParams, QuadRLTask
 from safety_filter.bases.risk import RiskStrategy
 
 
-# MIMPS = MMPI MPS
+# MIMPS = MPPI MPS
 @dataclass
 class MIMPSParams(QuadAlgSamplingParams):
     """Policy parameters for model-predictive path integral control.

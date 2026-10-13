@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Safety-value terminal cost ablation for DoomMPC.
+# Safety-value terminal cost ablation for Shield-Loco.
 #
 # Runs 4 modes: off, heuristic, direct, residual.
 #
