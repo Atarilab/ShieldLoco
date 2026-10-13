@@ -1,4 +1,4 @@
-__# Python
+# Python
 .DS_Store
 **/*.egg-info/
 **/__pycache__/
@@ -11,3 +11,4 @@ __# Python
 **/logs/
 **/system.log
 **/results/
+MUJOCO_LOG.TXT

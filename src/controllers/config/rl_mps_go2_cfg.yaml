@@ -6,7 +6,6 @@
 # POLICY
 # ----------------------------------------------------------------------------
 # Available policies in src/controllers/policies/locomotion_go2/:
-#   - contact_policy_actuatorRand.pt
 #   - contact_policy_feetRandom.pt
 #   - contact_policy_stanceSeperate.pt
 #   - contact_policy_stance2.pt
