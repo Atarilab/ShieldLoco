@@ -33,6 +33,10 @@ from .cbf_planner import (
     _make_lip_matrices,
     _make_unicycle_matrices,
     _project_onto_half_plane,
+    _blend_nominal_to_band,
+    _DEFAULT_CBF_CLEARANCE,
+    _DEFAULT_BAND_OUTER,
+    _DEFAULT_BAND_INNER,
 )
 
 from safety_filter.bases.risk import RiskStrategy
@@ -89,6 +93,11 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         hj_vi_iters: int = 30,
         hj_foot_bounds: float = 0.25,
         dynamics_model: str = "lip",
+        clearance: float = _DEFAULT_CBF_CLEARANCE,
+        max_correction: float = _DEFAULT_MAX_CORRECTION,
+        use_band: bool = False,
+        band_outer: float = _DEFAULT_BAND_OUTER,
+        band_inner: float = _DEFAULT_BAND_INNER,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -113,7 +122,11 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
 
         self._enabled = enabled
         self._use_geometric_fallback = use_geometric_fallback
-        self._max_correction = _DEFAULT_MAX_CORRECTION
+        self._max_correction = max_correction
+        self._hj_clearance = clearance
+        self._use_band = use_band
+        self._band_outer = band_outer
+        self._band_inner = band_inner
 
         T = self.task.command_duration
         self._dynamics_model = dynamics_model
@@ -170,7 +183,7 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         N = states.shape[0]
 
         sdfs, _ = _batch_sdf_and_grad(states[:, [0, 2]], self.task.obstacle_sdf)
-        h_vals = jnp.min(sdfs, axis=-1) - self.task.body_sdf_margin
+        h_vals = jnp.min(sdfs, axis=-1) - self._hj_clearance
 
         u_1d = jnp.linspace(-self._foot_bounds, self._foot_bounds, self._n_u_per_dim)
         UX, UY = jnp.meshgrid(u_1d, u_1d, indexing="ij")
@@ -326,6 +339,10 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         If V < 0 (state is in the BRT), corrects the footstep by solving
         a 2D QP with the linearised V constraint.
 
+        The discrete control is the centroid of the SWING feet — the feet
+        about to step and become the next support pivots.  The correction
+        is applied to the swing-feet targets; stance feet are never moved.
+
         Args:
             plan_h: (plan_dim,) normalised nominal footstep plan for step h.
             s_k:    (4,) current CoM state.
@@ -341,35 +358,39 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         feet_world = ref_world.reshape(4, 3)
 
         if stance_mask is not None:
-            mask_f = stance_mask.astype(jnp.float32)
-            n_stance = jnp.maximum(jnp.sum(mask_f), 1.0)
-            u_avg_nom = jnp.sum(mask_f[:, None] * feet_world[:, :2], axis=0) / n_stance
+            swing_f = 1.0 - stance_mask.astype(jnp.float32)
+            n_swing = jnp.sum(swing_f)
         else:
-            u_avg_nom = jnp.mean(feet_world[:, :2], axis=0)
+            swing_f = jnp.ones(4, dtype=jnp.float32)
+            n_swing = jnp.array(4.0)
 
-        s_nom = self._A @ s_k + self._B_full @ u_avg_nom
-        V_nom = self._query_V(s_nom)
+        def _correct():
+            u_avg_nom = jnp.sum(swing_f[:, None] * feet_world[:, :2], axis=0) / n_swing
 
-        grad = self._grad_V(s_nom)
-        grad_B = self._B_full.T @ grad          # (2,)  = B_full^T (4×2) @ grad (4,)
-        grad_B = grad_B[:2]                     # keep only the u_x, u_y components
+            s_nom = self._A @ s_k + self._B_full @ u_avg_nom
+            V_nom = self._query_V(s_nom)
 
-        A_hj = -grad_B[None, :]
-        b_hj = V_nom - grad_B @ u_avg_nom
+            grad = self._grad_V(s_nom)
+            grad_B = self._B_full.T @ grad          # (2,)  = B_full^T (4×2) @ grad (4,)
+            grad_B = grad_B[:2]                     # keep only the u_x, u_y components
 
-        u_avg_safe = _project_onto_half_plane(
-            u_avg_nom,
-            A_hj,
-            b_hj.reshape(1,),
-            u_avg_nom - self._max_correction,
-            u_avg_nom + self._max_correction,
-        )
+            A_hj = -grad_B[None, :]
+            b_hj = V_nom - grad_B @ u_avg_nom
 
-        correction = u_avg_safe - u_avg_nom
-        mask_f = stance_mask.astype(jnp.float32) if stance_mask is not None else jnp.ones(4, dtype=jnp.float32)
-        safe_feet_xy = feet_world[:, :2] + mask_f[:, None] * correction[None, :]
-        safe_feet = jnp.concatenate([safe_feet_xy, feet_world[:, 2:]], axis=-1)
-        return safe_feet.reshape(-1) / self.task.plan_lim
+            u_avg_safe = _project_onto_half_plane(
+                u_avg_nom,
+                A_hj,
+                b_hj.reshape(1,),
+                u_avg_nom - self._max_correction,
+                u_avg_nom + self._max_correction,
+            )
+
+            correction = u_avg_safe - u_avg_nom
+            safe_feet_xy = feet_world[:, :2] + swing_f[:, None] * correction[None, :]
+            safe_feet = jnp.concatenate([safe_feet_xy, feet_world[:, 2:]], axis=-1)
+            return safe_feet.reshape(-1) / self.task.plan_lim
+
+        return jax.lax.cond(n_swing > 0.0, _correct, lambda: plan_h)
 
     # =====================================================================
     # GAIT HELPERS
@@ -453,6 +474,13 @@ class QuadHJPlanner(QuadSamplingBasedPlanner):
         safe_plan, _ = jax.lax.scan(
             _step, jnp.zeros_like(params.ref), jnp.arange(H), length=H,
         )
+
+        if self._use_band:
+            com_xy = s_k[jnp.array([0, 2])]
+            safe_plan = _blend_nominal_to_band(
+                params.ref, safe_plan, com_xy, self.task.obstacle_sdf,
+                self._band_outer, self._band_inner,
+            )
 
         new_mean = safe_plan - params.ref
         return params.replace(mean=new_mean, best_plan=safe_plan)

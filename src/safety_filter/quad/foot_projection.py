@@ -285,6 +285,7 @@ def project_plan_feet(plans_denorm, sdf, r_safe, n_iters=3):
     feet_z = feet[..., 2:]
 
     flat_xy = feet_xy.reshape(-1, 2)
+    flat_xy_orig = flat_xy
 
     def _step(p, _):
         sdfs_all, grads_all = _batch_sdf_and_grad(p, sdf)
@@ -302,6 +303,15 @@ def project_plan_feet(plans_denorm, sdf, r_safe, n_iters=3):
         return p + jnp.where(needs_push[:, None], push, jnp.zeros_like(push)), None
 
     flat_xy, _ = jax.lax.scan(_step, flat_xy, None, length=n_iters)
+
+    # Safety clamp: if the projection moved a point deeper into obstacles
+    # (oscillation between two constraints), fall back to the original.
+    sdfs_proj, _ = _batch_sdf_and_grad(flat_xy, sdf)
+    sdfs_orig, _ = _batch_sdf_and_grad(flat_xy_orig, sdf)
+    min_proj = jnp.min(sdfs_proj, axis=1)
+    min_orig = jnp.min(sdfs_orig, axis=1)
+    got_worse = min_proj < min_orig - 1e-5
+    flat_xy = jnp.where(got_worse[:, None], flat_xy_orig, flat_xy)
 
     projected_xy = flat_xy.reshape(feet_xy.shape)
     projected_feet = jnp.concatenate([projected_xy, feet_z], axis=-1)
@@ -321,14 +331,14 @@ def check_and_fix_swing_arc(p_from, p_to, sdf, r_safe):
     safe) while the swing arc passes through the obstacle (collision).
 
     Args:
-        p_from: (2,) current foot XY position in world frame.
-        p_to:   (2,) projected landing XY position in world frame.
+        p_from: (4, 2) current foot XY positions in world frame.
+        p_to:   (4, 2) projected landing XY positions in world frame.
         sdf:    ObstacleSDF.
         r_safe: required clearance margin (metres).
 
     Returns:
-        p_corrected: (2,) safe landing position — either p_to (if arc is clear)
-                     or the near-side boundary intersection (if arc crosses).
+        p_corrected: (4, 2) safe landing positions — either p_to (if arc clear)
+                     or near-side boundary intersection (if arc crosses).
     """
     if sdf.num_obstacles == 0:
         return p_to
@@ -343,20 +353,20 @@ def check_and_fix_swing_arc(p_from, p_to, sdf, r_safe):
 
     ip_flat = interp_pts.reshape(-1, 2)
     sdfs_flat, grads_flat = _batch_sdf_and_grad(ip_flat, sdf)
-    sdfs_544 = sdfs_flat.reshape(5, 4, -1)
-    grads_544 = grads_flat.reshape(5, 4, -1, 2)
+    sdfs_grid = sdfs_flat.reshape(n_interp, 4, -1)
+    grads_grid = grads_flat.reshape(n_interp, 4, -1, 2)
 
-    min_sdfs_544 = jnp.min(sdfs_544, axis=2)
-    overall_min_flat = jnp.argmin(min_sdfs_544)
+    min_sdfs_grid = jnp.min(sdfs_grid, axis=2)
+    overall_min_flat = jnp.argmin(min_sdfs_grid)
     idx_i = overall_min_flat // 4
     idx_f = overall_min_flat % 4
-    idx_m = jnp.argmin(sdfs_544[idx_i, idx_f, :])
+    idx_m = jnp.argmin(sdfs_grid[idx_i, idx_f, :])
 
     p_from_min = p_from[idx_f]
     direction_min = direction[idx_f]
     t_min_scalar = t_vals[idx_i]
-    grad_at_min = grads_544[idx_i, idx_f, idx_m, :]
-    sdf_at_min = sdfs_544[idx_i, idx_f, idx_m]
+    grad_at_min = grads_grid[idx_i, idx_f, idx_m, :]
+    sdf_at_min = sdfs_grid[idx_i, idx_f, idx_m]
     min_clamped = jnp.clip(sdf_at_min, -1e4, 1e4)
 
     arc_is_clear = sdf_at_min >= r_safe
@@ -492,6 +502,11 @@ def project_plan_feet_with_arc_check(plans_denorm, sdf, r_safe, current_feet_xy,
 def _project_one_pairwise(p_ref, sdfs, grads, r_safe):
     """Project a single foot (2,) using pairwise KKT enumeration.
 
+    Evaluates single-constraint and pairwise intersection candidates for the
+    two most-violated SDF constraints, checks feasibility against ALL M
+    linearized constraints, and returns the feasible candidate with minimum
+    displacement from p_ref.
+
     Args:
         p_ref: (2,) initial XY position.
         sdfs: (M,) SDF values at p_ref.
@@ -503,16 +518,21 @@ def _project_one_pairwise(p_ref, sdfs, grads, r_safe):
     """
     M = sdfs.shape[0]
     v = r_safe - sdfs  # (M,) violation per obstacle
+    any_violation = jnp.max(v) > 1e-6
 
     b_rhs = jnp.einsum("mj,j->m", grads, p_ref) + r_safe - sdfs  # (M,)
 
-    top2_idx = jnp.flip(jnp.argsort(v)[-2:])
+    # Top-2 most-violated constraints, handles M=1 via padding
+    top2_idx_raw = jnp.flip(jnp.argsort(v)[-2:])
+    pad_len = 2 - top2_idx_raw.shape[0]
+    top2_idx = jnp.pad(top2_idx_raw, (0, pad_len), constant_values=0)
     v2 = v[top2_idx]
-    g2 = grads[top2_idx]  # (2, 2)
+    g2 = grads[top2_idx]
 
-    # Candidate 1: single-constraint projection onto worst
+    # Candidate 1: single-constraint projection along worst gradient
     p1 = p_ref + v2[0] * g2[0]
     feasible1 = jnp.all(grads @ p1 >= b_rhs - 1e-5)
+    cost1 = jnp.sum((p1 - p_ref) ** 2)
 
     # Candidate 2: pairwise intersection
     G = g2
@@ -526,12 +546,12 @@ def _project_one_pairwise(p_ref, sdfs, grads, r_safe):
         return p_ref
     p2 = jax.lax.cond(nonsingular, _compute_p2, _fallback_p2)
     feasible2 = jnp.all(grads @ p2 >= b_rhs - 1e-5) & nonsingular
+    cost2 = jnp.sum((p2 - p_ref) ** 2)
 
-    p_default = p1
-    p_best = jax.lax.select(
-        feasible2, p2, jax.lax.select(feasible1, p1, p_default)
-    )
-    any_violation = v2[0] > 1e-6
+    # Pick best feasible candidate (minimum displacement). Prefer single-
+    # constraint when both feasible and equally good (fewer moving parts).
+    pick2 = feasible2 & jnp.logical_or(~feasible1, cost2 < cost1)
+    p_best = jax.lax.select(pick2, p2, jax.lax.select(feasible1, p1, p_ref))
     return jax.lax.select(any_violation, p_best, p_ref)
 
 
@@ -594,10 +614,7 @@ def project_plan_feet_qp_sqp(plans_denorm, sdf, r_safe, n_outer=2):
     feet_z = feet[..., 2:]
     p = feet_xy.reshape(-1, 2)
 
-    sdfs, grads = _batch_sdf_and_grad(p, sdf)
-    p = _project_batch_pairwise(p, sdfs, grads, r_safe)
-
-    if n_outer >= 2:
+    for _ in range(n_outer):
         sdfs, grads = _batch_sdf_and_grad(p, sdf)
         p = _project_batch_pairwise(p, sdfs, grads, r_safe)
 
@@ -693,10 +710,7 @@ def project_plan_feet_with_arc_check_qp_sqp(
     feet_z = feet[..., 2:]
     p = feet_xy.reshape(-1, 2)
 
-    sdfs, grads = _batch_sdf_and_grad(p, sdf)
-    p = _project_batch_pairwise(p, sdfs, grads, r_safe)
-
-    if n_outer >= 2:
+    for _ in range(n_outer):
         sdfs, grads = _batch_sdf_and_grad(p, sdf)
         p = _project_batch_pairwise(p, sdfs, grads, r_safe)
 

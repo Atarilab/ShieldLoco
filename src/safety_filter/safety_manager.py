@@ -166,6 +166,7 @@ PLANNER_REGISTRY = {
     "REMIMPS": "QuadREMIMPSPlanner",
     "CBF": "QuadCBFPlanner",
     "HJ": "QuadHJPlanner",
+    "LIPM": "QuadLIPMPlanner",
 }
 
 
@@ -187,6 +188,7 @@ def create_planner(alg_name, task, config):
     from .quad.remimps import QuadREMIMPSPlanner
     from .quad.cbf_planner import QuadCBFPlanner
     from .quad.hj_planner import QuadHJPlanner
+    from .quad.lipm_planner import QuadLIPMPlanner
 
     registry = {
         "MIMPS": QuadMIMPSPlanner,
@@ -196,6 +198,7 @@ def create_planner(alg_name, task, config):
         "REMIMPS": QuadREMIMPSPlanner,
         "CBF": QuadCBFPlanner,
         "HJ": QuadHJPlanner,
+        "LIPM": QuadLIPMPlanner,
     }
     
     if alg_name not in registry:
@@ -220,7 +223,20 @@ def create_planner(alg_name, task, config):
     }
     
     optimizer_params = config.get(alg_name, {})
-    
+
+    # Bool flags may arrive as strings ('true'/'false') from sweep overrides or
+    # YAML. Coerce so that a truthy string "false" can never silently enable a
+    # filter ("nominal" planns). Non-bool/int keys are passed through untouched.
+    for _key in ("enabled", "use_geometric_fallback", "use_band"):
+        if _key in optimizer_params:
+            _v = optimizer_params[_key]
+            if isinstance(_v, str):
+                _low = _v.strip().lower()
+                if _low == "true":
+                    optimizer_params[_key] = True
+                elif _low == "false":
+                    optimizer_params[_key] = False
+
     return planner_cls(task=task, **common_params, **optimizer_params)
 
 

@@ -178,8 +178,13 @@ class SimEvalHooks:
 
         # Episode termination:
         # - goal_reached: write done_file immediately so the ROS node also stops fast
+        #   (only for static-nav scenarios; in dynamic_obs the goal is a dummy at the
+        #   robot's start pose, so it must never trigger)
         # - timed_out: controller writes done_file after max_time, we pick it up here
-        goal_reached = goal_dist < self.cfg.goal_threshold
+        goal_reached = (
+            self.cfg.scenario != "dynamic_obs"
+            and goal_dist < self.cfg.goal_threshold
+        )
         ros_done = os.path.exists(self.cfg.done_file)
         if goal_reached and not ros_done:
             with open(self.cfg.done_file, "w") as _f:

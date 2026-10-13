@@ -21,7 +21,7 @@ device: 'cpu'  # or "cuda:0"
 # ----------------------------------------------------------------------------
 control_dt: 0.005          # Main controller frequency (200 Hz)
 decimation: 4              # RL policy decimation
-command_duration: 0.45      # Duration per contact plan step
+command_duration: 0.45     # Duration per contact plan step
 obs_horizon: 2             # Reference trajectory horizon for policy observations
 timestep: 0.03             # MuJoCo physics timestep
 
@@ -197,11 +197,54 @@ CBF:
   use_geometric_fallback: false
   cross_entropy_decay: 0.5
   dynamics_model: "lip"   # "lip" | "unicycle"
+  clearance: 0.35         # DCBF barrier margin above obstacle SDF (body radius)
+  max_correction: 0.20    # per-step centroid correction bound (m)
+  # Transition-band override: smoothly blend nominal <-> corrected plan over
+  # the CoM-clearance band [band_inner, band_outer] instead of hard authority.
+  use_band: false
+  band_outer: 0.8         # clearance below which the filter starts to act (m)
+  band_inner: 0.25        # clearance below which the filter is fully applied (m)
 
 HJ:
   hj_grid: [30, 20, 30, 20]
   hj_vi_iters: 40
   dynamics_model: "lip"   # "lip" | "unicycle"
+  clearance: 0.35         # HJ terminal set margin (body radius)
+  max_correction: 0.20    # per-step centroid correction bound (m)
+  use_band: false         # transition-band override (see CBF notes)
+  band_outer: 0.8
+  band_inner: 0.25
+
+# Reduced-order LIPM baseline: the *proposed method's* sampler optimizes the
+# reduced-order CoM model (LIPM / unicycle) instead of full-order MuJoCo.
+# Use it as an ablation of the dynamics model while keeping the optimizer.
+LIPM:
+  enabled: true
+  # Ablation: set use_geometric_fallback: false to test the reduced-order
+  # optimizer standalone (no geometric projection during sampling / finalize).
+  use_geometric_fallback: false
+  optimizer: "mppi"   # "mppi" | "cem" | "replica" — selects the update rule
+  dynamics_model: "lip"   # "lip" | "unicycle"
+  noise_level: 0.6
+  # MPPI
+  temperature: 1.0
+  # CEM
+  elite_fraction: 0.1
+  cross_entropy_decay: 0.8
+  # Replica-exchange MPPI
+  num_replicas: 3
+  temp_min: 0.1
+  temp_max: 2.0
+  swap_every: 1
+  # Reduced-order cost weights
+  clearance: 0.35
+  cost_w_body: 10.0
+  cost_w_foot: 5.0
+  cost_w_track: 1.0
+  cost_w_terminal: 10.0
+  use_band: false
+  band_outer: 0.8
+  band_inner: 0.25
 
 # ----------------------------------------------------------------------------
 # TASK

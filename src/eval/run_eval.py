@@ -487,6 +487,15 @@ def parse_sweep_arg(sweep_str: str) -> List[Dict[str, Any]]:
 
 
 def _coerce(s: str) -> Any:
+    """Best-effort type coercion for sweep values.
+
+    Critical: 'true'/'false' are mapped to real booleans so that scheduler
+    flags like ``CBF.enabled=false`` reach YAML as bare ``false`` and are NOT
+    the truthy string ``'false'`` (which silently keeps the filter enabled).
+    """
+    low = s.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
     try:
         return int(s)
     except ValueError:

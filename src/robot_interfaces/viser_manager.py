@@ -198,6 +198,15 @@ class ViserManager:
         self.state.server.scene.set_up_direction("+z")
         self.state.server.scene.add_grid("/world/grid", width=8.0, height=8.0, plane="xy")
 
+        # # Soft dark background for comfortable viewing at night
+        # self.state.server.scene.configure_environment_map(
+        #     hdri="lobby",
+        #     background=True,
+        #     background_intensity=0.3,
+        #     background_blurriness=0.3,
+        #     environment_intensity=0.4,
+        # )
+
         try:
             self.state.reset_button = self.state.server.gui.add_button("Reset Robot")
             self.state.reset_button.on_click(lambda _: self.request_reset_callback())

@@ -30,6 +30,43 @@ from safety_filter.bases.risk import RiskStrategy
 _DEFAULT_COM_HEIGHT = 0.35
 _DEFAULT_DCBF_GAMMA = 0.5
 _DEFAULT_MAX_CORRECTION = 0.20
+_DEFAULT_CBF_CLEARANCE = 0.35
+_DEFAULT_BAND_OUTER = 0.8
+_DEFAULT_BAND_INNER = 0.25
+
+
+def _blend_nominal_to_band(
+    nominal: jax.Array,
+    safe: jax.Array,
+    com_xy: jax.Array,
+    sdf,
+    band_outer: float,
+    band_inner: float,
+) -> jax.Array:
+    """Smoothly blend the nominal plan into the reduced-order safe plan.
+
+    Sigma ramps 0->1 (smoothstep) as the clearance drops from band_outer
+    (filter off) to band_inner (fully applied), so the intervention is a
+    gradual transition band instead of a hard override.
+
+    Args:
+        ref:   (H, plan_dim) normalised nominal plan.
+        safe:  (H, plan_dim) normalised reduced-order filtered plan.
+        com_xy: (2,) current CoM XY (barrier risk signal).
+        sdf:   ObstacleSDF used to compute the clearance band signal.
+
+    Returns:
+        (H, plan_dim) blended plan.
+    """
+    if sdf.num_obstacles == 0:
+        return safe
+
+    sdfs_k, _ = _sdf_and_grad_all(com_xy, sdf)
+    d = jnp.min(sdfs_k)
+    span = jnp.maximum(band_outer - band_inner, 1e-6)
+    t = jnp.clip((band_outer - d) / span, 0.0, 1.0)
+    sigma = t * t * (3.0 - 2.0 * t)
+    return nominal + sigma * (safe - nominal)
 
 
 @dataclass
@@ -117,51 +154,57 @@ def _cbf_correct_plan(
     so the constraint activates preventively when the next CoM would be
     unsafe, even if the current CoM is safe.
 
-    If stance_mask is provided (4,), only stance feet are averaged into
-    the centroid and only stance feet receive the correction.
+    The discrete control is the centroid of the SWING feet — the feet about
+    to step and become the next support pivots (matching LIPM footstep
+    semantics).  The correction is therefore applied to the swing-feet
+    targets; stance feet are already planted and are never re-targeted.
     """
     ref_world = plan_h * plan_lim
     feet_world = ref_world.reshape(4, 3)
 
-    if stance_mask is not None:
-        mask_f = stance_mask.astype(jnp.float32)
-        n_stance = jnp.maximum(jnp.sum(mask_f), 1.0)
-        u_avg_nom = jnp.sum(mask_f[:, None] * feet_world[:, :2], axis=0) / n_stance
-    else:
-        u_avg_nom = jnp.mean(feet_world[:, :2], axis=0)
-
     if sdf.num_obstacles == 0:
         return plan_h
 
-    # h_k: safety at current CoM (for RHS of DCBF)
-    com_xy = s_k[jnp.array([0, 2])]
-    sdfs_k, _ = _sdf_and_grad_all(com_xy, sdf)
-    h_k = jnp.min(sdfs_k) - clearance
+    if stance_mask is None:
+        swing_f = jnp.ones(4, dtype=jnp.float32)
+        n_swing = jnp.array(4.0)
+    else:
+        swing_f = 1.0 - stance_mask.astype(jnp.float32)
+        n_swing = jnp.sum(swing_f)
 
-    # h_nom: safety at predicted next CoM under nominal footstep
-    s_nom = A @ s_k + B @ u_avg_nom
-    s_nom_xy = s_nom[jnp.array([0, 2])]
-    sdfs_nom, grads_nom = _sdf_and_grad_all(s_nom_xy, sdf)
-    h_nom = jnp.min(sdfs_nom) - clearance
-    worst_idx = jnp.argmin(sdfs_nom)
-    dh_dcom = grads_nom[worst_idx]
+    def _correct():
+        u_avg_nom = jnp.sum(swing_f[:, None] * feet_world[:, :2], axis=0) / n_swing
 
-    grad_B = jnp.array([
-        dh_dcom[0] * B_xy[0, 0] + dh_dcom[1] * B_xy[1, 0],
-        dh_dcom[0] * B_xy[0, 1] + dh_dcom[1] * B_xy[1, 1],
-    ])
+        # h_k: safety at current CoM (for RHS of DCBF)
+        com_xy = s_k[jnp.array([0, 2])]
+        sdfs_k, _ = _sdf_and_grad_all(com_xy, sdf)
+        h_k = jnp.min(sdfs_k) - clearance
 
-    A_cbf = -grad_B[None, :]
-    b_cbf = h_nom - (1.0 - gamma) * h_k - grad_B @ u_avg_nom
-    u_avg_safe = _project_onto_half_plane(u_avg_nom, A_cbf, b_cbf,
-                                           u_avg_nom - max_correction,
-                                           u_avg_nom + max_correction)
+        # h_nom: safety at predicted next CoM under nominal footstep
+        s_nom = A @ s_k + B @ u_avg_nom
+        s_nom_xy = s_nom[jnp.array([0, 2])]
+        sdfs_nom, grads_nom = _sdf_and_grad_all(s_nom_xy, sdf)
+        h_nom = jnp.min(sdfs_nom) - clearance
+        worst_idx = jnp.argmin(sdfs_nom)
+        dh_dcom = grads_nom[worst_idx]
 
-    correction = u_avg_safe - u_avg_nom
-    mask_f = stance_mask.astype(jnp.float32) if stance_mask is not None else jnp.ones(4, dtype=jnp.float32)
-    safe_feet_xy = feet_world[:, :2] + mask_f[:, None] * correction[None, :]
-    safe_feet = jnp.concatenate([safe_feet_xy, feet_world[:, 2:]], axis=-1)
-    return safe_feet.reshape(-1) / plan_lim
+        grad_B = jnp.array([
+            dh_dcom[0] * B_xy[0, 0] + dh_dcom[1] * B_xy[1, 0],
+            dh_dcom[0] * B_xy[0, 1] + dh_dcom[1] * B_xy[1, 1],
+        ])
+
+        A_cbf = -grad_B[None, :]
+        b_cbf = h_nom - (1.0 - gamma) * h_k - grad_B @ u_avg_nom
+        u_avg_safe = _project_onto_half_plane(u_avg_nom, A_cbf, b_cbf,
+                                               u_avg_nom - max_correction,
+                                               u_avg_nom + max_correction)
+
+        correction = u_avg_safe - u_avg_nom
+        safe_feet_xy = feet_world[:, :2] + swing_f[:, None] * correction[None, :]
+        safe_feet = jnp.concatenate([safe_feet_xy, feet_world[:, 2:]], axis=-1)
+        return safe_feet.reshape(-1) / plan_lim
+
+    return jax.lax.cond(n_swing > 0.0, _correct, lambda: plan_h)
 
 
 class QuadCBFPlanner(QuadSamplingBasedPlanner):
@@ -195,6 +238,11 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         c_max_decay: float = 0.9,
         include_terminal_cost: bool = True,
         dynamics_model: str = "lip",
+        clearance: float = _DEFAULT_CBF_CLEARANCE,
+        max_correction: float = _DEFAULT_MAX_CORRECTION,
+        use_band: bool = False,
+        band_outer: float = _DEFAULT_BAND_OUTER,
+        band_inner: float = _DEFAULT_BAND_INNER,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -229,7 +277,11 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
             self._A, self._B_full = _make_lip_matrices(T, _DEFAULT_COM_HEIGHT)
 
         self._B_xy = self._B_full[jnp.array([0, 2]), :]
-        self._max_correction = _DEFAULT_MAX_CORRECTION
+        self._max_correction = max_correction
+        self._cbf_clearance = clearance
+        self._use_band = use_band
+        self._band_outer = band_outer
+        self._band_inner = band_inner
 
     def init_params(
         self,
@@ -296,7 +348,7 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
         s_k = jnp.array([base_pos[0], base_vel[0], base_pos[1], base_vel[1]])
 
         sdf = self.task.obstacle_sdf
-        clearance = self.task.body_sdf_margin
+        clearance = self._cbf_clearance
 
         if sdf.num_obstacles == 0:
             safe_plan = params.ref
@@ -316,6 +368,13 @@ class QuadCBFPlanner(QuadSamplingBasedPlanner):
             safe_plan, _ = jax.lax.scan(
                 _step, jnp.zeros_like(params.ref), jnp.arange(H), length=H,
             )
+
+            if self._use_band:
+                com_xy = s_k[jnp.array([0, 2])]
+                safe_plan = _blend_nominal_to_band(
+                    params.ref, safe_plan, com_xy, sdf,
+                    self._band_outer, self._band_inner,
+                )
 
         new_mean = safe_plan - params.ref
         return params.replace(mean=new_mean, best_plan=safe_plan)
