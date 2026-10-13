@@ -22,21 +22,25 @@
 set -euo pipefail
 
 SCENARIO="eval/scenarios/scenario_a.yaml"
-RUNS=5
-BASE_SEED=42
+RUNS=10
+BASE_SEED=0
 
 # ---------------------------------------------------------------------------
 # Seed-only experiment (edit NAME and OUT, keep sweep commented)
 # ---------------------------------------------------------------------------
-NAME="go2"
+NAME="go2_corl"
 OUT="results/${NAME}"
 
 # ---------------------------------------------------------------------------
 # Sweep experiment (uncomment sweep section, edit SWEEP_DIR and sweep axes)
 # ---------------------------------------------------------------------------
-SWEEP_DIR="results/go2_sweep_contact_policy_latest"    # parent dir for all sweep conditions
+SWEEP_DIR="results/go2_corl_mega_sweep_momentum"    # parent dir for all sweep conditions
 # SWEEP="mps_safety_weight=10,100,1000 projection_clearance=0.08 body_sdf_margin=0.1,0.2,0.3"
-SWEEP="mps_alg_name=MIMPS,REMIMPS,CEMPS plan_lim=0.25,0.3,0.35 mps_iterations=1,2,3"
+# SWEEP="mps_alg_name=MIMPS,REMIMPS,CEMPS plan_lim=0.25,0.3,0.35 mps_iterations=1,2,3"
+# SWEEP="mps_alg_name=MIMPS,REMIMPS,CEMPS use_momentum=true,false horizon_length=4,6,8 mps_num_samples=32,256,512 safety_value_mode=off,residual mps_iterations=1,3,6"
+# SWEEP="mps_alg_name=CBF horizon_length=4,6,8 CBF.enabled=true CBF.use_geometric_fallback=false CBF.dynamics_model=lip,unicyle"
+# SWEEP="mps_alg_name=HJ horizon_length=4,6,8 HJ.hj_vi_iters=80,100,120 HJ.dynamics_model=lip,unicyle"
+SWEEP="mps_alg_name=MIMPS,REMIMPS,CEMPS use_momentum=true mps_momentum=0.1,0.3,0.5 mps_iterations=2,5"
 
 # ---------------------------------------------------------------------------
 
