@@ -25,7 +25,7 @@ This repo is built on top of [DOOM](https://github.com/Atarilab/DOOM), a framewo
 
 ## 📋 Table of Contents
 
-📦 [Setup](#-setup) • 🧪 [Simulation](#-simulation) • 📊 [Reproducing the paper](#-reproducing-the-paper) • 🦿 [Hardware](#-hardware-real-go2) • 💾 [Data](#-data-collection-and-output) • 📁 [Where is the code](#-where-is-the-code) • 📝 [Notes](#-notes) • 📚 [Citation](#-citation) • 📄 [License](#-license)
+📦 [Setup](#-setup) • 🧪 [Simulation](#-simulation) • 👀 [Viser](#-quick-look-in-the-browser-viser) • 📊 [Reproducing the paper](#-reproducing-the-paper) • 🦿 [Hardware](#-hardware-real-go2) • 💾 [Data](#-data-collection-and-output) • 📁 [Where is the code](#-where-is-the-code) • 📝 [Notes](#-notes) • 📚 [Citation](#-citation) • 📄 [License](#-license)
 
 ## 📦 Setup
 
@@ -49,12 +49,29 @@ The first start takes a few minutes while the optimizer compiles. Wait for it.
 
 ## 🧪 Simulation
 
-Run from `src/` inside the container. One run with the simulator and controller together (`Ctrl+C` stops both):
+### 👀 Quick look in the browser (viser)
+
+The simulator serves a 3D view at **http://localhost:8080** (open it on the machine running Docker, or use that machine's IP). It shows the robot, the obstacles, the planned contact locations and ghost copies of the predicted robot poses. This works with or without a display, so you can use it over ssh.
+
+**Easiest: let the eval launcher drive.** No joystick needed. It starts the simulator and controller, waits for the filter to compile, then makes the robot trot forward with the filter on:
 ```bash
 cd src/
 python3 eval/launch_eval.py --scenario eval/scenarios/scenario_a.yaml --seed 42
 ```
-`scenario_a.yaml` is the robot trotting forward to x = 6.5 m through the cluttered scene. `scenario_b.yaml` adds a ball thrown at the robot.
+Open the browser while it runs. The run stops when the robot reaches x = 6.5 m or the time limit, and also saves CSVs (`logs/eval/`).
+
+**Manual: drive it yourself** (same as the other DOOM tasks):
+```bash
+# Terminal 1: simulator (add --headless if you have no display, viser still works)
+go2_mps_sim
+# Terminal 2: attach with ./doom.sh -a, then
+ros2 run master_manager master_node --task rl-mps-sim-go2
+```
+Then follow the joystick table in the Hardware section: `Select` → `Start` → `L1+R1` → `L1+R1`, then `A` turns the filter on and the arrow buttons walk the robot. The terminal UI (`--ui`) can stand the robot up and send velocities, but the filter on/off switch is only on the joystick (`A`). With no gamepad, see the virtual joystick part of `docs/joystick_debug.md`.
+
+### 🏃 Eval runs
+
+These run from `src/` inside the container. The `launch_eval.py` command above is one eval run (`Ctrl+C` stops both processes). `scenario_a.yaml` is the robot trotting forward to x = 6.5 m through the cluttered scene. `scenario_b.yaml` adds a ball thrown at the robot.
 
 Many runs and sweeps over settings:
 ```bash
