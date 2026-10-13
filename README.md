@@ -20,6 +20,7 @@ This repo is built on top of [DOOM](https://github.com/Atarilab/DOOM), a framewo
 
 - **The Shield-Loco part** is everything above the "Base DOOM" line: setup, running the simulation, reproducing the paper, running on the robot. Start here.
 - **The Base DOOM part** is the original DOOM documentation, kept as it was further down. Read it if you want to know how DOOM itself works, or you need the Vicon and robot connection setup for hardware.
+- **Names you will see in the code:** MPS stands for Model Predictive Shielding, which is why the tasks are called `rl-mps-*`. `MIMPS` is the MPPI version, `CEMPS` the CEM version, and `REMIMPS` the replica exchange version, which is the default and the one used in the paper.
 - **Where the code is** is listed near the end of the Shield-Loco part, in [Where is the code](#-where-is-the-code).
 
 ## 📋 Table of Contents

@@ -77,9 +77,9 @@ CONDITIONS=(
   "lipm_replica|$(printf "%s" "$LIPM_COMMON") LIPM.optimizer=replica"
 )
 
-# Optional: run the main method (Shield-Loco/MIMPS) in the same harness/seeds for
+# Optional: run the main method (Shield-Loco, REMIMPS) in the same harness/seeds for
 # a head-to-head table. Uncomment to enable.
-# METHOD_CONDITION="mimps|mps_alg_name=MIMPS"
+# METHOD_CONDITION="remimps|mps_alg_name=REMIMPS"
 
 # ---------------------------------------------------------------------------
 
